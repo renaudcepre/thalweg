@@ -4,14 +4,14 @@
 //! (Whipple & Tucker 1999), capped by the CFL ceiling on the energy drop.
 //! Two paths consume this law:
 //!
-//! - **One-shot at worldgen** ([`erode_terrain`], the DEFAULT mode): sculpts
+//! - **One-shot at worldgen** ([`crate::erosion::erode_terrain`], the DEFAULT mode): sculpts
 //!   the drainage network into the bare terrain at world generation, then
 //!   elevation is frozen. Forcing = flow accumulation on slope alone
-//!   ([`accumulate_flow`], no climate). **Incision only, non-conservative**
+//!   ([`crate::erosion::accumulate_flow`], no climate). **Incision only, non-conservative**
 //!   (incised rock leaves the catchment the way a real river's sediment
 //!   reaches the sea): conserving mass in the CLOSED torus would only
 //!   smooth out the relief. No runtime cost, no drift toward flatness.
-//! - **Live** ([`step_erosion`], opt-in `erosion.enabled = 1`): one step per
+//! - **Live** (`step_erosion`, opt-in `erosion.enabled = 1`): one step per
 //!   simulated day, forced by the **EMA** of climate discharge (anti-pattern
 //!   #3), with sediment load and deposition, CONSERVATIVE
 //!   (`Σ(elevation)+Σ(sediment_load)` invariant), since it's a runtime
@@ -29,7 +29,7 @@ use crate::cell::CellProperties;
 use crate::dynamics::{CELL_AREA_M2, CELL_SPACING_M};
 use crate::grid::HexGrid;
 use crate::hydro::EdgeFluxMap;
-use crate::units::MM_PER_M;
+use crate::units::Mm;
 
 /// Seconds per day (SI).
 const SECONDS_PER_DAY: f32 = 86_400.0;
@@ -178,7 +178,7 @@ impl ErosionParams {
 /// `effective_elevation`, weighted by `delta^concentration`. Returns
 /// `(discharge, edge_flux)`: the cumulative discharge per cell (≈ drained
 /// area, in cell units) and its breakdown per edge, exactly the forcing
-/// [`step_erosion`] expects for erosion at world creation.
+/// `step_erosion` expects for erosion at world creation.
 ///
 /// Processing order is decreasing in elevation: by the time a cell is
 /// reached, all of its upstream input is already accumulated (strict
@@ -290,7 +290,7 @@ pub fn erode_terrain(grid: &mut HexGrid, params: &ErosionParams, iterations: u32
     }
 }
 
-/// Hydro history maps consumed by [`step_erosion`]: produced by the daily
+/// Hydro history maps consumed by `step_erosion`: produced by the daily
 /// hydro slice, smoothed by [`update_ema`]/[`update_edge_ema`].
 pub struct ErosionForcing<'a> {
     /// EMA of discharge (mm/day), see [`DischargeEmaMap`].
@@ -406,8 +406,11 @@ pub(crate) fn step_erosion(
             }
         }
 
-        // Q: mm/day sheet depth over the cell's area → m³/s SI.
-        let q_si = q_ema_mm_day * CELL_AREA_M2 / (MM_PER_M * SECONDS_PER_DAY);
+        // Q: mm/day sheet depth over the cell's area → m³/s SI. Routed
+        // through `Mm::areal_flux_to_m3_per_s` (units.rs) so the mm → m
+        // factor lives in one audited place instead of a bare `MM_PER_M` in
+        // this formula.
+        let q_si = Mm(q_ema_mm_day).areal_flux_to_m3_per_s(CELL_AREA_M2, SECONDS_PER_DAY);
         let power = if q_si > 0.0 && s_max > 0.0 {
             (q_si / Q_REF_M3_S).powf(params.m_exponent) * s_max.powf(params.n_exponent)
         } else {

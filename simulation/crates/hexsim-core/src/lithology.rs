@@ -11,12 +11,12 @@
 //! ## Pattern
 //!
 //! Modeled on `species.rs`: an `enum LithologyId`, a static table
-//! [`LITHOLOGY`] as the **single source of truth** (behavior changes by
+//! [`crate::lithology::LITHOLOGY`] as the **single source of truth** (behavior changes by
 //! editing the table, never in code), a stable index per cell.
 //!
 //! ## "The noise is the big bang"
 //!
-//! The class is set at tick 0 by [`classify`], a **pure** function of the
+//! The class is set at tick 0 by [`crate::lithology::classify`], a **pure** function of the
 //! substrate noise field and the relative altitude; deterministic by seed,
 //! like elevation. It is then **static**: neither erosion nor deposition
 //! change it for now (exhumation/burial is deferred to later work).
@@ -37,12 +37,12 @@
 //!   ridges and the other blankets the basins.
 //!
 //! The second axis costs **nothing** in permeability (both classes share
-//! the same value, cf. [`LITHOLOGY`]): it only prepares the L2/L3
+//! the same value, cf. [`crate::lithology::LITHOLOGY`]): it only prepares the L2/L3
 //! couplings, where the soft rock erodes and where marl feeds the flora.
 //!
 //! ## Units
 //!
-//! [`Lithology::permeability`] is the dimensionless aptitude ∈ [0, 1]
+//! [`crate::lithology::Lithology::permeability`] is the dimensionless aptitude ∈ [0, 1]
 //! already consumed by `groundwater` (water table capacity = `permeability
 //! × max_capacity`) and `snow`. This module doesn't change its semantics:
 //! it changes its **provenance**.

@@ -34,7 +34,7 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// Thirty seconds and not five: this delay only serves to spot a truly mute
 /// server, and it has to cover the interval between two steps. A job is split
-/// into [`STEP_BATCHES`](hexsim_proto::STEP_BATCHES) batches, so one batch of a
+/// into `STEP_BATCHES` batches, so one batch of a
 /// ten-year `step` is worth six simulated months: five seconds at R=45, and
 /// far more at a large radius (#145).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

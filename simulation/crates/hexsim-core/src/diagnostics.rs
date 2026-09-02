@@ -2,14 +2,12 @@ use serde::Serialize;
 
 pub mod structural;
 
-use crate::atmosphere::{AtmosphereParams, saturation_upper};
+use crate::atmosphere::EvapStats;
 use crate::coord::HexCoord;
 use crate::dynamics::SynopticStats;
 use crate::grid::HexGrid;
 use crate::hydro::DischargeMap;
 use crate::lithology::{LITHOLOGY, LITHOLOGY_COUNT, LithologyId};
-use crate::physics::meyer_evaporation;
-use crate::units::MetersPerSecond;
 use crate::wind::{WindField, WindVec};
 
 /// Compact summary of the water cycle, designed to be readable by a human
@@ -28,11 +26,14 @@ pub struct Diagnostics {
     pub hydrology: HydrologyStats,
     pub wind: WindStats,
     pub altitude: AltitudeStats,
-    /// Phase 1 (#29): Dalton's law applied observer-only, expressed
-    /// in mm/day (instantaneous physical rate). Phase 2 (#31) wires Meyer
-    /// into `step_evaporation`; v0.3.0 Tier 1 (#38) divides the flux by
-    /// `TICKS_PER_DAY` for the hourly regime, the daily total stays
-    /// equivalent to what this observer reports.
+    /// Open-water evaporation (Dalton/Meyer ET₀, mm/day): filled in by
+    /// `Simulation::diagnostics` from `AtmoScratch::evap`, itself written
+    /// by `step_evaporation`'s `out` parameter during the tick that just
+    /// ran. Same computation the engine applies, not a recomputation
+    /// (there used to be a diagnostics-side clone of this formula that
+    /// silently drifted from the engine's gate and wind source; removed).
+    /// Zero (`EvapStats::default()`) via the low-level `compute_diagnostics`
+    /// call, which only `Simulation::diagnostics` ever invokes.
     pub evap_observer: EvapStats,
     /// Phase 2 (#31) → Phase 3 (#32): `humidity_surface` is directly
     /// in mm of equivalent PW (×200 rescale of stocks in Phase 3). Real
@@ -102,22 +103,6 @@ pub struct ErosionStats {
     /// Closed depressions in the bedrock (strict local minima, toroidal
     /// neighbors).
     pub closed_depressions: usize,
-}
-
-/// Statistics for physical evaporation (Dalton's law, Meyer 1915) computed
-/// observer-only: read from the grid's current state, not fed back in.
-///
-/// Lets us compare against observation (temperate open water ≈ 2-4 mm/day,
-/// warm windy conditions > 8 mm/day) to validate the formula before
-/// integrating it into the pipeline in Phase 2.
-#[derive(Debug, Serialize)]
-pub struct EvapStats {
-    /// Average over the cells taken into account (thawed liquid water).
-    pub mean_mm_day: f32,
-    pub min_mm_day: f32,
-    pub max_mm_day: f32,
-    /// Number of cells taken into account (`water_level` > 0 AND T >= 0).
-    pub cell_count: usize,
 }
 
 /// Wind field statistics.
@@ -209,7 +194,6 @@ pub(crate) fn compute_diagnostics(
     discharge_map: &DischargeMap,
     wind_field: &WindField,
     precipitation: &crate::atmosphere::PrecipitationMap,
-    atmo_params: &AtmosphereParams,
 ) -> Diagnostics {
     let cell_count = grid.len();
 
@@ -270,7 +254,6 @@ pub(crate) fn compute_diagnostics(
     }
 
     let wind_stats = compute_wind_stats(wind_field);
-    let evap_observer = compute_evap_observer(grid, wind_field, atmo_params);
     let lithology_stats = compute_lithology_stats(grid);
 
     elev_entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -308,7 +291,10 @@ pub(crate) fn compute_diagnostics(
         },
         wind: wind_stats,
         altitude: altitude_stats,
-        evap_observer,
+        // Filled in by `Simulation::diagnostics` from `AtmoScratch::evap`,
+        // see the field doc-comment: this low-level call has no tick
+        // context to draw a real value from.
+        evap_observer: EvapStats::default(),
         humidity_surface_mm: property_stats(&mut humidity_surface_mm_entries),
         lithology: lithology_stats,
     }
@@ -359,68 +345,6 @@ fn compute_lithology_stats(grid: &HexGrid) -> LithologyStats {
                 }
             })
             .collect(),
-    }
-}
-
-/// Computes evaporation via Dalton's law (Meyer 1915) on every cell that
-/// has thawed open water, read-only. The current pipeline
-/// (`evap_rate * temp_factor`) stays the sole source of flux into
-/// `humidity_surface`, this function ONLY observes.
-///
-/// `humidity_relative` is derived from the existing saturation curve
-/// (`saturation_upper`), used here as a proxy for the surface layer's
-/// capacity. Phase 2 will replace it with direct Clausius-Clapeyron and
-/// dimension `humidity_surface` in mm.
-fn compute_evap_observer(
-    grid: &HexGrid,
-    wind_field: &WindField,
-    atmo_params: &AtmosphereParams,
-) -> EvapStats {
-    let mut sum = 0.0_f32;
-    let mut min = f32::INFINITY;
-    let mut max = 0.0_f32;
-    let mut count = 0_usize;
-
-    for (i, (_coord, cell)) in grid.iter().enumerate() {
-        if cell.water_level <= 0.0 || cell.temperature < 0.0 {
-            continue;
-        }
-        let cap = saturation_upper(cell.temperature, atmo_params).max(1e-6);
-        let rh = (cell.humidity_surface / cap).clamp(0.0, 1.0);
-        let wind_mag = wind_field.get(i).map_or(0.0, |w| w.magnitude());
-        // Phase 4 (#33): convention `magnitude × 10 = m/s` (Phase 1
-        // calibration preserved; Phase 6 will revise it with a coordinated
-        // rescale).
-        let wind_ms = MetersPerSecond(wind_mag * 10.0);
-        // Phase 1: assumes T_water = T_air (no dedicated water temperature
-        // in the model). Phase 2+ may differentiate if needed.
-        let e = meyer_evaporation(cell.temperature, cell.temperature, rh, wind_ms).0;
-
-        sum += e;
-        if e < min {
-            min = e;
-        }
-        if e > max {
-            max = e;
-        }
-        count += 1;
-    }
-
-    if count == 0 {
-        return EvapStats {
-            mean_mm_day: 0.0,
-            min_mm_day: 0.0,
-            max_mm_day: 0.0,
-            cell_count: 0,
-        };
-    }
-
-    let nf = f32::from(u16::try_from(count).unwrap_or(u16::MAX));
-    EvapStats {
-        mean_mm_day: sum / nf,
-        min_mm_day: min,
-        max_mm_day: max,
-        cell_count: count,
     }
 }
 

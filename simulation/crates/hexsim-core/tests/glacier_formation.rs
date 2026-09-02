@@ -31,6 +31,7 @@ fn sunny_forcing(ff: &[f32]) -> SnowForcing<'_> {
         flux_factor: ff,
         wind_mag: &[],
         rain_last_tick: &[],
+        gw_max_capacity: 100.0,
     }
 }
 
@@ -58,13 +59,7 @@ fn deep_water_does_not_become_permanent_glacier() {
         if let Some(cell) = current.get_mut(c) {
             cell.temperature = -5.0;
         }
-        step_snow(
-            &current,
-            &mut next,
-            &params,
-            100.0,
-            &SnowForcing::night_calm(),
-        );
+        step_snow(&current, &mut next, &params, &SnowForcing::night_calm());
         std::mem::swap(&mut current, &mut next);
     }
 
@@ -83,7 +78,7 @@ fn deep_water_does_not_become_permanent_glacier() {
         if let Some(cell) = current.get_mut(c) {
             cell.temperature = 25.0;
         }
-        step_snow(&current, &mut next, &params, 100.0, &sunny_forcing(&ff));
+        step_snow(&current, &mut next, &params, &sunny_forcing(&ff));
         std::mem::swap(&mut current, &mut next);
     }
 
@@ -127,7 +122,7 @@ fn snow_fully_melts_at_high_temperature() {
         if let Some(cell) = current.get_mut(c) {
             cell.temperature = 30.0;
         }
-        step_snow(&current, &mut next, &params, 100.0, &sunny_forcing(&ff));
+        step_snow(&current, &mut next, &params, &sunny_forcing(&ff));
         std::mem::swap(&mut current, &mut next);
     }
 
@@ -169,13 +164,7 @@ fn high_altitude_still_forms_glacier() {
             cell.temperature = -10.0;
             cell.snow_level += snow_injection_per_hour;
         }
-        step_snow(
-            &current,
-            &mut next,
-            &params,
-            100.0,
-            &SnowForcing::night_calm(),
-        );
+        step_snow(&current, &mut next, &params, &SnowForcing::night_calm());
         std::mem::swap(&mut current, &mut next);
     }
 
@@ -191,13 +180,7 @@ fn high_altitude_still_forms_glacier() {
         if let Some(cell) = current.get_mut(c) {
             cell.temperature = 5.0;
         }
-        step_snow(
-            &current,
-            &mut next,
-            &params,
-            100.0,
-            &SnowForcing::night_calm(),
-        );
+        step_snow(&current, &mut next, &params, &SnowForcing::night_calm());
         std::mem::swap(&mut current, &mut next);
     }
 

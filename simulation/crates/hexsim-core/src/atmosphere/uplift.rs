@@ -1,11 +1,33 @@
+use serde::Serialize;
+
 use crate::grid::HexGrid;
 use crate::physics::meyer_evaporation;
 use crate::species::SPECIES;
 use crate::temperature::{TemperatureParams, local_t_ref};
 use crate::time::TICKS_PER_DAY_F32;
-use crate::units::MetersPerSecond;
+use crate::wind::wind_magnitude_to_meters_per_second;
 
 use super::{AtmoScratch, AtmosphereParams, SOIL_GW_REFERENCE_MM, saturation_upper};
+
+/// Open-water evaporation stats for the tick, aggregated by `step_evaporation`
+/// over the exact cells and formula it uses to move water: no separate
+/// recomputation exists anywhere else (a diagnostics-side clone of this
+/// formula used to drift from it silently, see #29/#89 history). `mean_mm_day`
+/// etc. are the physical rate (Dalton/Meyer ET₀), comparable to observed
+/// open-water evaporation (temperate ≈ 2-4 mm/day, warm windy > 8 mm/day),
+/// not the per-tick mass actually transferred (which is this rate divided by
+/// `TICKS_PER_DAY` and capped to the available surplus).
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct EvapStats {
+    /// Average over the cells taken into account (true open water: surplus
+    /// above `water_capacity`, thawed).
+    pub mean_mm_day: f32,
+    pub min_mm_day: f32,
+    pub max_mm_day: f32,
+    /// Number of cells taken into account. 0 when no cell has open water,
+    /// in which case every field above is 0 (never a NaN from an empty mean).
+    pub cell_count: usize,
+}
 
 /// Evaporation of liquid water + plant transpiration + snow sublimation.
 /// Feeds `humidity_surface`: freshly evaporated vapor must be lifted by
@@ -19,12 +41,25 @@ use super::{AtmoScratch, AtmosphereParams, SOIL_GW_REFERENCE_MM, saturation_uppe
 /// (FAO-56, cf `transpiration_coef`) reuses this same Meyer demand as ET₀
 /// and closes the vegetation → atmosphere loop.
 /// Snow sublimation remains phenomenological.
+///
+/// `out` reports open-water evaporation stats (`EvapStats`) for whoever
+/// needs to display them (diagnostics): filled from the same loop, same
+/// gate (`open_water > 0`, i.e. a real lake, not any puddle under
+/// capacity) and same memoized wind (`wind_mag`) that drive the flux
+/// actually applied below. This is now the sole computation of open-water
+/// evaporation; nothing else may recompute it (anti-pattern #2).
 pub fn step_evaporation(
     current: &HexGrid,
     next: &mut HexGrid,
     params: &AtmosphereParams,
     wind_mag: &[f32],
+    out: &mut EvapStats,
 ) {
+    let mut evap_sum = 0.0_f32;
+    let mut evap_min = f32::INFINITY;
+    let mut evap_max = 0.0_f32;
+    let mut evap_count = 0_usize;
+
     let cur = current.cells_slice();
     let next_cells = next.cells_slice_mut();
     for (i, cell) in cur.iter().enumerate() {
@@ -34,7 +69,7 @@ pub fn step_evaporation(
         // Magnitude precomputed at the cadence of the wind field (#89): the
         // field only changes one hour out of N, the per-cell-hour sqrt was
         // pure recomputation.
-        let wind_ms = MetersPerSecond(wind_mag.get(i).copied().unwrap_or(0.0) * 10.0);
+        let wind_ms = wind_magnitude_to_meters_per_second(wind_mag.get(i).copied().unwrap_or(0.0));
         let cap = saturation_upper(cell.temperature, params).max(1e-6);
         let rh = (cell.humidity_surface / cap).clamp(0.0, 1.0);
         let evap_demand_per_day = if cell.temperature >= 0.0 {
@@ -50,6 +85,12 @@ pub fn step_evaporation(
             let evap = (evap_demand_per_day / TICKS_PER_DAY_F32).min(open_water);
             next_cells[i].water_level -= evap;
             next_cells[i].humidity_surface += evap;
+
+            // `out`: same gate, same value, no separate pass over the grid.
+            evap_sum += evap_demand_per_day;
+            evap_min = evap_min.min(evap_demand_per_day);
+            evap_max = evap_max.max(evap_demand_per_day);
+            evap_count += 1;
         }
 
         // Plant transpiration (#77, replaces the `ground_evap_rate` proxy).
@@ -91,6 +132,18 @@ pub fn step_evaporation(
             next_cells[i].humidity_surface += departed;
         }
     }
+
+    *out = if evap_count == 0 {
+        EvapStats::default()
+    } else {
+        let nf = f32::from(u16::try_from(evap_count).unwrap_or(u16::MAX));
+        EvapStats {
+            mean_mm_day: evap_sum / nf,
+            min_mm_day: evap_min,
+            max_mm_day: evap_max,
+            cell_count: evap_count,
+        }
+    };
 }
 
 /// Intra-cell vertical uplift: transfers a fraction of `humidity_surface`
@@ -288,6 +341,88 @@ mod tests {
     use crate::atmosphere::total_humidity;
     use crate::coord::DIRECTIONS;
     use crate::coord::HexCoord;
+    use crate::units::MetersPerSecond;
+
+    #[test]
+    fn step_evaporation_stats_count_only_true_open_water() {
+        // Pins the bug fix: the old diagnostics-side observer gated on
+        // `water_level > 0` (any surface water, including a puddle under
+        // capacity), while the engine only ever evaporates the surplus
+        // above `water_capacity` (a real lake). `EvapStats` must reflect
+        // exactly the cells and formula the engine itself uses to move
+        // water, no separate recomputation. Evaporation is cell-local
+        // (no neighbor reads), so radius 0-transport caveats don't apply.
+        let mut current = HexGrid::from_radius(1);
+        let coords: Vec<HexCoord> = current.coords().copied().collect();
+
+        // Lake: surplus above capacity, thawed -> counted.
+        if let Some(c) = current.get_mut(coords[0]) {
+            c.water_capacity = 1.0;
+            c.water_level = 5.0;
+            c.temperature = 20.0;
+            c.humidity_surface = 5.0;
+        }
+        // Puddle: water_level > 0 but under capacity -> NOT open water,
+        // excluded (this is exactly what the old buggy gate got wrong).
+        if let Some(c) = current.get_mut(coords[1]) {
+            c.water_capacity = 10.0;
+            c.water_level = 3.0;
+            c.temperature = 20.0;
+        }
+        // Frozen lake: surplus above capacity but T < 0 -> excluded.
+        if let Some(c) = current.get_mut(coords[2]) {
+            c.water_capacity = 1.0;
+            c.water_level = 5.0;
+            c.temperature = -5.0;
+        }
+        // Remaining cells stay at the default (water_level=0 < capacity=1):
+        // dry, excluded.
+
+        let mut next = current.clone();
+        let params = AtmosphereParams::default();
+        let wind_mag = vec![0.0_f32; current.len()];
+        let mut stats = EvapStats::default();
+
+        step_evaporation(&current, &mut next, &params, &wind_mag, &mut stats);
+
+        assert_eq!(
+            stats.cell_count, 1,
+            "only the true lake cell (surplus above capacity, thawed) counts as open water"
+        );
+        // Ground truth computed independently from the same physical
+        // formula step_evaporation applies (Dalton/Meyer), not by calling
+        // back into the engine: this is what "the flux the engine applied"
+        // means for that single cell.
+        let cap = saturation_upper(20.0, &params).max(1e-6);
+        let rh = (5.0_f32 / cap).clamp(0.0, 1.0);
+        let expected = meyer_evaporation(20.0, 20.0, rh, MetersPerSecond(0.0)).0;
+        assert!(
+            (stats.mean_mm_day - expected).abs() < 1e-4,
+            "mean={} expected={expected}",
+            stats.mean_mm_day
+        );
+        assert!((stats.min_mm_day - expected).abs() < 1e-4);
+        assert!((stats.max_mm_day - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn step_evaporation_stats_empty_when_no_open_water() {
+        // No cell has open water: EvapStats must fall back to all-zero
+        // fields (same convention the removed diagnostics-side observer
+        // used), never a NaN from dividing by zero cells.
+        let current = HexGrid::from_radius(0);
+        let mut next = current.clone();
+        let params = AtmosphereParams::default();
+        let wind_mag = vec![0.0_f32; current.len()];
+        let mut stats = EvapStats::default();
+
+        step_evaporation(&current, &mut next, &params, &wind_mag, &mut stats);
+
+        assert_eq!(stats.cell_count, 0);
+        assert!(stats.mean_mm_day.abs() < 1e-6);
+        assert!(stats.min_mm_day.abs() < 1e-6);
+        assert!(stats.max_mm_day.abs() < 1e-6);
+    }
 
     #[test]
     fn diurnal_convection_pushes_more_humidity_at_noon_than_at_night() {

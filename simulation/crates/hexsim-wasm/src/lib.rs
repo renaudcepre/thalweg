@@ -133,7 +133,7 @@ impl HexSim {
     }
 
     /// Executes a protocol command (`{"cmd":"diagnostics"}`) and returns
-    /// the JSON [`Envelope`] describing what to do next.
+    /// the JSON `Envelope` describing what to do next.
     ///
     /// Never panics: an unreadable or inapplicable command comes back as
     /// `{"kind":"error"}`, exactly where the server would emit a `warn!`.
@@ -158,7 +158,12 @@ impl HexSim {
     /// This is the auto-tick step; the exact counterpart of the server's
     /// `spawn_tick_loop`, which advances by one **hour** and not one day
     /// so that the front sees the diurnal cycle (#47).
-    pub fn step_hour(&mut self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Error message if encoding the snapshot fails; see
+    /// [`HexSim::snapshot`].
+    pub fn step_hour(&mut self) -> Result<Vec<u8>, String> {
         self.world.sim_mut().step_hour();
         self.snapshot()
     }
@@ -175,9 +180,18 @@ impl HexSim {
 
     /// Column-packed msgpack snapshot of the current state; byte-for-byte
     /// identical to the WebSocket one.
-    #[must_use]
-    pub fn snapshot(&self) -> Vec<u8> {
-        self.world.snapshot_bytes().to_vec()
+    ///
+    /// # Errors
+    ///
+    /// Error message if `MessagePack` encoding fails (see
+    /// `hexsim_proto::wire::encode_snapshot`): this doesn't happen on a
+    /// valid state, but the error is surfaced to JS rather than masked,
+    /// same rationale as [`HexSim::export_checkpoint`].
+    pub fn snapshot(&self) -> Result<Vec<u8>, String> {
+        self.world
+            .snapshot_bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| format!("snapshot_bytes: {e}"))
     }
 
     /// Radius of the current grid (it changes if a checkpoint from a
@@ -338,7 +352,7 @@ mod tests {
     fn step_hour_advances_and_returns_a_valid_snapshot() {
         let mut sim = tiny();
         let before = sim.world.sim().hour_tick();
-        let bytes = sim.step_hour();
+        let bytes = sim.step_hour().expect("step_hour snapshot encode");
         assert_eq!(sim.world.sim().hour_tick(), before + 1);
 
         let decoded: Value = rmp_serde::from_slice(&bytes).expect("snapshot msgpack");
@@ -401,9 +415,16 @@ mod tests {
         let mut b = HexSim::new(7, 2);
         a.advance(4, true);
         b.advance(4, true);
-        assert_eq!(a.snapshot(), b.snapshot());
+        assert_eq!(
+            a.snapshot().expect("snapshot a"),
+            b.snapshot().expect("snapshot b")
+        );
 
         let c = HexSim::new(8, 2);
-        assert_ne!(a.snapshot(), c.snapshot(), "different seeds, same world?");
+        assert_ne!(
+            a.snapshot().expect("snapshot a"),
+            c.snapshot().expect("snapshot c"),
+            "different seeds, same world?"
+        );
     }
 }

@@ -22,7 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::grid::HexGrid;
-use crate::units::MM_PER_M;
+use crate::units::{Meters, Mm};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LakeParams {
@@ -58,10 +58,13 @@ impl Default for LakeParams {
     }
 }
 
-/// Free-water `surplus` level (mm) of a cell (0 if below capacity).
+/// Free-water `surplus` level (mm) of a cell (0 if below capacity). Returns
+/// `Mm`, not a bare `f32`: every caller that needs it in meters (to compare
+/// or add against an elevation) must go through `Mm::to_meters()`, which is
+/// exactly the compile-time check #104 needed.
 #[inline]
-fn surplus_mm(water_level: f32, water_capacity: f32) -> f32 {
-    (water_level - water_capacity).max(0.0)
+fn surplus_mm(water_level: f32, water_capacity: f32) -> Mm {
+    (Mm(water_level) - Mm(water_capacity)).non_negative()
 }
 
 /// Levels each connected lake: reads from `current`, writes to `next`.
@@ -81,7 +84,7 @@ pub(crate) fn step_lake_leveling(current: &HexGrid, next: &mut HexGrid, params: 
     next.cells_slice_mut().clone_from_slice(cells);
 
     let is_lake = |i: usize| {
-        surplus_mm(cells[i].water_level, cells[i].water_capacity) > params.min_surplus_mm
+        surplus_mm(cells[i].water_level, cells[i].water_capacity) > Mm(params.min_surplus_mm)
     };
 
     let mut seen = vec![false; n];
@@ -114,7 +117,11 @@ pub(crate) fn step_lake_leveling(current: &HexGrid, next: &mut HexGrid, params: 
         // Total free-water volume of the component, in meters of depth.
         let volume_m: f32 = comp
             .iter()
-            .map(|&i| surplus_mm(cells[i].water_level, cells[i].water_capacity) / MM_PER_M)
+            .map(|&i| {
+                surplus_mm(cells[i].water_level, cells[i].water_capacity)
+                    .to_meters()
+                    .0
+            })
             .sum();
 
         let level_m = solve_flat_level(&comp, cells, volume_m);
@@ -124,8 +131,8 @@ pub(crate) fn step_lake_leveling(current: &HexGrid, next: &mut HexGrid, params: 
         // leaves the lake, its surplus has flowed toward the low points).
         let out = next.cells_slice_mut();
         for &i in &comp {
-            let depth_m = (level_m - cells[i].elevation).max(0.0);
-            out[i].water_level = cells[i].water_capacity + depth_m * MM_PER_M;
+            let depth_m = Meters((level_m - cells[i].elevation).max(0.0));
+            out[i].water_level = (Mm(cells[i].water_capacity) + depth_m.to_mm()).0;
         }
     }
 }
@@ -184,7 +191,7 @@ mod tests {
     fn total_surplus(grid: &HexGrid) -> f32 {
         grid.cells_slice()
             .iter()
-            .map(|c| surplus_mm(c.water_level, c.water_capacity))
+            .map(|c| surplus_mm(c.water_level, c.water_capacity).0)
             .sum()
     }
 
@@ -198,8 +205,10 @@ mod tests {
         let effs: Vec<f32> = next
             .cells_slice()
             .iter()
-            .filter(|c| surplus_mm(c.water_level, c.water_capacity) > 0.0)
-            .map(|c| c.elevation + surplus_mm(c.water_level, c.water_capacity) / MM_PER_M)
+            .filter(|c| surplus_mm(c.water_level, c.water_capacity) > Mm(0.0))
+            .map(|c| {
+                (Meters(c.elevation) + surplus_mm(c.water_level, c.water_capacity).to_meters()).0
+            })
             .collect();
         let max = effs.iter().copied().fold(f32::MIN, f32::max);
         let min = effs.iter().copied().fold(f32::MAX, f32::min);

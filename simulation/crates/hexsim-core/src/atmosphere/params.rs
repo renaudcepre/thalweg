@@ -159,7 +159,7 @@ pub struct AtmosphereParams {
     /// `synoptic.enabled`, hardcoded ON by default) for coherent
     /// convergence zones (disproved on noise-wind, #69: smear).
     pub updraft_ref_ms: f32,
-    /// Floor [0,1] of the precip factor in subsidence zones (ascent
+    /// Floor `[0,1]` of the precip factor in subsidence zones (ascent
     /// trigger): fraction of efficiency retained with no ascent.
     /// 0.0 = subsidence zones totally dry.
     pub updraft_floor: f32,

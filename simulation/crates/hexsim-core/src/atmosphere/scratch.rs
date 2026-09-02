@@ -2,7 +2,7 @@ use crate::grid::HexGrid;
 use crate::temperature::TemperatureParams;
 use crate::wind::{WindField, WindVec};
 
-use super::{AtmosphereParams, saturation_upper};
+use super::{AtmosphereParams, EvapStats, saturation_upper};
 
 /// Scratch buffers for `step_atmosphere_into`, owned by the caller
 /// (`Simulation`) and reused every tick: zero malloc in the hot path
@@ -44,6 +44,12 @@ pub struct AtmoScratch {
     /// Total ascent `w = H·(−∇·v) + v·∇z` per cell, in m/s (Phase 3
     /// ascent trigger; filled only when `updraft_ref_ms > 0`).
     pub convergence: Vec<f32>,
+    /// Open-water evaporation stats for the tick, written by
+    /// `step_evaporation`. Unlike the other fields here, this one is read
+    /// back by the caller after `step_atmosphere_into` returns (same
+    /// pattern as `convergence`/`updraft_field`): it is the diagnostics
+    /// layer's sole source for evaporation, never recomputed there.
+    pub evap: EvapStats,
 }
 
 impl AtmoScratch {
@@ -67,6 +73,7 @@ impl AtmoScratch {
             precip_water_delta: Vec::with_capacity(n),
             precip_snow_delta: Vec::with_capacity(n),
             convergence: Vec::with_capacity(n),
+            evap: EvapStats::default(),
         }
     }
 

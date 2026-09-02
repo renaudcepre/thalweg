@@ -1,6 +1,6 @@
 use crate::coord::hex_direction_to_world;
 use crate::grid::HexGrid;
-use crate::wind::WindField;
+use crate::wind::{WindField, wind_magnitude_to_meters_per_second};
 
 /// Total ascent `w = H·(−∇·v) + v·∇z` (m/s) per cell (Phase 3 synoptic
 /// ascent trigger, ex-design C #69).
@@ -10,15 +10,16 @@ use crate::wind::WindField;
 /// - Orographic uplift: `v·∇z`, altitude gradient via the same
 ///   estimator, the wind pushing against the slope rises.
 ///
-/// The wind is converted from the `WindVec` unit (magnitude × 10 = m/s, #33) to
-/// m/s. Positive = air that rises (front OR windward flank).
+/// The wind is converted from the `WindVec` unit to m/s via
+/// `wind::wind_magnitude_to_meters_per_second` (convention #33, single
+/// source of truth lives on the type in `wind.rs`). Positive = air that
+/// rises (front OR windward flank).
 pub(crate) fn fill_updraft_into(
     current: &HexGrid,
     wind_field: &WindField,
     h_column: f32,
     out: &mut Vec<f32>,
 ) {
-    const WINDVEC_TO_MS: f32 = 10.0;
     let inv3d = 1.0 / (3.0 * crate::dynamics::CELL_SPACING_M);
     let n = current.len();
     let cells = current.cells_slice();
@@ -37,9 +38,9 @@ pub(crate) fn fill_updraft_into(
             gx += dz * dx;
             gy += dz * dy;
         }
-        let conv_si = acc * WINDVEC_TO_MS * inv3d;
+        let conv_si = wind_magnitude_to_meters_per_second(acc).0 * inv3d;
         let wc = wind_field[i];
-        let w_oro = (wc.x * gx + wc.y * gy) * WINDVEC_TO_MS * inv3d;
+        let w_oro = wind_magnitude_to_meters_per_second(wc.x * gx + wc.y * gy).0 * inv3d;
         *w = conv_si * h_column + w_oro;
     }
 }

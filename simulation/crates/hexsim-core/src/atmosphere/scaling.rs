@@ -1,3 +1,4 @@
+use crate::ablation::Ablation;
 use crate::time::TICKS_PER_DAY_F32;
 use crate::wind::WindParams;
 
@@ -13,20 +14,14 @@ use super::AtmosphereParams;
 /// hillside rain drops ~5% (112 to 106 j/year medians), plain/mid+high
 /// elevations/mountain clouds/lapse/drift unchanged. `N=4` gave -28% but
 /// hillside drift grew; `N=3` is the sweet spot.
-const TRANSPORT_SUBSAMPLE_HOURS: u16 = 3;
+pub(crate) const TRANSPORT_SUBSAMPLE_HOURS: u16 = 3;
 
 /// Effective value: `TRANSPORT_SUBSAMPLE_HOURS` by default, overridden by
-/// `HEXSIM_TRANSPORT_SUBSAMPLE` (useful for parametric A/B without recompile).
+/// `HEXSIM_TRANSPORT_SUBSAMPLE` (useful for parametric A/B without
+/// recompile). Delegates to [`Ablation::effective`], which reads the
+/// environment once for the whole process.
 pub(crate) fn transport_subsample() -> u16 {
-    use std::sync::OnceLock;
-    static N: OnceLock<u16> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("HEXSIM_TRANSPORT_SUBSAMPLE")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(TRANSPORT_SUBSAMPLE_HOURS)
-    })
+    Ablation::effective().transport_subsample
 }
 
 /// Apply Tier 1 scaling to atmospheric rates.

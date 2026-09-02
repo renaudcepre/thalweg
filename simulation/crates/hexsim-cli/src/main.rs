@@ -270,7 +270,15 @@ fn spawn_tick_loop(state: Arc<AppState>) {
                 world.snapshot_bytes()
             };
 
-            let _ = state.tx.send(frame);
+            match frame {
+                Ok(frame) => {
+                    let _ = state.tx.send(frame);
+                }
+                // Logged, not broadcast: an empty frame would make the
+                // decoder throw client-side with nothing pointing back to
+                // the encode that actually failed (see `encode_snapshot`).
+                Err(e) => warn!(error = %e, "auto-tick: snapshot encode failed, frame skipped"),
+            }
         }
     });
 }
@@ -307,7 +315,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // Sends the current state immediately
     {
-        let frame = state.world.lock().await.snapshot_bytes();
+        let frame = match state.world.lock().await.snapshot_bytes() {
+            Ok(frame) => frame,
+            Err(e) => {
+                warn!(client_id, error = %e, "snapshot encode failed, no initial frame sent");
+                return;
+            }
+        };
         if sender.send(Message::Binary(frame)).await.is_err() {
             debug!(client_id, "ws close (send initial snapshot failed)");
             return;
@@ -457,10 +471,12 @@ async fn run_outcome(
 ) {
     match outcome {
         Outcome::Nothing => {}
-        Outcome::Snapshot => {
-            let frame = state.world.lock().await.snapshot_bytes();
-            let _ = state.tx.send(frame);
-        }
+        Outcome::Snapshot => match state.world.lock().await.snapshot_bytes() {
+            Ok(frame) => {
+                let _ = state.tx.send(frame);
+            }
+            Err(e) => warn!(client_id, error = %e, "snapshot encode failed, broadcast skipped"),
+        },
         // Targeted response: this client requested it, the others have no
         // use for it.
         Outcome::Reply(value) => {
@@ -553,8 +569,15 @@ async fn run_stepped(state: &AppState, reply: &mpsc::Sender<String>, n: u64, hou
             (world.snapshot_bytes(), world.sim().tick())
         };
         // Snapshot broadcast to everyone (each client's map follows the
-        // computation).
-        let _ = state.tx.send(frame);
+        // computation). A failed encode is logged and only this batch's
+        // frame is skipped: the world already advanced, only the visual
+        // update is lost, not the computation.
+        match frame {
+            Ok(frame) => {
+                let _ = state.tx.send(frame);
+            }
+            Err(e) => warn!(error = %e, tick, "snapshot encode failed, batch frame skipped"),
+        }
         // Progress targeted at the requester only (the others have no job
         // in progress on the UI side). Best-effort: if the channel is full,
         // we skip the step rather than block the sim on client consumption.
@@ -629,9 +652,21 @@ async fn import_checkpoint(State(state): State<Arc<AppState>>, body: Bytes) -> i
                 world.replace_simulation(new_sim);
                 (world.snapshot_bytes(), world.sim().tick())
             };
-            let _ = state.tx.send(frame);
-            info!(tick, size = body.len(), "import checkpoint");
-            (StatusCode::OK, format!("loaded (tick {tick})")).into_response()
+            match frame {
+                Ok(frame) => {
+                    let _ = state.tx.send(frame);
+                    info!(tick, size = body.len(), "import checkpoint");
+                    (StatusCode::OK, format!("loaded (tick {tick})")).into_response()
+                }
+                Err(e) => {
+                    warn!(error = %e, tick, "import checkpoint: snapshot encode failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("snapshot_bytes: {e}"),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "import checkpoint rejected");

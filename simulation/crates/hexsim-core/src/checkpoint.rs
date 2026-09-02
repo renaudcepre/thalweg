@@ -13,9 +13,11 @@
 //! [`Simulation`](crate::simulation::Simulation): the grid, the clock, the
 //! prognostic synoptic state, the in-progress yearly normals accumulator,
 //! the precipitation hysteresis, the retained downsampled wind field, the
-//! fire counters. *Derived* fields (double-buffer `next`, reconstructible
-//! neighbor caches, scratch buffers) are rebuilt on load, never relied
-//! upon. Since fire is a **stateless** random draw
+//! fire counters, and the process's [`crate::ablation::Ablation`] (env-var A/B switches, see
+//! [`crate::ablation`]) — process-global state that lives outside the seed
+//! but still changes the physics. *Derived* fields (double-buffer `next`,
+//! reconstructible neighbor caches, scratch buffers) are rebuilt on load,
+//! never relied upon. Since fire is a **stateless** random draw
 //! (`hash01(seed, day, cell)`), the seed plus the clock are enough to
 //! reproduce it; no generator state to store.
 //!
@@ -25,11 +27,14 @@
 //! needed for `HexGrid::coord_index` and `ClimateHistory`
 //! (`HashMap<HexCoord, _>`), which JSON refuses (string keys only).
 //! Versioned envelope: loading a file with an incompatible format version
-//! is **refused with a clear message** ([`CheckpointError::Version`])
-//! rather than silently misread.
+//! is **refused with a clear message** ([`crate::checkpoint::CheckpointError::Version`])
+//! rather than silently misread. Loading a file whose [`crate::ablation::Ablation`] doesn't
+//! match the running process is refused the same way
+//! ([`crate::checkpoint::CheckpointError::Ablation`]).
 
 use serde::{Deserialize, Serialize};
 
+use crate::ablation::Ablation;
 use crate::atmosphere::AtmosphereParams;
 use crate::climate::{ClimateHistory, DayRecord};
 use crate::climate_normals::ClimateNormalsAccumulator;
@@ -46,12 +51,16 @@ use crate::vegetation::VegetationParams;
 use crate::wind::{WindParams, WindVec};
 
 /// Checkpoint format version. Bump on any breaking change to the
-/// [`Checkpoint`] schema. Loading a different version is refused
+/// `Checkpoint` schema. Loading a different version is refused
 /// ([`CheckpointError::Version`]); no silent migration.
 ///
 /// v2 (issue #88): synoptic state now lives on the coarse torus
 /// (`synoptic_coarse_radius` added, `synoptic_state` vectors at coarse
 /// size); a v1 carries fine-grid state that can't be converted.
+///
+/// `ablation` is additive and carries `serde(default)`, so it did **not**
+/// bump the version: see its field doc for why a missing value is read as
+/// the compiled defaults rather than refused.
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 
 /// Header marker: distinguishes a `HexSim` checkpoint from some unrelated
@@ -61,7 +70,7 @@ pub(crate) const MAGIC: &str = "HEXSIM_CKPT";
 /// Errors saving/loading a checkpoint.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
-    /// The blob isn't `MessagePack` decodable into a [`Checkpoint`].
+    /// The blob isn't `MessagePack` decodable into a `Checkpoint`.
     #[error("checkpoint deserialization failed: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
     /// `MessagePack` serialization failed (doesn't happen on a valid
@@ -78,6 +87,20 @@ pub enum CheckpointError {
         found: u32,
         /// Version expected by this engine.
         expected: u32,
+    },
+    /// The checkpoint's [`Ablation`] (env-var A/B switches) differs from the
+    /// running process's: explicit refusal, same precedent as
+    /// [`CheckpointError::Version`]. Resuming under a different ablation
+    /// silently resumes the same seed in different physics (see
+    /// [`crate::ablation`]) — refuse, don't warn.
+    #[error(
+        "checkpoint ablation differs from the running process, refusing to resume in a \
+         different physics: {differences} (match the environment variables to the ones the \
+         checkpoint was saved under, or start a fresh world)"
+    )]
+    Ablation {
+        /// One entry per diverging field, from [`Ablation::differences`].
+        differences: String,
     },
 }
 
@@ -156,6 +179,19 @@ pub(crate) struct Checkpoint {
     /// (default), consistent with fresh world.
     #[serde(default)]
     pub(crate) lake_params: LakeParams,
+    /// Env-var A/B switches in effect when this checkpoint was saved.
+    /// `serde(default)`: a file predating the field is read as
+    /// [`Ablation::defaults`], which is the only information it carries —
+    /// the switches are perf experiments run deliberately, so a file with
+    /// no record of one was produced under the compiled configuration.
+    ///
+    /// Refusing such a file instead would cost the one that exists:
+    /// `frontend/worlds/aged.ckptz`, the 42-year world the public embed
+    /// boots on, saved by engine 0.10.0 before this field existed. Same
+    /// precedent as the `serde(default)` fields above. See
+    /// [`crate::ablation`].
+    #[serde(default)]
+    pub(crate) ablation: Ablation,
 }
 
 impl Checkpoint {
@@ -177,6 +213,12 @@ impl Checkpoint {
             return Err(CheckpointError::Version {
                 found: ckpt.format_version,
                 expected: CHECKPOINT_FORMAT_VERSION,
+            });
+        }
+        let differences = ckpt.ablation.differences(Ablation::effective());
+        if !differences.is_empty() {
+            return Err(CheckpointError::Ablation {
+                differences: differences.join("; "),
             });
         }
         Ok(ckpt)
@@ -259,11 +301,12 @@ mod tests {
         fire_params: FireParams,
     }
 
-    /// Strips the 7 `#[serde(default)]` fields from a complete
+    /// Strips the `#[serde(default)]` fields from a complete
     /// [`Checkpoint`] and re-encodes: faithfully simulates a file
-    /// produced by an engine predating #105/#106 (the missing keys don't
-    /// exist at all in the `MessagePack` map, not just set to a default
-    /// value).
+    /// produced by an engine predating #105/#106 and the `ablation` field
+    /// (the missing keys don't exist at all in the `MessagePack` map, not
+    /// just set to a default value). `frontend/worlds/aged.ckptz` is
+    /// exactly such a file.
     fn omit_serde_default_fields(full: Checkpoint) -> Vec<u8> {
         let Checkpoint {
             magic,
@@ -457,5 +500,71 @@ mod tests {
                 "water_level NaN after restoring an old checkpoint"
             );
         }
+    }
+
+    /// A checkpoint saved and reloaded within the same process (hence the
+    /// same [`Ablation::effective`]) must decode: the happy path that
+    /// `checkpoint_with_different_ablation_is_refused` contrasts with.
+    #[test]
+    fn checkpoint_with_matching_ablation_decodes() {
+        let sim = sim_with_terrain(4, 1);
+        let bytes = sim.save_state().expect("save_state must not fail");
+        Checkpoint::decode(&bytes)
+            .expect("a checkpoint saved under the running process's own ablation must decode");
+    }
+
+    /// A checkpoint whose ablation config doesn't match the running
+    /// process's must be refused, not silently loaded under a different
+    /// physics (the bug this module exists to close). Built by hand-editing
+    /// a decoded [`Checkpoint`]'s `ablation` field, never
+    /// `std::env::set_var` (unsafe in Rust 2024, and would leak into every
+    /// other test in this binary).
+    #[test]
+    fn checkpoint_with_different_ablation_is_refused() {
+        let sim = sim_with_terrain(4, 1);
+        let bytes = sim.save_state().expect("save_state must not fail");
+        let mut ckpt: Checkpoint =
+            rmp_serde::from_slice(&bytes).expect("raw decode of a checkpoint we just produced");
+        ckpt.ablation.wind_subsample += 1;
+        let tampered_bytes = ckpt.encode().expect("re-encode must not fail");
+
+        let err = Checkpoint::decode(&tampered_bytes)
+            .err()
+            .expect("a checkpoint with a mismatched ablation must be refused");
+        match err {
+            CheckpointError::Ablation { differences } => {
+                assert!(
+                    differences.contains("wind_subsample"),
+                    "refusal message must name the diverging field, got: {differences}"
+                );
+            }
+            other => panic!("expected CheckpointError::Ablation, got {other:?}"),
+        }
+    }
+
+    /// A blob written before `ablation` existed must still decode, and
+    /// decode as [`Ablation::defaults`].
+    ///
+    /// This is a sentinel, not a nicety: `frontend/worlds/aged.ckptz` is
+    /// such a blob (engine 0.10.0, no `ablation` key) and it is the world
+    /// the public embed boots on. No test loads that file — 2 MB gzipped,
+    /// 52 MB decompressed — so nothing else in the suite notices when a
+    /// schema change locks it out. Bumping `CHECKPOINT_FORMAT_VERSION` for
+    /// `ablation` did exactly that, and 388 green tests said nothing.
+    #[test]
+    fn checkpoint_without_an_ablation_key_decodes_as_defaults() {
+        let sim = sim_with_terrain(4, 1);
+        let bytes = sim.save_state().expect("save_state must not fail");
+        let stripped = omit_serde_default_fields(
+            rmp_serde::from_slice(&bytes).expect("raw decode of a checkpoint we just produced"),
+        );
+
+        let ckpt = Checkpoint::decode(&stripped)
+            .expect("a blob predating the `ablation` field must still decode");
+        assert_eq!(
+            ckpt.ablation,
+            Ablation::defaults(),
+            "a missing `ablation` key must read as the compiled defaults"
+        );
     }
 }

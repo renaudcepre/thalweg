@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lithology::LithologyId;
 use crate::species::SPECIES_COUNT;
-use crate::units::MM_PER_M;
+use crate::units::{Meters, Mm};
 
 /// Properties of a hexagonal cell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,9 +119,14 @@ impl CellProperties {
     /// meters: 100 mm of water offset 100 m of relief, hence stable
     /// water bodies on slopes ("lakes on slopes", diag #103). The hydrostatic
     /// equilibrium is now a genuine flat free surface in m.
+    ///
+    /// Routed through `Mm`/`Meters` (units.rs) rather than a bare division:
+    /// the compiler, not a re-read of this function, is what now rejects
+    /// adding `water_level` (mm) straight to `elevation` (m).
     #[must_use]
     pub fn effective_elevation(&self) -> f32 {
-        self.elevation + (self.water_level - self.water_capacity).max(0.0) / MM_PER_M
+        let surplus = (Mm(self.water_level) - Mm(self.water_capacity)).non_negative();
+        (Meters(self.elevation) + surplus.to_meters()).0
     }
 
     /// Total humidity of the atmospheric column (surface + upper + droplets).
@@ -205,7 +210,8 @@ mod tests {
                 water_capacity: wc,
                 ..Default::default()
             };
-            let expected = elev + (wl - wc).max(0.0) / MM_PER_M;
+            let surplus = (Mm(wl) - Mm(wc)).non_negative();
+            let expected = (Meters(elev) + surplus.to_meters()).0;
             prop_assert!((cell.effective_elevation() - expected).abs() < 1e-3);
         }
     }

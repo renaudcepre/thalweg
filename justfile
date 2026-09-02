@@ -97,13 +97,20 @@ fmt:
 fmt-check:
     cargo fmt --check
 
-# Full check (fmt + lint + default suite)
+# Rustdoc lint: broken and private intra-doc links become hard errors
+# (`-D warnings`, same posture as `lint`). Whole workspace, not just
+# hexsim-core: the repo ships as a public mirror, so a broken link renders
+# as-is on the generated docs, and nothing else catches this.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+# Full check (fmt + lint + doc + default suite)
 check:
-    cargo fmt --check && cargo clippy --all-targets --all-features --keep-going -- -D warnings && cargo nextest run --no-fail-fast -E "not ({{known_reds}})"
+    cargo fmt --check && cargo clippy --all-targets --all-features --keep-going -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features && cargo nextest run --no-fail-fast -E "not ({{known_reds}})"
 
 # Pre-merge check: like `check` but with the full suite (test-all)
 check-all:
-    cargo fmt --check && cargo clippy --all-targets --all-features --keep-going -- -D warnings && cargo nextest run --profile heavy --no-fail-fast -E "not ({{known_reds}})" && ../scripts/known-reds.sh "{{known_reds}}" {{known_reds_count}}
+    cargo fmt --check && cargo clippy --all-targets --all-features --keep-going -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features && cargo nextest run --profile heavy --no-fail-fast -E "not ({{known_reds}})" && ../scripts/known-reds.sh "{{known_reds}}" {{known_reds_count}}
 
 # Run the server (release = ~10x faster, also builds hexsim-ctl and hexsim-mcp)
 run:
@@ -142,8 +149,10 @@ rebuild:
     echo "✓ Server restarted, v$VERSION · $HASH"
     echo "  logs: tail -f /tmp/hexsim.log"
 
-# Doc tests
-doc:
+# Doc tests (the `compile_fail`/executable examples embedded in doc comments,
+# e.g. `units::Meters`). Distinct from `just doc`, which lints the comments
+# themselves (broken links), not the code samples inside them.
+doctest:
     cargo test --doc
 
 # ── Optim: parameter evaluation harness ─────

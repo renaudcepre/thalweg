@@ -34,7 +34,10 @@ pub use condensation::{saturation_surface, saturation_upper, saturation_upper_pw
 pub use params::AtmosphereParams;
 pub use precipitation::cloud_water_to_qc;
 pub use scratch::AtmoScratch;
-pub use uplift::step_evaporation;
+pub use uplift::{EvapStats, step_evaporation};
+// Crate-internal only: consumed by `ablation::Ablation::defaults` to build
+// the compiled-in default without duplicating the constant.
+pub(crate) use scaling::TRANSPORT_SUBSAMPLE_HOURS;
 
 /// Water vapor specific constant (J/kg/K). Used to convert a saturation
 /// vapor pressure into a density via the ideal gas law:
@@ -166,7 +169,7 @@ pub fn step_atmosphere_into(
     // bit-identical to the inline call it replaces.
     scratch.fill_sat_upper_offset(current, params, temp_params);
 
-    step_evaporation(current, next, params, wind_mag);
+    step_evaporation(current, next, params, wind_mag, &mut scratch.evap);
     // Orographic convection BEFORE advection: fresh vapor evaporated near a
     // relief must rise orographically before being swept away by downslope
     // thermal breezes (which flow down reliefs in a closed terrarium).

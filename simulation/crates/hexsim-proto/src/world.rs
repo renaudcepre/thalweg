@@ -163,8 +163,12 @@ impl World {
     }
 
     /// Column-packed msgpack snapshot, ready to send.
-    #[must_use]
-    pub fn snapshot_bytes(&self) -> bytes::Bytes {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`wire::encode_snapshot`]'s error: see its doc for when
+    /// that happens and why it isn't masked here either.
+    pub fn snapshot_bytes(&self) -> Result<bytes::Bytes, rmp_serde::encode::Error> {
         wire::encode_snapshot(&self.sim.snapshot())
     }
 

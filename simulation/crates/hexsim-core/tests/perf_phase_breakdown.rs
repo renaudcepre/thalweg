@@ -30,7 +30,8 @@ use hexsim_core::simulation::{synoptic_subsample_hours, wind_subsample_hours};
 use hexsim_core::snow::{SnowForcing, SnowParams, step_snow};
 use hexsim_core::synoptic_mesh::SynopticMesh;
 use hexsim_core::temperature::{
-    SolarBeam, TemperatureParams, compute_illumination, solar_beam_at_tick, step_temperature,
+    SolarBeam, TemperatureForcing, TemperatureParams, compute_illumination, solar_beam_at_tick,
+    step_temperature,
 };
 use hexsim_core::terrain::{TerrainParams, generate_terrain};
 use hexsim_core::wind::{
@@ -101,7 +102,16 @@ fn illum_and_temp(
     il: &mut Vec<f32>,
 ) {
     compute_illumination(current, beam, p.temp.cloud_albedo_coef, 1500.0, ff, il);
-    step_temperature(current, next, &p.temp, hour_tick, ff, &p.snow);
+    step_temperature(
+        current,
+        next,
+        &p.temp,
+        &TemperatureForcing {
+            hour_tick,
+            flux_factor: ff,
+            snow: &p.snow,
+        },
+    );
 }
 
 struct AllParams {
@@ -311,13 +321,13 @@ fn run_phases(grid: HexGrid) -> (PhaseTimings, usize) {
                 &s.current,
                 &mut s.next,
                 &p.snow,
-                p.gw.max_capacity,
                 &SnowForcing {
                     beam_w_m2: solar.beam,
                     ground_albedo: p.temp.ground_albedo,
                     flux_factor: &s.flux_factor,
                     wind_mag: &s.wind_mag,
                     rain_last_tick: &s.precip_tick,
+                    gw_max_capacity: p.gw.max_capacity,
                 },
             );
             std::mem::swap(&mut s.current, &mut s.next);

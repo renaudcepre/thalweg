@@ -1,28 +1,57 @@
+//! The simulation engine: per-tick orchestration, the `Simulation` state,
+//! and the API surface around it.
+//!
+//! Split (same pattern as `temperature/`: `mod.rs` owns the shared state,
+//! sub-modules add `impl Simulation` blocks) out of a former single
+//! 1700+ line `simulation.rs` into one file per concern:
+//!
+//! - This top-level module: [`crate::simulation::FireStats`], the [`crate::simulation::Simulation`] struct
+//!   itself, and the orchestration — `new`, `step`, `step_hour` and the
+//!   private helpers they call (`refresh_wind`, `step_hydro_tranche`,
+//!   `level_lakes`, `step_daily_tail`). The call order inside
+//!   `step_hour`/`step_daily_tail` is physics (convection before
+//!   advection, groundwater before hydro), written in hand rather than
+//!   dispatched through a generic trait (issue #61: no `Phenomenon`
+//!   trait).
+//! - `accessors`: the read/write API surface — `snapshot`,
+//!   `diagnostics`, `grid`, `tick`, the `*_params` getters, the `set_*`
+//!   setters. Passthrough onto the fields declared here, kept out of the
+//!   orchestration so it doesn't drown it.
+//! - `params`: `update_param`, the stringly-typed runtime tuning
+//!   dispatch (`group.field` keys), and its two per-group helpers.
+//! - `persistence`: `save_state`/`load_state`, the checkpoint glue.
+//!
+//! `Simulation`'s fields stay private to this module. Every sub-module
+//! below is a child of `simulation`, so an `impl Simulation` block there
+//! sees the same private fields as this file — no re-export needed, and
+//! `hexsim_core::simulation::X` stays the exact same public path for
+//! every `X` regardless of which sub-module implements it: the split
+//! moves code, it does not change the crate's public surface.
+
+use crate::ablation::Ablation;
 use crate::atmosphere::{
     AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, step_atmosphere_into,
 };
-use crate::checkpoint::{CHECKPOINT_FORMAT_VERSION, Checkpoint, CheckpointError, MAGIC};
 use crate::climate::{ClimateHistory, DayRecord};
-use crate::climate_normals::{CellClimateNormals, ClimateNormalsAccumulator};
-use crate::diagnostics::{Diagnostics, compute_diagnostics};
+use crate::climate_normals::ClimateNormalsAccumulator;
 use crate::dynamics::{SynopticParams, SynopticState};
 use crate::erosion::{
     DischargeEmaMap, EdgeFluxEmaMap, ErosionForcing, ErosionParams, step_erosion, update_edge_ema,
     update_ema,
 };
 use crate::fire::{FireParams, step_fire};
-use crate::grid::{GridState, HexGrid};
+use crate::grid::HexGrid;
 use crate::groundwater::{GroundwaterParams, step_groundwater};
 use crate::hydro::{
-    DischargeMap, EdgeFluxMap, FlowVecMap, FluxMap, HydroMaps, HydroParams, step_hydro_mfd_into,
+    DischargeMap, EdgeFluxMap, FlowVecMap, FluxMap, HydroParams, step_hydro_mfd_into,
 };
 use crate::lake::{LakeParams, step_lake_leveling};
 use crate::phase_timing::{PhaseTimings, elapsed_s, mark};
 use crate::snow::{SnowForcing, SnowParams, step_snow};
 use crate::synoptic_mesh::SynopticMesh;
 use crate::temperature::{
-    IllumCache, TemperatureParams, aspect_insolation_correction, compute_illumination_cached,
-    compute_surface_normals, solar_beam_at_tick, step_temperature,
+    IllumCache, TemperatureForcing, TemperatureParams, aspect_insolation_correction,
+    compute_illumination_cached, compute_surface_normals, solar_beam_at_tick, step_temperature,
 };
 use crate::time::{self, TICKS_PER_DAY};
 use crate::vegetation::{VegetationParams, step_vegetation};
@@ -30,6 +59,10 @@ use crate::wind::{
     WindField, WindParams, WindVec, compute_wind_field_into, compute_wind_magnitudes_into,
 };
 use serde::Serialize;
+
+mod accessors;
+mod params;
+mod persistence;
 
 /// Fire metrics accumulated since the simulation started (#wildfire).
 /// `peak_burning` = largest number of cells simultaneously on fire, the
@@ -77,20 +110,14 @@ const HYDRO_MFD_PASSES_PER_DAY: u32 = 8;
 /// keeps the diurnal breeze sampled finely enough. Going higher is not
 /// justified by these metrics (rain/clouds), which don't capture local
 /// breeze fidelity. Overridable via `HEXSIM_WIND_SUBSAMPLE` for A/B testing.
-const WIND_SUBSAMPLE_HOURS: u64 = 3;
+pub(crate) const WIND_SUBSAMPLE_HOURS: u64 = 3;
 
 /// Effective value: `WIND_SUBSAMPLE_HOURS` by default, overridden by
-/// `HEXSIM_WIND_SUBSAMPLE` (parametric A/B without recompiling). Read once.
+/// `HEXSIM_WIND_SUBSAMPLE` (parametric A/B without recompiling). Delegates
+/// to [`Ablation::effective`], which reads the environment once for the
+/// whole process.
 fn wind_subsample() -> u64 {
-    use std::sync::OnceLock;
-    static N: OnceLock<u64> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("HEXSIM_WIND_SUBSAMPLE")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(WIND_SUBSAMPLE_HOURS)
-    })
+    Ablation::effective().wind_subsample
 }
 
 /// Synoptic ODE subsampling. The prognostic integrator
@@ -120,21 +147,20 @@ fn wind_subsample() -> u64 {
 /// (wind then always reads a freshly-written `synoptic_base`). `plainsP`
 /// drifts ±1-4 % with no consistent sign across seeds -> noise, not a bias.
 /// `M=1` = historical behaviour. Overridable via `HEXSIM_SYNOPTIC_SUBSAMPLE`.
-const SYNOPTIC_SUBSAMPLE_HOURS: u64 = 3;
+pub(crate) const SYNOPTIC_SUBSAMPLE_HOURS: u64 = 3;
 
 /// Effective value: `SYNOPTIC_SUBSAMPLE_HOURS` by default, overridden by
-/// `HEXSIM_SYNOPTIC_SUBSAMPLE` (parametric A/B without recompiling). Read once.
+/// `HEXSIM_SYNOPTIC_SUBSAMPLE` (parametric A/B without recompiling).
+/// Delegates to [`Ablation::effective`], which reads the environment once
+/// for the whole process.
 fn synoptic_subsample() -> u64 {
-    use std::sync::OnceLock;
-    static M: OnceLock<u64> = OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("HEXSIM_SYNOPTIC_SUBSAMPLE")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(SYNOPTIC_SUBSAMPLE_HOURS)
-    })
+    Ablation::effective().synoptic_subsample
 }
+
+/// Compiled-in default for the coarse synoptic mesh toggle: coarse ON. See
+/// the ablation rationale and A/B table at its call site in
+/// `Simulation::new` (`synoptic_coarse`, `HEXSIM_SYNOPTIC_COARSE`).
+pub(crate) const SYNOPTIC_COARSE_DEFAULT: bool = true;
 
 /// Effective subsample cadences (#89, synoptic), exposed so that instruments
 /// that replay the tick phase by phase (`perf_phase_breakdown`) measure at
@@ -344,8 +370,11 @@ impl Simulation {
         // so floor noise, same verdict as plainsP on 07-07. Perf outside
         // contention: synoptic 83.2 % -> 2.0 % of tick r30 (7.131 -> 0.029
         // ms/hour-tick), r45 end-to-end 427 -> 75.3 ms/tick.
-        let synoptic_coarse = std::env::var("HEXSIM_SYNOPTIC_COARSE")
-            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"));
+        //
+        // Effective value: `SYNOPTIC_COARSE_DEFAULT` unless overridden by
+        // `HEXSIM_SYNOPTIC_COARSE`, resolved through [`Ablation::effective`]
+        // (reads the environment once for the whole process).
+        let synoptic_coarse = Ablation::effective().synoptic_coarse;
         let mut synoptic_mesh = if synoptic_coarse {
             SynopticMesh::build(&grid)
         } else {
@@ -497,9 +526,11 @@ impl Simulation {
             &self.current,
             &mut self.next,
             &self.temperature_params,
-            self.hour_tick,
-            &self.scratch_flux_factor,
-            &self.snow_params,
+            &TemperatureForcing {
+                hour_tick: self.hour_tick,
+                flux_factor: &self.scratch_flux_factor,
+                snow: &self.snow_params,
+            },
         );
         std::mem::swap(&mut self.current, &mut self.next);
         self.timings.temperature += elapsed_s(t0);
@@ -514,13 +545,13 @@ impl Simulation {
             &self.current,
             &mut self.next,
             &self.snow_params,
-            self.groundwater_params.max_capacity,
             &SnowForcing {
                 beam_w_m2: solar.beam,
                 ground_albedo: self.temperature_params.ground_albedo,
                 flux_factor: &self.scratch_flux_factor,
                 wind_mag: &self.wind_mag,
                 rain_last_tick: &self.scratch_precip_tick,
+                gw_max_capacity: self.groundwater_params.max_capacity,
             },
         );
         std::mem::swap(&mut self.current, &mut self.next);
@@ -782,646 +813,6 @@ impl Simulation {
         std::mem::swap(&mut self.current, &mut self.next);
         self.timings.fire += elapsed_s(t0);
     }
-
-    #[must_use]
-    pub fn snapshot(&self) -> GridState {
-        // `discharge`/`edge_flux` come from the EMA (#105), not the day's
-        // slice: the displayed network drifts with the seasons instead of
-        // rearranging on every rainy day (#106 point 2). `flow_vec` stays
-        // the instantaneous slice, no EMA exists for this field, out of
-        // scope for #106 (it drives neither river nor lake in the render).
-        let mut state = self.current.snapshot(
-            time::ticks_to_days(self.hour_tick),
-            self.hour_tick,
-            &HydroMaps {
-                discharge: &self.discharge_ema,
-                flow_vec: &self.flow_vec_map,
-                edge_flux: &self.edge_flux_ema,
-            },
-            &self.wind_field,
-            &self.last_precipitation,
-        );
-        // Synoptic fields (Phase 2): filled here, not in `grid.snapshot`, the
-        // synoptic state lives in the sim, the grid doesn't know about the
-        // dynamics. Total wind `(u + U, v)` in m/s: the base that the wind
-        // pipeline consumes when `synoptic.enabled` (source of truth on the
-        // core side, the front-end displays it blindly, anti-pattern #2).
-        // The state lives on the coarse torus: sampled per fine cell with the
-        // same barycentric weights as the base wind.
-        let (u, v) = self.synoptic_state.velocity();
-        let h = self.synoptic_state.height();
-        let u0 = self.synoptic_params.mean_flow_ms;
-        for (i, cell) in state.cells.iter_mut().enumerate() {
-            cell.synoptic_h = self.synoptic_mesh.sample_scalar(h, i);
-            cell.synoptic_u = self.synoptic_mesh.sample_scalar(u, i) + u0;
-            cell.synoptic_v = self.synoptic_mesh.sample_scalar(v, i);
-        }
-        // Illumination (#102): display factor [0,1] per cell (aspect x
-        // occlusion x cloud shadow), computed by `compute_illumination` this
-        // tick. Lives in the sim; the front-end colors the albedo with it,
-        // no recompute (#2).
-        for (cell, &illum) in state.cells.iter_mut().zip(self.scratch_illumination.iter()) {
-            cell.illumination = illum;
-        }
-        state
-    }
-
-    #[must_use]
-    pub fn diagnostics(&self) -> Diagnostics {
-        let mut diag = compute_diagnostics(
-            &self.current,
-            time::ticks_to_days(self.hour_tick),
-            &self.discharge_map,
-            &self.wind_field,
-            &self.last_precipitation,
-            &self.atmosphere_params,
-        );
-        diag.synoptic = Some(
-            self.synoptic_state
-                .stats(&self.synoptic_params, self.synoptic_enabled),
-        );
-        diag.erosion = Some(crate::diagnostics::ErosionStats {
-            enabled: self.erosion_params.enabled,
-            gini_discharge_ema: crate::erosion::discharge_gini(&self.discharge_ema),
-            sediment_in_transit_m: self
-                .current
-                .cells_slice()
-                .iter()
-                .map(|c| f64::from(c.sediment_load))
-                .sum(),
-            incised_total_m: self.erosion_incised_total,
-            deposited_total_m: self.erosion_deposited_total,
-            closed_depressions: crate::erosion::closed_depression_indices(&self.current).len(),
-        });
-        diag
-    }
-
-    #[must_use]
-    pub fn climate_history(&self) -> &ClimateHistory {
-        &self.climate_history
-    }
-
-    /// Wall-clock cumulative totals per real tick phase (cf.
-    /// [`PhaseTimings`]). Always zero on wasm32.
-    #[must_use]
-    pub fn phase_timings(&self) -> &PhaseTimings {
-        &self.timings
-    }
-
-    /// Resets the phase counters to zero (windowing a measurement).
-    pub fn reset_phase_timings(&mut self) {
-        self.timings = PhaseTimings::default();
-    }
-
-    /// Climate normals per cell (#79), indexed like `grid().cells_slice()`.
-    /// Last complete year; default values as long as no year has finished
-    /// (cf. `climate_normals_ready`).
-    #[must_use]
-    pub fn climate_normals(&self) -> &[CellClimateNormals] {
-        self.climate_normals.normals()
-    }
-
-    /// `true` as soon as at least one year has been simulated (normals
-    /// available).
-    #[must_use]
-    pub fn climate_normals_ready(&self) -> bool {
-        self.climate_normals.has_normals()
-    }
-
-    #[must_use]
-    pub fn last_precipitation(&self) -> &PrecipitationMap {
-        &self.last_precipitation
-    }
-
-    #[must_use]
-    pub fn grid(&self) -> &HexGrid {
-        &self.current
-    }
-
-    /// Day counter elapsed since creation (v0.2.x API compat). Derived from
-    /// `hour_tick / TICKS_PER_DAY`, the current hour of day isn't visible
-    /// through it. Use `hour_tick()`, `day_of_year()` or `hour_of_day()` for
-    /// hourly resolution.
-    #[must_use]
-    pub fn tick(&self) -> u64 {
-        time::ticks_to_days(self.hour_tick)
-    }
-
-    /// Cumulative hour counter since creation (v0.3.0, issue #38).
-    /// 1 unit = 1 hour. Exposes the sub-tick temporal resolution for
-    /// consumers that want to trace dawn/dusk tick by tick.
-    #[must_use]
-    pub fn hour_tick(&self) -> u64 {
-        self.hour_tick
-    }
-
-    /// Day of year [0, 364] for the current tick.
-    #[must_use]
-    pub fn day_of_year(&self) -> u16 {
-        time::day_of_year(self.hour_tick)
-    }
-
-    /// Local hour [0, 23] for the current tick. In PR1 always 0 when
-    /// observed from the external API (`step()` advances by 24 hours).
-    #[must_use]
-    pub fn hour_of_day(&self) -> u8 {
-        time::hour_of_day(self.hour_tick)
-    }
-
-    #[must_use]
-    pub fn discharge_map(&self) -> &DischargeMap {
-        &self.discharge_map
-    }
-
-    #[must_use]
-    pub fn flow_vec_map(&self) -> &FlowVecMap {
-        &self.flow_vec_map
-    }
-
-    /// Outgoing flux per edge (order `coord::DIRECTIONS`), accumulated over
-    /// the last daily hydro slice (#103). `Σ_dir == discharge_map[i]` up to
-    /// f32 epsilon.
-    #[must_use]
-    pub fn edge_flux_map(&self) -> &EdgeFluxMap {
-        &self.edge_flux_map
-    }
-
-    /// EMA of daily discharge (mm/day, τ = `erosion.tau_days`), the flux
-    /// history that drives stream power (#105) and the stabilized network
-    /// rendering consumed by `snapshot` (#106).
-    #[must_use]
-    pub fn discharge_ema_map(&self) -> &DischargeEmaMap {
-        &self.discharge_ema
-    }
-
-    /// EMA of flux per edge, same cadence as [`discharge_ema_map`](Self::discharge_ema_map).
-    #[must_use]
-    pub fn edge_flux_ema_map(&self) -> &EdgeFluxEmaMap {
-        &self.edge_flux_ema
-    }
-
-    /// Cumulative erosion counters since creation: (bedrock incised,
-    /// load redeposited), in m accumulated over the map.
-    #[must_use]
-    pub fn erosion_totals(&self) -> (f64, f64) {
-        (self.erosion_incised_total, self.erosion_deposited_total)
-    }
-
-    /// Total ascent `w = H·(−∇·v) + v·∇z` (m/s) per cell, buffer for the
-    /// ascent trigger (synoptic Phase 3). Empty if `updraft_ref_ms = 0`
-    /// (the scratch is only filled when the trigger is active). Diagnostic
-    /// only.
-    #[must_use]
-    pub fn updraft_field(&self) -> &[f32] {
-        &self.scratch_atmo.convergence
-    }
-
-    #[must_use]
-    pub fn wind_field(&self) -> &WindField {
-        &self.wind_field
-    }
-
-    /// Synoptic state (Phase 1), geopotential height / prognostic wind.
-    /// Exposed for diagnostics (isobars, L/H). Read-only.
-    #[must_use]
-    pub fn synoptic_state(&self) -> &SynopticState {
-        &self.synoptic_state
-    }
-
-    /// Does synoptic dynamics drive the wind (param `synoptic.enabled`,
-    /// hardcoded ON by default)?
-    #[must_use]
-    pub fn synoptic_enabled(&self) -> bool {
-        self.synoptic_enabled
-    }
-
-    /// Test/diagnostic seam: forces a uniform surface wind field, short-
-    /// circuiting the whole pipeline (noise/thermal/relief/synoptic) and
-    /// disabling synoptic dynamics. Replaces the old `west_bias=… +
-    /// synoptic.enabled=0` fixture from the advection tests. Upper-level
-    /// wind is still derived from this uniform field (rotation + ratio) in
-    /// the atmosphere pass.
-    pub fn set_uniform_wind(&mut self, wind: WindVec) {
-        self.uniform_wind = Some(wind);
-        self.synoptic_enabled = false;
-        self.wind_field.fill(wind);
-        compute_wind_magnitudes_into(&self.wind_field, &mut self.wind_mag);
-    }
-
-    #[must_use]
-    pub fn atmosphere_params(&self) -> &AtmosphereParams {
-        &self.atmosphere_params
-    }
-
-    #[must_use]
-    pub fn hydro_params(&self) -> &HydroParams {
-        &self.hydro_params
-    }
-
-    #[must_use]
-    pub fn groundwater_params(&self) -> &GroundwaterParams {
-        &self.groundwater_params
-    }
-
-    #[must_use]
-    pub fn snow_params(&self) -> &SnowParams {
-        &self.snow_params
-    }
-
-    #[must_use]
-    pub fn temperature_params(&self) -> &TemperatureParams {
-        &self.temperature_params
-    }
-
-    #[must_use]
-    pub fn wind_params(&self) -> &WindParams {
-        &self.wind_params
-    }
-
-    #[must_use]
-    pub fn vegetation_params(&self) -> &VegetationParams {
-        &self.vegetation_params
-    }
-
-    #[must_use]
-    pub fn synoptic_params(&self) -> &SynopticParams {
-        &self.synoptic_params
-    }
-
-    #[must_use]
-    pub fn erosion_params(&self) -> &ErosionParams {
-        &self.erosion_params
-    }
-
-    /// Replaces the erosion parameters (preserved on reset, like fire).
-    pub fn set_erosion_params(&mut self, params: ErosionParams) {
-        self.erosion_params = params;
-    }
-
-    #[must_use]
-    pub fn lake_params(&self) -> &LakeParams {
-        &self.lake_params
-    }
-
-    /// Replaces the lake leveling parameters (preserved on reset).
-    pub fn set_lake_params(&mut self, params: LakeParams) {
-        self.lake_params = params;
-    }
-
-    #[must_use]
-    pub fn fire_params(&self) -> &FireParams {
-        &self.fire_params
-    }
-
-    /// Cumulative fire metrics, for calibration (#wildfire).
-    #[must_use]
-    pub fn fire_stats(&self) -> FireStats {
-        let currently_burning = self
-            .current
-            .cells_slice()
-            .iter()
-            .filter(|c| c.fire_intensity > 1e-3)
-            .count();
-        FireStats {
-            ignitions_total: self.fire_ignitions_total,
-            cell_days_total: self.fire_cell_days_total,
-            peak_burning: self.fire_peak_burning,
-            currently_burning,
-        }
-    }
-
-    /// Sets the fire randomness seed (determinism "1 seed = 1 world").
-    pub fn set_seed(&mut self, seed: u32) {
-        self.seed = seed;
-    }
-
-    /// Replaces the fire parameters (preserved on reset, like the others).
-    pub fn set_fire_params(&mut self, params: FireParams) {
-        self.fire_params = params;
-    }
-
-    /// Updates a simulation parameter by "group.field" key.
-    /// Returns true if the key is recognized.
-    pub fn update_param(&mut self, key: &str, value: f32) -> bool {
-        if key.starts_with("atmosphere.") {
-            return self.set_atmosphere_param(key, value);
-        }
-        if key.starts_with("erosion.") {
-            return self.set_erosion_param(key, value);
-        }
-        match key {
-            // Hydrology
-            "hydro.flow_rate" => self.hydro_params.flow_rate = value,
-            "hydro.slope_full_mobility" => self.hydro_params.slope_full_mobility = value,
-            "hydro.flow_concentration" => self.hydro_params.flow_concentration = value,
-            // Lake leveling (#106)
-            "lake.enabled" => self.lake_params.enabled = value != 0.0,
-            "lake.min_surplus_mm" => self.lake_params.min_surplus_mm = value,
-            // Groundwater
-            "groundwater.infiltration_rate" => {
-                self.groundwater_params.infiltration_rate = value;
-            }
-            "groundwater.diffusion_rate" => self.groundwater_params.diffusion_rate = value,
-            "groundwater.max_capacity" => self.groundwater_params.max_capacity = value,
-            "groundwater.baseflow_coef" => self.groundwater_params.baseflow_coef = value,
-            // Snow
-            "snow.snow_albedo_dry" => self.snow_params.snow_albedo_dry = value,
-            "snow.snow_albedo_melt" => self.snow_params.snow_albedo_melt = value,
-            "snow.snow_emissivity" => self.snow_params.snow_emissivity = value,
-            "snow.sensible_exchange_coef" => self.snow_params.sensible_exchange_coef = value,
-            "snow.free_convection_wind_ms" => self.snow_params.free_convection_wind_ms = value,
-            "snow.snow_masking_half_mm" => self.snow_params.snow_masking_half_mm = value,
-            "snow.freeze_threshold" => self.snow_params.freeze_threshold = value,
-            "snow.melt_recharge_frac" => self.snow_params.melt_recharge_frac = value,
-            // Temperature
-            "temperature.base_temp" => self.temperature_params.base_temp = value,
-            "temperature.lapse_rate" => self.temperature_params.lapse_rate = value,
-            "temperature.water_cooling" => self.temperature_params.water_cooling = value,
-            "temperature.thermal_coupling" => self.temperature_params.thermal_coupling = value,
-            "temperature.latitude_deg" => self.temperature_params.latitude_deg = value,
-            "temperature.cloud_albedo_coef" => {
-                self.temperature_params.cloud_albedo_coef = value;
-            }
-            "temperature.atmospheric_transmittance" => {
-                self.temperature_params.atmospheric_transmittance = value;
-            }
-            "temperature.ground_albedo" => {
-                self.temperature_params.ground_albedo = value;
-            }
-            // Wind
-            "wind.noise_direction_amplitude" => {
-                self.wind_params.noise_direction_amplitude = value;
-            }
-            "wind.noise_strength_amplitude" => {
-                self.wind_params.noise_strength_amplitude = value;
-            }
-            "wind.noise_time_scale" => self.wind_params.noise_time_scale = value,
-            "wind.thermal_strength" => self.wind_params.thermal_strength = value,
-            "wind.terrain_deflection" => self.wind_params.terrain_deflection = value,
-            "wind.terrain_speed_factor" => self.wind_params.terrain_speed_factor = value,
-            "wind.humidity_advection_rate" => self.wind_params.humidity_advection_rate = value,
-            "wind.temperature_advection_rate" => {
-                self.wind_params.temperature_advection_rate = value;
-            }
-            "wind.wind_upper_rotation_deg" => {
-                self.wind_params.wind_upper_rotation_deg = value;
-            }
-            "wind.wind_upper_speed_ratio" => {
-                self.wind_params.wind_upper_speed_ratio = value;
-            }
-            // Synoptic dynamics (Phase 1). `deformation_radius_cells` is NOT
-            // hot-reloadable: it fixes H = h₀, frozen at state init
-            // (changing it requires a reset). The others are safe at runtime.
-            "synoptic.enabled" => self.synoptic_enabled = value != 0.0,
-            "synoptic.mean_flow_ms" => self.synoptic_params.mean_flow_ms = value,
-            "synoptic.thermal_anomaly_days" => {
-                self.synoptic_params.thermal_anomaly_days = value;
-            }
-            "synoptic.thermal_coupling" => self.synoptic_params.thermal_coupling = value,
-            "synoptic.viscosity" => self.synoptic_params.viscosity = value,
-            "synoptic.friction_days" => self.synoptic_params.friction_days = value,
-            "synoptic.relax_days" => self.synoptic_params.relax_days = value,
-            // Vegetation (transition to SI, finalized by #77)
-            "vegetation.growth_rate" => self.vegetation_params.growth_rate = value,
-            "vegetation.colonization_rate" => self.vegetation_params.colonization_rate = value,
-            "vegetation.base_mortality" => self.vegetation_params.base_mortality = value,
-            "vegetation.lethal_mortality" => self.vegetation_params.lethal_mortality = value,
-            "vegetation.succession_rate" => self.vegetation_params.succession_rate = value,
-            "vegetation.k_total" => self.vegetation_params.k_total = value,
-            "vegetation.open_water_excess" => self.vegetation_params.open_water_excess = value,
-            // Fire (#wildfire). `fire.enabled`: 0 = off, otherwise on.
-            "fire.enabled" => self.fire_params.enabled = value != 0.0,
-            "fire.ignition_rate" => self.fire_params.ignition_rate = value,
-            "fire.spread_rate" => self.fire_params.spread_rate = value,
-            "fire.moisture_ref_mm" => self.fire_params.moisture_ref_mm = value,
-            "fire.temp_ignite_lo" => self.fire_params.temp_ignite_lo = value,
-            "fire.temp_ignite_hi" => self.fire_params.temp_ignite_hi = value,
-            "fire.fuel_age_half_years" => self.fire_params.fuel_age_half_years = value,
-            "fire.combustion_fraction_per_day" => {
-                self.fire_params.combustion_fraction_per_day = value;
-            }
-            "fire.extinguish_fuel_min" => self.fire_params.extinguish_fuel_min = value,
-            "fire.fuel_load_kg_per_m2" => self.fire_params.fuel_load_kg_per_m2 = value,
-            "fire.combustion_heat_ground_fraction" => {
-                self.fire_params.combustion_heat_ground_fraction = value;
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// Applies an `erosion.*` parameter (#105). Extracted from `update_param`
-    /// to keep it readable (like `set_atmosphere_param`).
-    fn set_erosion_param(&mut self, key: &str, value: f32) -> bool {
-        match key {
-            "erosion.enabled" => self.erosion_params.enabled = value != 0.0,
-            "erosion.k_incision" => self.erosion_params.k_incision = value,
-            "erosion.k_transport" => self.erosion_params.k_transport = value,
-            "erosion.m_exponent" => self.erosion_params.m_exponent = value,
-            "erosion.n_exponent" => self.erosion_params.n_exponent = value,
-            "erosion.tau_days" => self.erosion_params.tau_days = value,
-            "erosion.accel_years_per_day" => self.erosion_params.accel_years_per_day = value,
-            "erosion.cfl_drop_frac" => self.erosion_params.cfl_drop_frac = value,
-            _ => return false,
-        }
-        true
-    }
-
-    fn set_atmosphere_param(&mut self, key: &str, value: f32) -> bool {
-        match key {
-            "atmosphere.transpiration_coef" => self.atmosphere_params.transpiration_coef = value,
-            // Ascent trigger + critical mass (synoptic Phase 3).
-            "atmosphere.updraft_ref_ms" => self.atmosphere_params.updraft_ref_ms = value,
-            "atmosphere.updraft_floor" => self.atmosphere_params.updraft_floor = value,
-            "atmosphere.precip_crit_mm" => self.atmosphere_params.precip_crit_mm = value,
-            "atmosphere.condensation_rate" => {
-                self.atmosphere_params.condensation_rate = value;
-            }
-            "atmosphere.cloud_evap_hr_threshold" => {
-                self.atmosphere_params.cloud_evap_hr_threshold = value;
-            }
-            "atmosphere.cloud_evap_rate" => {
-                self.atmosphere_params.cloud_evap_rate = value;
-            }
-            "atmosphere.kk2000_droplet_count" => {
-                self.atmosphere_params.kk2000_droplet_count = value;
-            }
-            "atmosphere.cloud_diffusion_rate" => {
-                self.atmosphere_params.cloud_diffusion_rate = value;
-            }
-            "atmosphere.precip_neighbor_share" => {
-                self.atmosphere_params.precip_neighbor_share = value;
-            }
-            "atmosphere.max_precip_per_tick" => {
-                self.atmosphere_params.max_precip_per_tick = value;
-            }
-            "atmosphere.fog_condensation_threshold" => {
-                self.atmosphere_params.fog_condensation_threshold = value;
-            }
-            "atmosphere.fog_condensation_rate" => {
-                self.atmosphere_params.fog_condensation_rate = value;
-            }
-            "atmosphere.sublimation_rate" => self.atmosphere_params.sublimation_rate = value,
-            "atmosphere.uplift_rate" => self.atmosphere_params.uplift_rate = value,
-            "atmosphere.uplift_thermal_coef" => {
-                self.atmosphere_params.uplift_thermal_coef = value;
-            }
-            "atmosphere.upper_layer_altitude_m" => {
-                self.atmosphere_params.upper_layer_altitude_m = value;
-            }
-            "atmosphere.global_precip_gate" => {
-                self.atmosphere_params.global_precip_gate = value;
-            }
-            "atmosphere.initial_humidity_floor" => {
-                self.atmosphere_params.initial_humidity_floor = value;
-            }
-            "atmosphere.orographic_lift_coef" => {
-                self.atmosphere_params.orographic_lift_coef = value;
-            }
-            _ => return false,
-        }
-        true
-    }
-}
-
-impl Simulation {
-    /// Serializes the full simulation state to `MessagePack` (see
-    /// [`crate::checkpoint`]). The blob can be reloaded via
-    /// [`Simulation::load_state`] to resume the simulation **identically**;
-    /// bit-identical resumption is proven by test.
-    ///
-    /// # Errors
-    /// Returns [`CheckpointError::Encode`] if `MessagePack` serialization
-    /// fails, which doesn't happen on a valid simulation state, but the API
-    /// stays honest rather than masking the failure with an `unwrap`.
-    pub fn save_state(&self) -> Result<Vec<u8>, CheckpointError> {
-        let checkpoint = Checkpoint {
-            magic: MAGIC.to_string(),
-            format_version: CHECKPOINT_FORMAT_VERSION,
-            engine_version: env!("CARGO_PKG_VERSION").to_string(),
-            grid: self.current.clone(),
-            hour_tick: self.hour_tick,
-            seed: self.seed,
-            fire_ignitions_total: self.fire_ignitions_total,
-            fire_cell_days_total: self.fire_cell_days_total,
-            fire_peak_burning: self.fire_peak_burning,
-            discharge_map: self.discharge_map.clone(),
-            flow_vec_map: self.flow_vec_map.clone(),
-            edge_flux_map: self.edge_flux_map.clone(),
-            discharge_ema: self.discharge_ema.clone(),
-            edge_flux_ema: self.edge_flux_ema.clone(),
-            erosion_incised_total: self.erosion_incised_total,
-            erosion_deposited_total: self.erosion_deposited_total,
-            wind_field: self.wind_field.clone(),
-            wind_mag: self.wind_mag.clone(),
-            synoptic_params: self.synoptic_params.clone(),
-            synoptic_state: self.synoptic_state.clone(),
-            synoptic_enabled: self.synoptic_enabled,
-            synoptic_base: self.synoptic_base.clone(),
-            synoptic_coarse_radius: self.synoptic_mesh.grid().radius(),
-            climate_history: self.climate_history.clone(),
-            last_precipitation: self.last_precipitation.clone(),
-            precip_gate_open: self.precip_gate_open,
-            climate_normals: self.climate_normals.clone(),
-            hydro_params: self.hydro_params.clone(),
-            atmosphere_params: self.atmosphere_params.clone(),
-            groundwater_params: self.groundwater_params.clone(),
-            snow_params: self.snow_params.clone(),
-            temperature_params: self.temperature_params.clone(),
-            wind_params: self.wind_params.clone(),
-            vegetation_params: self.vegetation_params.clone(),
-            fire_params: self.fire_params,
-            erosion_params: self.erosion_params.clone(),
-            lake_params: self.lake_params.clone(),
-        };
-        checkpoint.encode()
-    }
-
-    /// Rebuilds a simulation from a blob produced by
-    /// [`Simulation::save_state`]. The authoritative state is restored verbatim;
-    /// derived fields (double-buffer `next`, scratch buffers) are
-    /// rebuilt on the fly, never depended on from the file.
-    ///
-    /// # Errors
-    /// Returns [`CheckpointError`] if the blob isn't a valid `HexSim`
-    /// checkpoint ([`CheckpointError::Decode`] / [`CheckpointError::BadMagic`])
-    /// or has an incompatible format version ([`CheckpointError::Version`]).
-    pub fn load_state(bytes: &[u8]) -> Result<Self, CheckpointError> {
-        let ckpt = Checkpoint::decode(bytes)?;
-        let current = ckpt.grid;
-        let n = current.len();
-        // Field absent from pre-#103 v2 checkpoints (`serde(default)`): empty
-        // map -> sized to the grid, filled on the next hydro slice.
-        let mut edge_flux_map = ckpt.edge_flux_map;
-        edge_flux_map.resize(n, [0.0; 6]);
-        // Same contract for pre-#105 EMAs: empty -> sized, the EMA
-        // refills over ~3τ (warm-up assumed, see `erosion.rs`).
-        let mut discharge_ema = ckpt.discharge_ema;
-        discharge_ema.resize(n, 0.0);
-        let mut edge_flux_ema = ckpt.edge_flux_ema;
-        edge_flux_ema.resize(n, [0.0; 6]);
-        // `next` is a double-buffer: it must mirror `current` before each
-        // phase (exact parity with `Simulation::new`, which does `grid.clone()`).
-        let next = current.clone();
-        // Mesh rebuilt at the PERSISTED radius (not the current env's): the
-        // verbatim-restored synoptic state stays aligned with its torus.
-        let mut synoptic_mesh =
-            SynopticMesh::with_coarse_radius(&current, ckpt.synoptic_coarse_radius);
-        synoptic_mesh.aggregate_temperature(&current);
-        let mut synoptic_coarse_base: WindField =
-            vec![WindVec::default(); synoptic_mesh.grid().len()];
-        ckpt.synoptic_state
-            .write_base_wind(&ckpt.synoptic_params, &mut synoptic_coarse_base);
-        Ok(Self {
-            current,
-            next,
-            hour_tick: ckpt.hour_tick,
-            hydro_params: ckpt.hydro_params,
-            atmosphere_params: ckpt.atmosphere_params,
-            groundwater_params: ckpt.groundwater_params,
-            snow_params: ckpt.snow_params,
-            temperature_params: ckpt.temperature_params,
-            wind_params: ckpt.wind_params,
-            vegetation_params: ckpt.vegetation_params,
-            fire_params: ckpt.fire_params,
-            seed: ckpt.seed,
-            fire_ignitions_total: ckpt.fire_ignitions_total,
-            fire_cell_days_total: ckpt.fire_cell_days_total,
-            fire_peak_burning: ckpt.fire_peak_burning,
-            discharge_map: ckpt.discharge_map,
-            flow_vec_map: ckpt.flow_vec_map,
-            edge_flux_map,
-            erosion_params: ckpt.erosion_params,
-            lake_params: ckpt.lake_params,
-            discharge_ema,
-            edge_flux_ema,
-            erosion_incised_total: ckpt.erosion_incised_total,
-            erosion_deposited_total: ckpt.erosion_deposited_total,
-            wind_field: ckpt.wind_field,
-            wind_mag: ckpt.wind_mag,
-            uniform_wind: None,
-            synoptic_params: ckpt.synoptic_params,
-            synoptic_state: ckpt.synoptic_state,
-            synoptic_enabled: ckpt.synoptic_enabled,
-            synoptic_base: ckpt.synoptic_base,
-            synoptic_mesh,
-            synoptic_coarse_base,
-            climate_history: ckpt.climate_history,
-            last_precipitation: ckpt.last_precipitation,
-            precip_gate_open: ckpt.precip_gate_open,
-            scratch_wind_snap: vec![WindVec::default(); n],
-            scratch_atmo: AtmoScratch::new(n),
-            scratch_flux: vec![0.0; n],
-            scratch_flow_vec: vec![(0.0, 0.0); n],
-            scratch_edge_flux: vec![[0.0; 6]; n],
-            scratch_precip_tick: vec![DayRecord::default(); n],
-            scratch_flux_factor: vec![0.0; n],
-            scratch_illumination: vec![1.0; n],
-            illum_cache: IllumCache::new(),
-            climate_normals: ckpt.climate_normals,
-            timings: PhaseTimings::default(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1465,56 +856,6 @@ mod tests {
         )
     }
 
-    /// The core of step 1: `save_state` -> `load_state` -> continuation
-    /// **bit-identical**. Saves at a non-aligned instant (mid-day, mid-year)
-    /// to exercise all the hidden state: prognostic synoptic, in-progress
-    /// yearly normals accumulator, intra-day flux maps, precipitation
-    /// hysteresis, retained subsampled wind field. If just one of these
-    /// fields weren't restored, the grid would diverge within a few hours via
-    /// the evaporation/wind/precipitation chain.
-    #[test]
-    fn checkpoint_restart_is_bit_identical() {
-        let mut a = sim_with_terrain(6, 42);
-        // Force synoptic ON (already the hardcoded default since #108, set
-        // explicitly so the prognostic state is part of the tested
-        // round-trip, independent of any future default change).
-        a.update_param("synoptic.enabled", 1.0);
-
-        // 20 days + 7 h: instant not aligned on a day/year boundary.
-        for _ in 0..(20 * 24 + 7) {
-            a.step_hour();
-        }
-
-        let bytes = a.save_state().expect("save_state must not fail");
-        let mut b = Simulation::load_state(&bytes).expect("load_state of a valid blob");
-        assert_eq!(a.hour_tick(), b.hour_tick(), "restored clock");
-
-        // Identical continuation on both sides.
-        for _ in 0..(3 * 24 + 5) {
-            a.step_hour();
-            b.step_hour();
-        }
-
-        // Strong, order-stable comparison (Vec of cells, not a HashMap whose
-        // iteration order is non-deterministic): all per-cell physics must
-        // be bit-identical. `CellProperties` doesn't implement `PartialEq`,
-        // so we compare via `MessagePack` encoding, which is deterministic.
-        let cells_a = rmp_serde::to_vec(a.grid().cells_slice()).expect("encode cells a");
-        let cells_b = rmp_serde::to_vec(b.grid().cells_slice()).expect("encode cells b");
-        assert_eq!(
-            cells_a, cells_b,
-            "grid diverged after restart: a hidden state field was not restored"
-        );
-    }
-
-    /// A blob that isn't a `HexSim` checkpoint must be rejected cleanly,
-    /// never silently misinterpreted.
-    #[test]
-    fn load_state_rejects_foreign_bytes() {
-        let result = Simulation::load_state(b"this is not a checkpoint");
-        assert!(result.is_err(), "a foreign blob must be rejected");
-    }
-
     #[test]
     fn tick_increments() {
         let mut sim = default_sim(2);
@@ -1523,98 +864,6 @@ mod tests {
         assert_eq!(sim.tick(), 1);
         sim.step();
         assert_eq!(sim.tick(), 2);
-    }
-
-    #[test]
-    fn snapshot_returns_current_tick() {
-        let mut sim = default_sim(1);
-        sim.step();
-        sim.step();
-        sim.step();
-        let snap = sim.snapshot();
-        assert_eq!(snap.tick, 3);
-    }
-
-    /// #106 point 2: the displayed network should drift with the seasons, not
-    /// rearrange itself with every rain slice. Pins that `snapshot` sources
-    /// `outflow_flux`/`edge_flux` from the EMA (#105, τ=60d), never from the
-    /// daily slice; otherwise an isolated instantaneous flow makes the
-    /// network flicker in `play` instead of drifting slowly.
-    #[test]
-    fn snapshot_flux_uses_ema_not_daily_tranche() {
-        let mut sim = sim_with_terrain(6, 42);
-        for _ in 0..(3 * 24) {
-            sim.step_hour();
-        }
-
-        let discharge_map = sim.discharge_map().clone();
-        let discharge_ema = sim.discharge_ema_map().clone();
-        assert!(
-            discharge_map.iter().any(|&d| d > 0.0),
-            "no outflow after 3 days, fixture not meaningful"
-        );
-
-        let snap = sim.snapshot();
-        for (i, cell) in snap.cells.iter().enumerate() {
-            assert!(
-                (cell.outflow_flux - discharge_ema[i]).abs() < 1e-6,
-                "cell {i}: outflow_flux={} should follow discharge_ema={}, not discharge_map={}",
-                cell.outflow_flux,
-                discharge_ema[i],
-                discharge_map[i]
-            );
-        }
-
-        // τ=60d by default: after only 3 days the EMA should still lag well
-        // behind the instantaneous value, otherwise the test doesn't
-        // distinguish EMA from raw.
-        let sum_map: f64 = discharge_map.iter().map(|&v| f64::from(v)).sum();
-        let sum_ema: f64 = discharge_ema.iter().map(|&v| f64::from(v)).sum();
-        assert!(
-            sum_ema < sum_map * 0.5,
-            "EMA should be damped vs raw slice after 3 days (map={sum_map}, ema={sum_ema})"
-        );
-    }
-
-    #[test]
-    fn update_param_sets_each_group() {
-        // 1 representative key per group: the setter must be reflected
-        // by the corresponding getter (round-trip).
-        let mut sim = default_sim(1);
-
-        assert!(sim.update_param("atmosphere.uplift_rate", 0.123));
-        assert!((sim.atmosphere_params().uplift_rate - 0.123).abs() < 1e-6);
-
-        assert!(sim.update_param("hydro.flow_rate", 0.456));
-        assert!((sim.hydro_params().flow_rate - 0.456).abs() < 1e-6);
-
-        assert!(sim.update_param("groundwater.max_capacity", 7.5));
-        assert!((sim.groundwater_params().max_capacity - 7.5).abs() < 1e-6);
-
-        assert!(sim.update_param("snow.snow_albedo_dry", 0.7));
-        assert!((sim.snow_params().snow_albedo_dry - 0.7).abs() < 1e-6);
-
-        assert!(sim.update_param("temperature.base_temp", 15.0));
-        assert!((sim.temperature_params().base_temp - 15.0).abs() < 1e-6);
-
-        assert!(sim.update_param("wind.thermal_strength", 0.8));
-        assert!((sim.wind_params().thermal_strength - 0.8).abs() < 1e-6);
-
-        assert!(sim.update_param("vegetation.growth_rate", 0.33));
-        assert!((sim.vegetation_params().growth_rate - 0.33).abs() < 1e-6);
-
-        assert!(sim.update_param("erosion.accel_years_per_day", 50.0));
-        assert!((sim.erosion_params().accel_years_per_day - 50.0).abs() < 1e-6);
-        assert!(sim.update_param("erosion.enabled", 0.0));
-        assert!(!sim.erosion_params().enabled);
-    }
-
-    #[test]
-    fn update_param_unknown_key_returns_false() {
-        let mut sim = default_sim(1);
-        assert!(!sim.update_param("not.a.key", 0.0));
-        assert!(!sim.update_param("atmosphere.unknown", 0.0));
-        assert!(!sim.update_param("", 0.0));
     }
 
     #[test]
@@ -1727,27 +976,5 @@ mod tests {
             );
             assert!(n.insolation_mean >= 0.0, "insolation negative : {n:?}");
         }
-    }
-
-    #[test]
-    fn water_budget_equals_sum_of_components() {
-        // `water_budget.total` must be exactly the sum of the 4 stocks.
-        // If this test fails, a new reservoir was added without updating
-        // `compute_diagnostics`.
-        let mut sim = sim_with_terrain(3, 42);
-        for _ in 0..10 {
-            sim.step();
-        }
-        let diag = sim.diagnostics();
-        let sum = diag.water_budget.surface
-            + diag.water_budget.humidity
-            + diag.water_budget.groundwater
-            + diag.water_budget.snow;
-        assert!(
-            (diag.water_budget.total - sum).abs() < 1e-3,
-            "total={} != surface+humidity+gw+snow={}",
-            diag.water_budget.total,
-            sum
-        );
     }
 }

@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 use crate::coord::hex_direction_to_world;
 use crate::dynamics::{CELL_SPACING_M, STEEP_SLOPE_GRADE};
 use crate::grid::HexGrid;
+use crate::units::MetersPerSecond;
+
+/// Conversion factor from the internal `WindVec` magnitude unit to an
+/// actual wind speed in m/s (convention #33). The `WindField` is
+/// unitless by construction — Perlin noise in [0, 1] blended with
+/// thermal/orographic terms that share no common physical scale (see
+/// `WindParams` doc) — so a single calibrated factor stands in for a
+/// real dimensional analysis until Phase 6 rescales the field itself.
+/// Private: reached only through [`WindVec::to_meters_per_second`] and
+/// [`wind_magnitude_to_meters_per_second`], so no call site can hand-roll
+/// its own copy and drift from this one (same pattern as `MM_PER_M` in
+/// `units.rs`) — historically it did, in three places (`snow.rs`,
+/// `atmosphere/updraft.rs`, `atmosphere/uplift.rs`), each a private copy
+/// with no shared source of truth.
+const WINDVEC_TO_MS: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct WindVec {
@@ -25,6 +40,28 @@ impl WindVec {
     pub fn direction_deg(self) -> f32 {
         (self.y.atan2(self.x).to_degrees() + 360.0) % 360.0
     }
+
+    /// Converts this vector's magnitude to an actual wind speed (convention
+    /// #33: `WindVec` magnitude × `WINDVEC_TO_MS` = m/s). The single source
+    /// of truth for the conversion when a full `WindVec` is at hand; see
+    /// [`wind_magnitude_to_meters_per_second`] for the same factor applied
+    /// to an already-extracted scalar magnitude.
+    #[must_use]
+    pub fn to_meters_per_second(self) -> MetersPerSecond {
+        wind_magnitude_to_meters_per_second(self.magnitude())
+    }
+}
+
+/// Converts a `WindVec` magnitude — already extracted, e.g. by
+/// `compute_wind_magnitudes_into`, or accumulated from several vectors'
+/// components (convergence/orographic estimators) — to an actual wind
+/// speed (convention #33). Consumers that never hold the full `WindVec`
+/// (they only ever see a memoized scalar magnitude) go through here
+/// instead of [`WindVec::to_meters_per_second`]; both apply the exact same
+/// single multiplication by `WINDVEC_TO_MS`, so the two never drift apart.
+#[must_use]
+pub fn wind_magnitude_to_meters_per_second(magnitude: f32) -> MetersPerSecond {
+    MetersPerSecond(magnitude * WINDVEC_TO_MS)
 }
 
 /// Wind field indexed by `HexGrid::cell_index` (size = `grid.len()`).
@@ -367,6 +404,38 @@ fn propagate_upstream(
 mod tests {
     use super::*;
     use crate::coord::HexCoord;
+
+    /// Pins convention #33: a `WindVec` magnitude of 1.0 must convert to
+    /// exactly 10 m/s, and a scalar magnitude taken through the free
+    /// function must agree bit-for-bit with the method on `WindVec` — the
+    /// two are meant to be the same single multiplication, never two
+    /// independently-tuned copies (that duplication is exactly the bug
+    /// this refactor closes: `snow.rs`, `updraft.rs` and `uplift.rs` each
+    /// used to carry their own `10.0`).
+    #[test]
+    fn windvec_magnitude_converts_to_meters_per_second() {
+        let w = WindVec { x: 3.0, y: 4.0 }; // magnitude 5.0
+        let from_vec = w.to_meters_per_second();
+        assert!(
+            (from_vec.0 - 50.0).abs() < 1e-6,
+            "magnitude 5.0 should convert to 50 m/s, got {}",
+            from_vec.0
+        );
+
+        let from_scalar = wind_magnitude_to_meters_per_second(w.magnitude());
+        assert_eq!(
+            from_vec.0.to_bits(),
+            from_scalar.0.to_bits(),
+            "the method and the free function must apply the exact same factor"
+        );
+
+        let unit = wind_magnitude_to_meters_per_second(1.0);
+        assert!(
+            (unit.0 - 10.0).abs() < 1e-6,
+            "unit magnitude should convert to 10 m/s (convention #33), got {}",
+            unit.0
+        );
+    }
 
     #[test]
     fn wind_field_is_computed() {

@@ -17,7 +17,7 @@
 //! to `CellSnapshot` without being added here (and vice versa).
 
 use bytes::Bytes;
-use hexsim_core::grid::{CellSnapshot, GridState};
+use hexsim_core::snapshot::{CellSnapshot, GridState};
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, SerializeTuple, Serializer};
 
 /// Cell field names, in the exact order of `CellRow`'s elements.
@@ -138,9 +138,19 @@ impl Serialize for WireGridState<'_> {
 
 /// Encodes a snapshot for the WS. `Bytes`: broadcast frames are cloned
 /// per subscribed client, we want an O(1) clone even at 10 MB.
-#[must_use]
-pub fn encode_snapshot(state: &GridState) -> Bytes {
-    Bytes::from(rmp_serde::to_vec_named(&WireGridState(state)).unwrap_or_default())
+///
+/// # Errors
+///
+/// Returns the underlying `MessagePack` encode error if serialization
+/// fails. This doesn't happen on a valid `GridState` (every field is a
+/// plain number, string or vector, none of which refuse encoding), but
+/// the API stays honest rather than defaulting to an empty `Bytes` on
+/// failure: that used to hand the caller a zero-byte frame, which the
+/// server would then broadcast in silence — the front-end's msgpack
+/// decoder threw on an unrelated later frame, with nothing in the logs
+/// pointing back to the encode that actually failed.
+pub fn encode_snapshot(state: &GridState) -> Result<Bytes, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(&WireGridState(state)).map(Bytes::from)
 }
 
 #[cfg(test)]
@@ -293,7 +303,7 @@ mod tests {
         let state = grid.snapshot(0, 0, &empty_hydro_maps(), &Vec::new(), &Vec::new());
 
         let json_len = serde_json::to_string(&state).expect("json").len();
-        let wire_len = encode_snapshot(&state).len();
+        let wire_len = encode_snapshot(&state).expect("encode").len();
 
         println!(
             "wire {wire_len} o vs json {json_len} o: {}%, {} o/cell",

@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::climate::DayRecord;
 use crate::grid::HexGrid;
+use crate::groundwater::DEFAULT_MAX_CAPACITY_MM;
 use crate::temperature::{
     ATMO_IR_BACK_CLEAR, ATMO_IR_BACK_CLOUDY_BOOST, SECONDS_PER_HOUR, STEFAN_BOLTZMANN,
     cloud_cover_fraction,
 };
+use crate::wind::wind_magnitude_to_meters_per_second;
 
 /// Latent heat of fusion of ice (J/kg). Reference: Bonan G. (2008),
 /// *Ecological Climatology* 2nd ed., appendix A.4 (0 °C, standard pressure).
@@ -43,9 +45,6 @@ pub const WATER_EMISSIVITY: f32 = 0.96;
 /// A material constant like `Lf`, not a calibration knob.
 pub const WATER_ALBEDO: f32 = 0.08;
 
-/// Conversion of `WindVec` magnitude → m/s (convention #33, cf `wind.rs`).
-const WINDVEC_TO_MS: f32 = 10.0;
-
 /// External forcings for the snow step: the same per-cell fields consumed
 /// by the temperature balance (#102), passed in rather than recomputed
 /// (anti-pattern #2: a single source of truth for illumination).
@@ -67,11 +66,18 @@ pub struct SnowForcing<'a> {
     /// exist yet when snow steps; negligible at hourly scale, documented
     /// here.
     pub rain_last_tick: &'a [DayRecord],
+    /// Water table capacity reference (mm) of the neighboring phenomenon
+    /// (`groundwater::GroundwaterParams::max_capacity`), read-only input
+    /// used to bound how much of the melt can recharge `groundwater`
+    /// (`cell.permeability × gw_max_capacity`, see `melt_recharge_frac`).
+    pub gw_max_capacity: f32,
 }
 
 impl SnowForcing<'static> {
-    /// "Calm night" forcing: no sun, no wind, no rain.
-    /// For tests that isolate the non-solar terms of the balance.
+    /// "Calm night" forcing: no sun, no wind, no rain, and the engine's
+    /// own reference water table capacity ([`DEFAULT_MAX_CAPACITY_MM`],
+    /// which advertises itself as the single source of truth for exactly
+    /// this). For tests that isolate the non-solar terms of the balance.
     #[must_use]
     pub fn night_calm() -> Self {
         Self {
@@ -80,6 +86,7 @@ impl SnowForcing<'static> {
             flux_factor: &[],
             wind_mag: &[],
             rain_last_tick: &[],
+            gw_max_capacity: DEFAULT_MAX_CAPACITY_MM,
         }
     }
 }
@@ -202,7 +209,6 @@ pub fn step_snow(
     current: &HexGrid,
     next: &mut HexGrid,
     params: &SnowParams,
-    gw_max_capacity: f32,
     forcing: &SnowForcing,
 ) {
     let n = current.len();
@@ -242,8 +248,10 @@ pub fn step_snow(
             let q_solar = beam_to_incident * ff * (1.0 - WATER_ALBEDO);
             let cover = cloud_cover_fraction(cell.cloud_water);
             let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
-            let wind_ms = forcing.wind_mag.get(i).copied().unwrap_or(0.0) * WINDVEC_TO_MS
-                + params.free_convection_wind_ms;
+            let wind_ms = wind_magnitude_to_meters_per_second(
+                forcing.wind_mag.get(i).copied().unwrap_or(0.0),
+            )
+            .0 + params.free_convection_wind_ms;
             let q_sensible = sensible_coef * wind_ms * t_air; // T_air < 0 → refroidit
             let q_net = q_solar + q_ir_down - q_ir_emitted_water + q_sensible;
 
@@ -287,8 +295,10 @@ pub fn step_snow(
             let q_solar = beam_to_incident * ff * (1.0 - params.snow_albedo_melt);
             let cover = cloud_cover_fraction(cell.cloud_water);
             let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
-            let wind_ms = forcing.wind_mag.get(i).copied().unwrap_or(0.0) * WINDVEC_TO_MS
-                + params.free_convection_wind_ms;
+            let wind_ms = wind_magnitude_to_meters_per_second(
+                forcing.wind_mag.get(i).copied().unwrap_or(0.0),
+            )
+            .0 + params.free_convection_wind_ms;
             let q_sensible = sensible_coef * wind_ms * t_air;
             let rain_mm = forcing.rain_last_tick.get(i).map_or(0.0, |r| r.rain);
             let q_rain = WATER_SPECIFIC_HEAT_J_PER_KG_K * rain_mm * t_air / SECONDS_PER_HOUR;
@@ -314,7 +324,7 @@ pub fn step_snow(
             // removed in Phase 4; the capacity bound is enough: mountain
             // water tables, being small, saturate fast and the rest runs
             // off.)
-            let gw_capacity = cell.permeability * gw_max_capacity;
+            let gw_capacity = cell.permeability * forcing.gw_max_capacity;
             let gw_headroom = (gw_capacity - cell.groundwater).max(0.0);
             let to_gw = (params.melt_recharge_frac * departed).min(gw_headroom);
             nc.groundwater += to_gw;
@@ -348,6 +358,7 @@ mod tests {
             flux_factor: ff,
             wind_mag: &[],
             rain_last_tick: &[],
+            gw_max_capacity: DEFAULT_MAX_CAPACITY_MM,
         }
     }
 
@@ -366,7 +377,6 @@ mod tests {
             &grid,
             &mut next,
             &SnowParams::default(),
-            100.0,
             &SnowForcing::night_calm(),
         );
 
@@ -390,13 +400,7 @@ mod tests {
 
         let ff = vec![1.0; grid.len()];
         let mut next = grid.clone();
-        step_snow(
-            &grid,
-            &mut next,
-            &SnowParams::default(),
-            100.0,
-            &sunny_noon(&ff),
-        );
+        step_snow(&grid, &mut next, &SnowParams::default(), &sunny_noon(&ff));
 
         let center = next.get(HexCoord::new(0, 0)).unwrap();
         assert!(center.snow_level < 5.0, "Snow should melt");
@@ -417,7 +421,6 @@ mod tests {
             &grid,
             &mut next,
             &SnowParams::default(),
-            100.0,
             &SnowForcing::night_calm(),
         );
 
@@ -443,7 +446,6 @@ mod tests {
             &grid,
             &mut next,
             &SnowParams::default(),
-            100.0,
             &SnowForcing::night_calm(),
         );
         let after = total_water_and_snow(&next);
@@ -471,13 +473,7 @@ mod tests {
             cell.temperature = 8.0;
             let ff = vec![1.0];
             let mut next = grid.clone();
-            step_snow(
-                &grid,
-                &mut next,
-                &SnowParams::default(),
-                100.0,
-                &sunny_noon(&ff),
-            );
+            step_snow(&grid, &mut next, &SnowParams::default(), &sunny_noon(&ff));
             stock_mm - next.get(HexCoord::new(0, 0)).unwrap().snow_level
         };
         let melt_pack = run(2_000.0);
@@ -515,13 +511,7 @@ mod tests {
 
         for _ in 0..100 {
             let mut next = current.clone();
-            step_snow(
-                &current,
-                &mut next,
-                &params,
-                100.0,
-                &SnowForcing::night_calm(),
-            );
+            step_snow(&current, &mut next, &params, &SnowForcing::night_calm());
             current = next;
         }
 
@@ -553,13 +543,7 @@ mod tests {
 
         let ff = vec![1.0; grid.len()];
         let mut next = grid.clone();
-        step_snow(
-            &grid,
-            &mut next,
-            &SnowParams::default(),
-            100.0,
-            &sunny_noon(&ff),
-        );
+        step_snow(&grid, &mut next, &SnowParams::default(), &sunny_noon(&ff));
 
         let c = next.get(c0).unwrap();
         assert!(c.snow_level < 10.0, "snow must melt");
@@ -593,13 +577,7 @@ mod tests {
         }
         let ff = vec![1.0; grid.len()];
         let mut next = grid.clone();
-        step_snow(
-            &grid,
-            &mut next,
-            &SnowParams::default(),
-            100.0,
-            &sunny_noon(&ff),
-        );
+        step_snow(&grid, &mut next, &SnowParams::default(), &sunny_noon(&ff));
 
         let c = next.get(c0).unwrap();
         assert!(
@@ -628,7 +606,7 @@ mod tests {
 
     fn melted_after(grid: &HexGrid, forcing: &SnowForcing) -> f32 {
         let mut next = grid.clone();
-        step_snow(grid, &mut next, &SnowParams::default(), 100.0, forcing);
+        step_snow(grid, &mut next, &SnowParams::default(), forcing);
         50.0 - next.get(HexCoord::new(0, 0)).unwrap().snow_level
     }
 
@@ -750,7 +728,7 @@ mod tests {
 
     fn frozen_after(grid: &HexGrid, forcing: &SnowForcing) -> f32 {
         let mut next = grid.clone();
-        step_snow(grid, &mut next, &SnowParams::default(), 100.0, forcing);
+        step_snow(grid, &mut next, &SnowParams::default(), forcing);
         let c0 = next.get(HexCoord::new(0, 0)).unwrap();
         100.0 - c0.water_level
     }
@@ -831,6 +809,7 @@ mod tests {
             flux_factor: &ff,
             wind_mag: &[],
             rain_last_tick: &[],
+            gw_max_capacity: DEFAULT_MAX_CAPACITY_MM,
         };
         let by_night = frozen_after(&watery_cell(-5.0, 0.0), &SnowForcing::night_calm());
         let by_noon = frozen_after(&watery_cell(-5.0, 0.0), &sunny);
