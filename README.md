@@ -3,20 +3,18 @@
 An emergent geophysical world on a hex grid, in Rust.
 
 No player, no objective, nothing to win. I wanted a world that runs on its own,
-and to watch what it does with itself. The rules are local, a cell and its six
-neighbours, and everything above that is a consequence.
+and to watch what it does. The rules are local, a cell and its six neighbours.
 
-So far the consequences are rivers that carve their own beds, lakes that fill
-and drain, snow that holds on north faces and goes on south ones, forests that
-take two centuries to reach climax. None of it is drawn. The terrain comes out
-of a seed, the rest falls out of the physics.
+So far that gives rivers that carve their own beds, lakes that fill and drain,
+snow that holds on north faces and goes on south ones, forests that take two
+centuries to reach climax. None of it is drawn. The terrain comes out of a
+seed, the rest comes from the physics.
 
 A thalweg is the line along the bottom of a valley where running water
-concentrates. That one isn't drawn either, it follows from the slope.
+concentrates.
 
-I mostly run it the way you watch a fire. The long-term plan is to put agents
-on the map and see whether they organise themselves, but the ground has to
-hold first.
+I mostly run it the way you watch a fire. Later I want agents on the map, to
+see whether they organise themselves. The ground isn't ready for that.
 
 <img src="assets/world.jpg" alt="A night view of the simulated world: a hex-tiled plain with scattered trees, a lake ringed with forest, mountains on the horizon" width="100%">
 
@@ -31,7 +29,7 @@ invariant.
 - **Hex grid**, axial coordinates `(q, r)`, six neighbours per cell. Radius 45
   by default, about 6 200 hexes, roughly 1.46 ha each.
 - **One tick is one hour**, twenty-four per simulated day, which is what makes
-  a diurnal cycle possible at all.
+  a diurnal cycle possible.
 - **Double buffering**: every tick reads from `current` and writes into
   `next`, so the order cells are visited in cannot change the result.
 - **Each phenomenon is a pure function** over a cell and its neighbours. They
@@ -43,12 +41,11 @@ invariant.
 
 The arrows are the wind field, one per cell.
 
-Physics is written in strict SI units — W/m² for energy fluxes, J/(m²·K) for
-surface heat capacities, Pa for pressures — with the fundamental constants
-declared explicitly and their source named in the code. Dimensionless
-hand-tuned coefficients that absorb several distinct phenomena are not
-accepted: a coefficient with no named physical unit is a signal that it must
-be decomposed into separate SI fluxes.
+Physics is written in strict SI units, W/m² for energy fluxes, J/(m²·K) for
+surface heat capacities, Pa for pressures, with the fundamental constants
+declared explicitly and their source named in the code. A dimensionless
+coefficient tuned by hand to absorb several phenomena at once gets decomposed
+into separate SI fluxes instead.
 
 <img src="assets/rule.svg" alt="" width="100%">
 
@@ -67,8 +64,8 @@ frontend/           three.js visualisation, WASM or WebSocket transport
 
 The engine is decoupled from the visualisation: it produces a serialised
 state, an external consumer renders it. Over the WebSocket, snapshots are
-column-compact msgpack — field names are sent once per frame, not once per
-cell — while commands, targeted answers and logs stay JSON text.
+column-compact msgpack, with field names sent once per frame rather than once
+per cell. Commands, targeted answers and logs stay JSON text.
 
 <img src="assets/rule.svg" alt="" width="100%">
 
@@ -115,10 +112,10 @@ And once, to wire fmt + clippy into every commit:
 | `just shot` | screenshot the 3D scene (Playwright) |
 
 The test suite is 403 tests across 82 integration files. Physical invariants
-(mass and energy conservation) are checked with `proptest`; a separate family
-of very small, very fast tests pins behaviours that are obvious to state and
-were hard to obtain — saturation rises with temperature, a fire goes out and
-stays out, a south-facing slope is warmer than a north-facing one.
+(mass and energy conservation) are checked with `proptest`. A separate family
+of very small, very fast tests pins things that were hard to get right:
+saturation rises with temperature, a fire goes out and stays out, a
+south-facing slope is warmer than a north-facing one.
 
 Clippy runs with `all = deny` and `pedantic = warn`, hardened to `-D warnings`
 by the pre-commit hook. Silencing a lint with `#[allow]` is not accepted.
