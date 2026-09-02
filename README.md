@@ -1,4 +1,4 @@
-# thalweg
+<img src="assets/hero.svg" alt="thalweg" width="430">
 
 An emergent geophysical world on a hex grid, in Rust.
 
@@ -17,6 +17,8 @@ concentrates. That one isn't drawn either, it follows from the slope.
 I mostly run it the way you watch a fire. The long-term plan is to put agents
 on the map and see whether they organise themselves, but the ground has to
 hold first.
+
+<img src="assets/rule.svg" alt="" width="100%">
 
 ## How it works
 
@@ -42,6 +44,8 @@ hand-tuned coefficients that absorb several distinct phenomena are not
 accepted: a coefficient with no named physical unit is a signal that it must
 be decomposed into separate SI fluxes.
 
+<img src="assets/rule.svg" alt="" width="100%">
+
 ## Layout
 
 ```
@@ -59,6 +63,8 @@ The engine is decoupled from the visualisation: it produces a serialised
 state, an external consumer renders it. Over the WebSocket, snapshots are
 column-compact msgpack — field names are sent once per frame, not once per
 cell — while commands, targeted answers and logs stay JSON text.
+
+<img src="assets/rule.svg" alt="" width="100%">
 
 ## Run it
 
@@ -88,6 +94,8 @@ And once, to wire fmt + clippy into every commit:
 ./scripts/install-hooks.sh
 ```
 
+<img src="assets/rule.svg" alt="" width="100%">
+
 ## Commands
 
 `just` alone lists them all. The ones worth knowing:
@@ -108,6 +116,8 @@ stays out, a south-facing slope is warmer than a north-facing one.
 
 Clippy runs with `all = deny` and `pedantic = warn`, hardened to `-D warnings`
 by the pre-commit hook. Silencing a lint with `#[allow]` is not accepted.
+
+<img src="assets/rule.svg" alt="" width="100%">
 
 ## License
 
