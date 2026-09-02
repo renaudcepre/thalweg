@@ -1,0 +1,27 @@
+# HexSim startup configuration.
+#
+# Copy to `hexsim.toml` (gitignored) and uncomment what you want to override:
+#     cp hexsim.toml.example hexsim.toml
+#
+# Scope = *bootstrap* parameters, fixed at world generation. Physical
+# parameters (base_temp, evap_rate, …) are adjusted live via the front-end
+# sliders, not here.
+#
+# Priority: defaults < this file < environment variables. So
+# `HEXSIM_RADIUS=200 just run` always overrides the value below.
+# Path overridable via `HEXSIM_CONFIG=/path/to/file.toml`.
+
+[server]
+# HTTP + WebSocket port. Default: 8355. Dual-stack bind ([::]), so IPv4+IPv6.
+# port = 8355
+
+# Hex grid radius. Number of hexagons = 3·r·(r+1)+1.
+#   r=45  → ~6,211 hex   (default, smooth)
+#   r=60  → ~10,981 hex
+#   r=120 → ~43,561 hex  (contemplative, slow tick)
+#   r=200 → ~120,601 hex (3D rendering chokes on modest hardware)
+# radius = 45
+
+[world]
+# World seed (terrain, wind). Default: 42.
+# seed = 42

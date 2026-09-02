@@ -1,0 +1,16 @@
+{
+  "name": "hexsim-shot",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Playwright screenshots of the HexSim front end (localhost:3000)",
+  "bin": {
+    "hexsim-shot": "shot.mjs"
+  },
+  "scripts": {
+    "setup": "npm install && npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "1.56.1"
+  }
+}

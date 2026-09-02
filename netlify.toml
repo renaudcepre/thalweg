@@ -1,0 +1,34 @@
+# Static deployment of the HexSim front (#138 L3).
+#
+# The site is fully static: the simulation runs as WebAssembly in the
+# visitor's tab, there's no backend. `dist/` is produced by `just build-web`,
+# not by Netlify, which has neither Rust nor wasm-pack here; hence the
+# absence of `command`, the folder is dropped off already built.
+
+[build]
+  publish = "dist"
+
+# `WebAssembly.instantiateStreaming` refuses a module served with any MIME
+# type other than `application/wasm` and silently falls back to the slow
+# path (ArrayBuffer). Netlify serves `.wasm` correctly by default, but
+# spelling it out protects against a change of host.
+[[headers]]
+  for = "/wasm/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+
+# The `.wasm` and the vendored dependencies are immutable: their content
+# only changes with a new build, which produces a fresh deployment.
+[[headers]]
+  for = "/wasm/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/vendor/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# No COOP/COEP: they only serve to unlock `SharedArrayBuffer`, which the
+# module doesn't need, the simulation runs on a single thread inside a
+# Web Worker. Enabling them would isolate the page for no benefit.

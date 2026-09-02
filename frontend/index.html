@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hexarium</title>
+  <!-- IBM Plex Mono served locally via npm (@fontsource), no CDN.
+       Weights 400/500/600/700 = the ones used by style.css. -->
+  <!-- Brand-mark hexagon as a data URI: avoids a 404 /favicon.ico
+       on the deployed site, without adding a file to serve. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%3E%3Cpolygon%20points=%2212,2%2022,7%2022,17%2012,22%202,17%202,7%22%20fill=%22none%22%20stroke=%22%238fa3b8%22%20stroke-width=%221.5%22/%3E%3Cpolygon%20points=%2212,7%2017,9.5%2017,14.5%2012,17%207,14.5%207,9.5%22%20fill=%22%238fa3b8%22%20fill-opacity=%220.35%22/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./node_modules/@fontsource/ibm-plex-mono/400.css">
+  <link rel="stylesheet" href="./node_modules/@fontsource/ibm-plex-mono/500.css">
+  <link rel="stylesheet" href="./node_modules/@fontsource/ibm-plex-mono/600.css">
+  <link rel="stylesheet" href="./node_modules/@fontsource/ibm-plex-mono/700.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./node_modules/three/build/three.module.js",
+      "three/addons/": "./node_modules/three/examples/jsm/",
+      "@msgpack/msgpack": "./node_modules/@msgpack/msgpack/dist.esm/index.mjs"
+    }
+  }
+  </script>
+</head>
+<body>
+  <!-- Embed bootstrap (#142). Inline, not `<script src>`: both things
+       set up here must be in place before anyone can miss them, and a
+       separate file costs a network round-trip at the worst possible moment.
+
+       1. `data-chrome`, before the first paint. Set from main.js it
+          arrived later (~150 ms locally, several seconds behind the
+          network) and the full interface would show while it loaded.
+       2. `window.__hexsim`, before the host page can call into it.
+          main.js is a module, so it's deferred: without this bootstrap, a
+          host calling `pause()` on the iframe's `load` hits nothing.
+
+       This script is the single source of truth for `data-chrome`. main.js
+       reads the same URL parameter for the 3D scene (EMBED constant), and
+       wires up the real implementation via `_attach`. -->
+  <script>
+    (function () {
+      var chrome = new URLSearchParams(location.search).get("chrome");
+      if (chrome === "minimal" || chrome === "none") {
+        document.body.dataset.chrome = chrome;
+      }
+
+      // Calls received before main.js has wired up the implementation.
+      var queue = [];
+      var listeners = { ready: [], tick: [] };
+      var dispatch = null;
+      var ready = false;
+      var lastTick = null;
+
+      // Always returns a promise: `export` and `load` need one, and a
+      // queued command must be able to resolve later, once it's
+      // delivered. Commands with no return value just let it drop.
+      function call(name, arg) {
+        if (dispatch) {
+          try { return Promise.resolve(dispatch(name, arg)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return new Promise(function (resolve, reject) {
+          queue.push([name, arg, resolve, reject]);
+        });
+      }
+
+      // Identifiers come from the DOM, single source of truth: a view
+      // added or renamed in the `<select>` shows up here with nothing else
+      // to touch. A host that hardcodes the list breaks silently on the
+      // next rename, which is exactly what these getters avoid.
+      //
+      // Trade-off, flagged by the integrator: the list depends on the
+      // PRESENCE of the panel in the DOM. Under `chrome=none` it is there,
+      // just hidden by CSS, an assumed constraint, not an accident (see
+      // EMBED.md and the comment on the VIEW section further down). The day
+      // someone conditions its construction on the mode, the list would
+      // go empty; it screams instead of silently returning an empty array.
+      function valuesOf(selector, attr, what) {
+        var out = [];
+        var nodes = document.querySelectorAll(selector);
+        for (var i = 0; i < nodes.length; i++) {
+          out.push(attr ? nodes[i].getAttribute(attr) : nodes[i].value);
+        }
+        if (!out.length) {
+          console.error(
+            "__hexsim." + what + " is empty: the VIEW panel is not in the " +
+              "DOM. A host will show no buttons. The bare mode must HIDE " +
+              "this panel, never refrain from building it.",
+          );
+        }
+        return out;
+      }
+
+      window.__hexsim = {
+        play: function () { call("play"); },
+        pause: function () { call("pause"); },
+        // Simulated hours per second. The slider position is a detail
+        // of our UI, the host doesn't need to know the curve.
+        speed: function (hoursPerSecond) { call("speed", hoursPerSecond); },
+
+        // Base map (exclusive) and overlays (stackable).
+        view: function (id) { call("view", id); },
+        layer: function (id, on) { call("layer", { id: id, on: on !== false }); },
+
+        // Cell inspector: tooltip on hover, and dump copied to clipboard on
+        // click. OFF by default under `?chrome=`, this is HexSim UI, and
+        // the click writes to the host page's clipboard (#150). A host
+        // that wants to offer it turns it back on here.
+        inspect: function (on) { call("inspect", on !== false); },
+
+        // Lists of available identifiers. Read on call, not frozen at
+        // construction time: the `<select>` is further down in the document
+        // than this script. Valid as soon as the document is parsed, so as
+        // soon as the iframe's `load` fires.
+        get views() { return valuesOf("#view-mode option", null, "views"); },
+        get layers() { return valuesOf("[data-layer]", "data-layer", "layers"); },
+
+        // Full world state. `export` returns the raw ArrayBuffer, `load`
+        // rejects if the engine refuses it (incompatible format version,
+        // foreign file) without touching the current world.
+        export: function () { return call("export"); },
+        load: function (data) { return call("load", data); },
+
+        // Returns an unsubscribe function.
+        on: function (event, cb) {
+          var l = listeners[event];
+          if (!l) throw new Error('__hexsim: unknown event "' + event + '"');
+          l.push(cb);
+          // A subscription registered after the fact must still see the
+          // current state. Without this, `on("ready")` registered a
+          // millisecond too late never fires, the classic event-API race,
+          // and it's painful to debug from the other repo.
+          if (event === "ready" && ready) cb();
+          else if (event === "tick" && lastTick) cb(lastTick);
+          return function () {
+            var i = l.indexOf(cb);
+            if (i >= 0) l.splice(i, 1);
+          };
+        },
+
+        // --- Internal, called by main.js. Outside the contract, can change. ---
+        _attach: function (fn) {
+          dispatch = fn;
+          var pending = queue.splice(0);
+          for (var i = 0; i < pending.length; i++) {
+            var p = pending[i];
+            try { p[2](dispatch(p[0], p[1])); }
+            catch (e) { p[3](e); }
+          }
+        },
+        _emit: function (event, arg) {
+          if (event === "ready") ready = true;
+          else if (event === "tick") lastTick = arg;
+          var l = listeners[event].slice();
+          for (var i = 0; i < l.length; i++) l[i](arg);
+        },
+      };
+    })();
+  </script>
+  <aside id="sidebar">
+    <header id="side-header">
+      <svg id="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <polygon points="12,2 22,7 22,17 12,22 2,17 2,7" fill="none" stroke="currentColor" stroke-width="1.25"/>
+        <polygon points="12,7 17,9.5 17,14.5 12,17 7,14.5 7,9.5" fill="currentColor" fill-opacity="0.18" stroke="currentColor" stroke-width="0.75"/>
+      </svg>
+      <span class="brand-name">HEXARIUM</span>
+      <span id="ws-status" class="ws-dot" data-state="pending" title="WS: connecting..."></span>
+      <span id="tick-count" class="tick-readout">1 Jan Year 0</span>
+      <span id="version-badge" class="version-badge" title="unknown build">v? · ?</span>
+    </header>
+
+    <section class="side-region region-params">
+      <div class="region-head">
+        <span class="region-label">PARAMS</span>
+        <span class="region-sub">§ live tuning</span>
+      </div>
+      <div id="params-content" class="region-body">
+        <fieldset>
+          <legend>Atmosphere</legend>
+          <label title="Cloud droplet concentration N_c (cm^-3) — K&amp;K 2000 autoconversion. Low = easy rain (pristine marine), high = polluted continental.&#10;key: atmosphere.kk2000_droplet_count"><span class="pname">N_c (cm⁻³)</span><input type="range" data-key="atmosphere.kk2000_droplet_count" min="20" max="600" step="10" value="50"><span class="pval">50</span></label>
+          <label title="Max crop coefficient Kc_max (FAO-56) for plant transpiration: ET = Kc·ET₀·stress, with Kc = Kc_max × biomass (LAI proxy), ET₀ = Dalton/Meyer demand, stress = groundwater saturation. Draws from groundwater (strict conservation).&#10;key: atmosphere.transpiration_coef"><span class="pname">Transpir. Kc_max</span><input type="range" data-key="atmosphere.transpiration_coef" min="0" max="1.5" step="0.05" value="0.5"><span class="pval">0.5</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Hydrology</legend>
+          <label title="Fraction of surface water flowing to lower neighbours each tick.&#10;key: hydro.flow_rate"><span class="pname">Flow rate</span><input type="range" data-key="hydro.flow_rate" min="0.005" max="0.3" step="0.005" value="0.12"><span class="pval">0.12</span></label>
+          <label title="Flow concentration toward the lowest cell — higher = sharper rivers.&#10;key: hydro.flow_concentration"><span class="pname">Concentration</span><input type="range" data-key="hydro.flow_concentration" min="1" max="8" step="0.25" value="6"><span class="pval">6</span></label>
+          <label title="Slope (in metres) beyond which flow becomes fully mobile.&#10;key: hydro.slope_full_mobility"><span class="pname">Slope mobility</span><input type="range" data-key="hydro.slope_full_mobility" min="1" max="100" step="1" value="6"><span class="pval">6</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Groundwater</legend>
+          <label title="Rate at which surface water infiltrates the subsoil.&#10;key: groundwater.infiltration_rate"><span class="pname">Infiltration</span><input type="range" data-key="groundwater.infiltration_rate" min="0.005" max="0.2" step="0.005" value="0.05"><span class="pval">0.05</span></label>
+          <label title="Lateral spread of groundwater between neighbouring cells.&#10;key: groundwater.diffusion_rate"><span class="pname">Diffusion</span><input type="range" data-key="groundwater.diffusion_rate" min="0.005" max="0.1" step="0.005" value="0.03"><span class="pval">0.03</span></label>
+          <label title="Maximum subsoil water storage capacity, per cell (mm water-column equivalent).&#10;key: groundwater.max_capacity"><span class="pname">Max capacity</span><input type="range" data-key="groundwater.max_capacity" min="20" max="500" step="10" value="100"><span class="pval">100</span></label>
+          <label title="Fraction of snowmelt percolating straight into groundwater (soil under the snowpack) instead of running off. Feeds the humid montane belt (fir/beech) in spring.&#10;key: snow.melt_recharge_frac"><span class="pname">Melt → gwater</span><input type="range" data-key="snow.melt_recharge_frac" min="0" max="1" step="0.05" value="0.5"><span class="pval">0.5</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Temperature</legend>
+          <label title="Target mean annual temperature on dry plains, at the world latitude (°C). Calibrates the structural thermal offset — the simulation absorbs the missing greenhouse effect into this value.&#10;key: temperature.base_temp"><span class="pname">Mean ann. temp.</span><input type="range" data-key="temperature.base_temp" min="5" max="35" step="1" value="15"><span class="pval">15</span></label>
+          <label title="Cooling with altitude (°C per km). Local adiabatic lapse rate.&#10;key: temperature.lapse_rate"><span class="pname">Lapse rate</span><input type="range" data-key="temperature.lapse_rate" min="3" max="10" step="0.5" value="6.5"><span class="pval">6.5</span></label>
+          <label title="Buffering effect of water surfaces — softens the temperature of wet cells.&#10;key: temperature.water_cooling"><span class="pname">Water cooling</span><input type="range" data-key="temperature.water_cooling" min="0.1" max="5" step="0.1" value="1"><span class="pval">1</span></label>
+          <label title="Global multiplier on delta_T per tick. 1.0 = normal physics (SI budget #43). 0.0 = freezes T (ablation-test kill switch).&#10;key: temperature.thermal_coupling"><span class="pname">Thermal coupl.</span><input type="range" data-key="temperature.thermal_coupling" min="0" max="2" step="0.05" value="1.0"><span class="pval">1.0</span></label>
+          <label title="World latitude (°, signed: +North, -South). Seasonality emerges from astronomy — not a free lever. 0 = equator (no seasons), ±45 = marked seasons, ±70 = polar nights and midnight sun.&#10;key: temperature.latitude_deg"><span class="pname">Latitude</span><input type="range" data-key="temperature.latitude_deg" min="-80" max="80" step="1" value="44"><span class="pval">44</span></label>
+          <label title="Atmospheric transmittance (mean Beer-Lambert). 0.7 = standard atmosphere with aerosols. Higher = more sun at ground level.&#10;key: temperature.atmospheric_transmittance"><span class="pname">Atmo. transmit.</span><input type="range" data-key="temperature.atmospheric_transmittance" min="0.4" max="0.95" step="0.01" value="0.7"><span class="pval">0.70</span></label>
+          <label title="Ground albedo (reflected fraction). 0.3 = typical grass/forest/bare-soil mix (Bonan 2008).&#10;key: temperature.ground_albedo"><span class="pname">Ground albedo</span><input type="range" data-key="temperature.ground_albedo" min="0.1" max="0.5" step="0.01" value="0.3"><span class="pval">0.30</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Wind</legend>
+          <label title="Strength of thermal breezes (land/water contrasts, altitude).&#10;key: wind.thermal_strength"><span class="pname">Thermal</span><input type="range" data-key="wind.thermal_strength" min="0" max="1" step="0.01" value="0.36"><span class="pval">0.36</span></label>
+          <label title="Wind deflection by relief — flow around mountains.&#10;key: wind.terrain_deflection"><span class="pname">Deflection</span><input type="range" data-key="wind.terrain_deflection" min="0" max="3" step="0.01" value="0.59"><span class="pval">0.59</span></label>
+          <label title="Humidity transport rate by wind (scaled by |wind| up to CFL 0.95).&#10;key: wind.humidity_advection_rate"><span class="pname">Humid. advect.</span><input type="range" data-key="wind.humidity_advection_rate" min="0" max="5" step="0.05" value="3"><span class="pval">3</span></label>
+          <label title="Temperature transport rate by wind (advection).&#10;key: wind.temperature_advection_rate"><span class="pname">Temp. advect.</span><input type="range" data-key="wind.temperature_advection_rate" min="0" max="0.3" step="0.005" value="0.07"><span class="pval">0.07</span></label>
+          <label title="Speed ratio between upper-level wind and surface wind.&#10;key: wind.wind_upper_speed_ratio"><span class="pname">Upper speed</span><input type="range" data-key="wind.wind_upper_speed_ratio" min="1" max="4" step="0.1" value="1.4"><span class="pval">1.4</span></label>
+          <label title="Rotation of upper-level wind relative to surface wind (degrees).&#10;key: wind.wind_upper_rotation_deg"><span class="pname">Upper rotation</span><input type="range" data-key="wind.wind_upper_rotation_deg" min="0" max="45" step="1" value="10"><span class="pval">10</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Rendering</legend>
+          <label title="Cell flow (mm) above which its river segment is drawn (same threshold as the diag river_cells). 0 = all runoff.&#10;local key: river_threshold (client only)"><span class="pname">River threshold</span><input type="range" data-local="river_threshold" min="0" max="10" step="0.01" value="0.5"><span class="pval">0.5</span></label>
+          <label title="Ambient light (multiplier). 0 = pitch dark (you only see what the sun lights); 1 = default; more = everything brightened.&#10;local key: ambient_gain (client only)"><span class="pname">Ambient</span><input type="range" data-local="ambient_gain" min="0" max="4" step="0.05" value="1"><span class="pval">1</span></label>
+        </fieldset>
+      </div>
+    </section>
+
+    <section class="side-region region-logs">
+      <div class="region-head">
+        <span class="region-label">LOG</span>
+        <span class="region-sub">
+          <span id="log-count">0</span>
+          <button id="log-clear" class="region-btn" title="Clear">clear</button>
+        </span>
+      </div>
+      <div id="log-body" class="region-body"></div>
+    </section>
+
+    <footer id="side-playback">
+      <div class="pb-row pb-row-transport">
+        <button id="btn-playpause" class="pb-primary" title="Space">▶ <span>PLAY</span></button>
+        <button id="btn-step-hour" title="Step 1 hour">+1H</button>
+        <button id="btn-step" title="Step 1 day">+1D</button>
+        <button id="btn-month" title="+30 days">+M</button>
+        <button id="btn-year" title="+365 days">+Y</button>
+      </div>
+      <div id="pb-progress" class="pb-progress" hidden>
+        <div class="pb-progress-head">
+          <span id="pb-progress-label" class="pb-progress-label">Computing…</span>
+          <span id="pb-progress-pct" class="pb-readout">0 %</span>
+        </div>
+        <div class="pb-progress-track"><div id="pb-progress-fill" class="pb-progress-fill"></div></div>
+      </div>
+      <div class="pb-row pb-row-seed">
+        <label class="pb-field">
+          <span>SEED</span>
+          <input id="seed-input" type="number" value="42" min="0" max="999999">
+        </label>
+        <button id="btn-random-seed" title="Random seed" class="pb-icon">⚄</button>
+        <button id="btn-reset" title="Reset world" class="pb-danger">RESET</button>
+      </div>
+      <div class="pb-row pb-row-persist">
+        <button id="btn-save" title="Export the full world state (.ckpt)">⤓ SAVE</button>
+        <button id="btn-load" title="Import an exported state (.ckpt)">⤒ LOAD</button>
+        <input id="file-load" type="file" accept=".ckpt,application/octet-stream" hidden>
+      </div>
+      <!-- Without a server, the world lives in the tab: visible only in
+           WASM mode (body[data-mode="wasm"], set by main.js). -->
+      <p class="pb-note">This world lives in the tab. Reloading resets it.</p>
+      <div class="pb-row pb-row-speed">
+        <span class="pb-cap">SPEED</span>
+        <input id="speed-slider" type="range" min="0" max="100" value="43" step="1">
+        <span id="speed-label" class="pb-readout">1.0 d/s</span>
+      </div>
+    </footer>
+  </aside>
+
+  <aside id="right-sidebar">
+    <header id="right-header">
+      <span class="brand-name rs-title">TELEMETRY</span>
+      <span class="rs-tag">live</span>
+    </header>
+
+    <section class="side-region region-fixed">
+      <div class="region-head">
+        <span class="region-label">TOTALS</span>
+        <span class="region-sub">H₂O masses</span>
+      </div>
+      <div id="stats" class="region-body stats-body">
+        <div class="stat-row"><span class="stat-key">Surface</span><span id="stat-surface" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Humidity</span><span id="stat-humidity" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Clouds</span><span id="stat-cloud" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Rainfall</span><span id="stat-rain-mm" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Groundwater</span><span id="stat-groundwater" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Snow</span><span id="stat-snow" class="stat-val">-</span></div>
+        <div class="stat-row stat-total-row"><span class="stat-key">Total</span><span id="stat-total" class="stat-val">-</span></div>
+      </div>
+    </section>
+
+    <section class="side-region region-fixed">
+      <div class="region-head">
+        <span class="region-label">PERF</span>
+        <!-- The subtitle names what's actually measured: a native
+             process server-side, the browser's Worker in WASM. -->
+        <span class="region-sub mode-ws">process rust</span>
+        <span class="region-sub mode-wasm">worker wasm</span>
+      </div>
+      <div id="perf-stats" class="region-body stats-body">
+        <!-- CPU comes from `sysinfo`: no equivalent in a browser. The
+             row disappears in WASM instead of showing a permanent dash. -->
+        <div class="stat-row mode-ws"><span class="stat-key">CPU</span><span id="stat-cpu" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">RAM</span><span id="stat-ram" class="stat-val">-</span></div>
+        <div class="stat-row"><span class="stat-key">Tick</span><span id="stat-tick-us" class="stat-val">-</span></div>
+      </div>
+    </section>
+
+    <section class="side-region region-fixed">
+      <!-- This panel is the source of `__hexsim.views` / `.layers`: the
+           `value` of the `<option>`s and the `data-layer` of the checkboxes
+           ARE the identifiers of the embed contract (EMBED.md). Two
+           consequences for whoever edits here: renaming a `value` renames
+           the public identifier, and this block must stay built in ALL
+           modes, `chrome=none` hides it in CSS, it doesn't refrain from
+           building it. `just embed-check` holds the constraint, it runs
+           in `chrome=none` and fails if the list is empty. -->
+      <div class="region-head">
+        <span class="region-label">VIEW</span>
+        <span class="region-sub">layers</span>
+      </div>
+      <div class="region-body view-body">
+        <select id="view-mode" title="Base map">
+          <option value="terrain">Terrain</option>
+          <option value="species">Cover (species)</option>
+          <option value="permeability">Permeability</option>
+          <option value="groundwater">Groundwater</option>
+          <option value="humidity_upper">Upper humidity</option>
+          <option value="humidity_surface">Surface humidity</option>
+          <option value="age">Forest age</option>
+          <option value="fire" title="Black background if no fire is active (rare: very low ignition_rate, and fire.enabled=0 by default outside the live server). Force an ignition: just param &quot;fire.enabled&quot; 1">Fire</option>
+          <option value="pressure">Pressure (synoptic)</option>
+        </select>
+        <label class="rs-check"><input id="toggle-wind" data-layer="wind" type="checkbox"><span>Wind</span></label>
+        <label class="rs-check"><input id="toggle-clouds" data-layer="clouds" type="checkbox" checked><span>Clouds</span></label>
+        <label class="rs-check"><input id="toggle-temperature" data-layer="temperature" type="checkbox"><span>Temperature</span></label>
+        <label class="rs-check"><input id="toggle-precipitation" data-layer="precipitation" type="checkbox"><span>Precipitation</span></label>
+      </div>
+    </section>
+
+    <section class="side-region region-fixed">
+      <div class="region-head">
+        <span class="region-label">CLIMATE</span>
+        <span class="region-sub">season · wind</span>
+      </div>
+      <div class="region-body climate-body">
+        <canvas id="compass" width="90" height="90"></canvas>
+        <div id="compass-info">
+          <div id="season-label">—</div>
+          <div id="avg-temp-label">—</div>
+          <div id="avg-wind-label">—</div>
+        </div>
+      </div>
+    </section>
+
+    <footer id="right-footer">
+      <div class="scale-inline">
+        <span class="pb-cap">SCALE</span>
+        <div id="scale-bar-line"></div>
+        <span id="scale-bar-label" class="pb-readout">1 km</span>
+      </div>
+    </footer>
+  </aside>
+
+  <div id="tooltip"></div>
+  <div id="map-width">
+    <div id="map-width-bar"></div>
+    <span id="map-width-label">— km</span>
+  </div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

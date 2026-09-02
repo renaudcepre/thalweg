@@ -1,0 +1,101 @@
+# Builds `dist/` (the complete static site) and attaches it to the tag as
+# `dist.tar.gz`.
+#
+# Why a release and not a deployment: the site is meant to be consumed by
+# several hosts, including an embed copied into another site (#140). A release
+# gives a versioned, atomic artifact; pulling files from a live site would
+# force the consumer to download them one by one, with no list, and to take
+# "whatever is up at this instant", including mid-deployment.
+name: dist
+
+on:
+  push:
+    tags: ["v*"]
+  # Allows a dry run without pushing a tag: produces the job artifact, not
+  # a release.
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach the archive to the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Aligned with the dev machine (`wasm-opt --version`). See the wasm-opt
+      # step below for what a too-old version causes.
+      BINARYEN_VERSION: "132"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `crates/hexsim-wasm/build.rs` reads the HEAD hash for the version
+          # badge: a shallow checkout would make it "unknown".
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: simulation
+
+      - uses: extractions/setup-just@v3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # wasm-opt, definitely NOT the Ubuntu package. `apt` serves binaryen 108
+      # on noble, published in 2022: too old for the target features emitted
+      # by rustc, which it strips from the binary instead of preserving them.
+      # The resulting module instantiates, exposes the right exports, and
+      # computes nothing. This is exactly what release v0.8.0 (#141) shipped:
+      # `.wasm` 32 KB bigger than local, simulation frozen, no error message.
+      # Version pinned to the dev machine's; `just wasm` additionally checks
+      # that nothing was stripped (scripts/check-wasm-opt.py).
+      - name: wasm-opt (binaryen ${{ env.BINARYEN_VERSION }})
+        run: |
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | sudo tar xz -C /opt
+          echo "/opt/binaryen-version_${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Front dependencies
+        run: npm ci --prefix frontend
+
+      # `build-web` builds the module itself (scripts/build-web.sh): an extra
+      # `just wasm` step would compile it twice and publish the second of
+      # the two binaries.
+      - name: Static site
+        run: just build-web
+
+      # Flat archive: `tar -C dist .` puts `index.html` at the root of the
+      # archive, not `dist/index.html`. The consumer extracts wherever they
+      # want without needing to know our directory layout.
+      - name: Archive
+        run: tar czf dist.tar.gz -C dist .
+
+      - name: Summary
+        run: |
+          echo "### dist.tar.gz" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- archive : $(du -h dist.tar.gz | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- fichiers : $(find dist -type f | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- wasm : $(du -h dist/wasm/hexsim_wasm_bg.wasm | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Always available, tag or not: lets you verify a build without
+      # publishing a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist.tar.gz

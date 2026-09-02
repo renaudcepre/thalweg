@@ -1,0 +1,46 @@
+# Nextest profiles, test cleanup effort 2026-07-10 (epic #59).
+#
+# `default` = daily dev loop (`just test`). The "heavy" tests are excluded
+# from it by the filter below and only run via the `heavy` profile
+# (`just test-all`, pre-merge gate).
+#
+# Classification is measured (rule: > ~15 s -> heavy; opt-level 3, 4 cores).
+# Reclassified 2026-07-10 after the coarse synoptic grid effort (#88): 7 of
+# the 9 original exclusions were heavy because of the fine-grid synoptic
+# solver (82% of the tick) and dropped back to 0.1-13.5 s; de-listed. Only
+# the scale_* (10-year sims, 25-53 s each) and physics_lake_concentration
+# remain. A test that becomes slow (again) gets flagged: slow-timeout marks
+# it [SLOW] at 15 s.
+#
+# `physics_lake_concentration` (12.8 s) is excluded HERE for its SLOWNESS
+# only. It's also red, but since 2026-08-28 redness is no longer managed in
+# this file: it lives in the `known_reds` variable of the justfile, checked
+# by `just reds`. One reason per place, otherwise we can no longer tell
+# whether de-listing it fixes the slowness or the redness.
+#
+# `phys_wet_peak_snows` is NO LONGER excluded here: at 0.36 s it wasn't slow
+# at all, it was only a tracked red (#111). It moved into `known_reds`.
+#
+# Reminder of the rule that applies to both: red = a discovery. The
+# threshold will NOT be re-tuned, it's the physics fix that must de-list
+# the exclusion.
+#
+# Run ONE specific heavy test:
+#   cargo nextest run --profile heavy -E 'test(dry_periods)'
+
+[profile.default]
+default-filter = """
+not (
+  binary(/^scale_/)
+  | binary(physics_lake_concentration)
+)
+"""
+slow-timeout = "15s"
+
+# Full suite: everything, including the heavy ones. The benchmarks
+# (#[ignore]: perf_phase_breakdown, scale_perf_radius_60) and the diag_*
+# tools stay out of the suite even here, they're dedicated just recipes,
+# not tests.
+[profile.heavy]
+default-filter = "all()"
+slow-timeout = "600s"

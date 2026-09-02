@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# HexSim pre-commit hook
+# - cargo fmt --check  : refuses the commit if formatting drifted
+# - cargo clippy -D warnings : refuses the commit on ANY warning, pedantic
+#                        included. The workspace config
+#                        ([workspace.lints.clippy] all=deny, pedantic=warn)
+#                        keeps severity "warn" for IDE work, where a hard
+#                        error on every keystroke breaks the editing flow;
+#                        `-D warnings` hardens it at commit time only.
+#                        Zero-warning discipline.
+#
+# Tests deliberately left out (too slow to gate every commit), `just check`
+# covers them before a push or a PR.
+#
+# To install this hook: ./scripts/install-hooks.sh
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SIM_DIR="$REPO_ROOT/simulation"
+
+# Nothing Rust in the commit, nothing to check (keeps the hook cheap).
+if ! git diff --cached --name-only --diff-filter=ACMR \
+        | grep -qE '^simulation/.*\.rs$|^simulation/.*Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+cd "$SIM_DIR"
+
+echo "▸ pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+    echo
+    echo "✗ Formatting does not conform. Fix with:  (cd simulation && cargo fmt)"
+    exit 1
+fi
+
+echo "▸ pre-commit: cargo clippy --all-targets --all-features --keep-going -D warnings"
+if ! cargo clippy --all-targets --all-features --keep-going --quiet -- -D warnings; then
+    echo
+    echo "✗ Clippy reported warnings or errors (-D warnings is on)."
+    echo "  Fix the code. Silencing a lint with #[allow] is not an option here."
+    exit 1
+fi
+
+echo "✓ pre-commit OK"

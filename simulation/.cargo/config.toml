@@ -1,0 +1,11 @@
+# target-cpu=native lets rustc use AVX2/NEON and other instructions specific
+# to the build machine. Acceptable for native binaries: we don't distribute
+# them, local perf is the priority (issue #41).
+#
+# Restricted to non-wasm targets since #138: the WASM module, on the other
+# hand, IS distributed, and it runs on the user's machine. Under `[build]` the
+# flag was also reaching wasm32, where it produced a
+# `'apple-m4' is not a recognized processor` error per compilation unit, and
+# risked enabling wasm features not all browsers have.
+[target.'cfg(not(target_arch = "wasm32"))']
+rustflags = ["-C", "target-cpu=native"]

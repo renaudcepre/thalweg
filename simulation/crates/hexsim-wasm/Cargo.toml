@@ -1,0 +1,34 @@
+[package]
+name = "hexsim-wasm"
+version.workspace = true
+edition.workspace = true
+
+# `cdylib` produces the `.wasm` module; `rlib` keeps the crate testable
+# natively (`cargo test`), without which the micro-tests would require a
+# wasm runner.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hexsim-core = { path = "../hexsim-core" }
+hexsim-proto = { path = "../hexsim-proto" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wasm-bindgen = "0.2.127"
+
+# Without this hook, a panic in the wasm shows up in JS as a
+# `RuntimeError: unreachable` with no stack trace or message, undebuggable.
+console_error_panic_hook = "0.1.7"
+
+[dev-dependencies]
+# Decodes snapshots in the micro-tests, the same way the front does.
+rmp-serde = "1.3"
+
+[lints]
+workspace = true
+
+# wasm-pack downloads its own copy of binaryen from GitHub Releases, which
+# fails behind a restricted network. We use the system's `wasm-opt`
+# (brew install binaryen), applied explicitly by the `just wasm` recipe.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

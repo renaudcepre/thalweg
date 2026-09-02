@@ -1,0 +1,163 @@
+# Search space for random_search.py
+#
+# Format: [group.param] = {min, max, [scale = "linear" | "log"]}
+# A parameter not present in this file stays at its default.
+# The user edits this file to open/close dimensions.
+#
+# Comments aligned with the project's physically credible ranges.
+# It's OK to temporarily extend a min/max to test a
+# hunch: if the optim converges outside the "safe" range, that's a
+# datapoint in itself.
+
+# ----- Atmosphere: condensation / precipitation -----
+#
+# Note Phase 2 (issue #31): `evap_rate` removed from the search space. Free
+# water evaporation now goes through Dalton's law (Meyer 1915) via
+# `meyer_evaporation` in `physics.rs`, a physical calculation from T, wind,
+# and RH. First parameter anchored to physics from the physical units refactor.
+
+# v0.6.x cleanup post-KK2000: `precip_rate` removed (field dropped from the
+# core, replaced by the KK2000 super-linear autoconversion). The equivalent
+# calibration knob is `kk2000_droplet_count` (N_c in cm^-3):
+# low -> rain comes easy, high -> rain is hard (exponent -1.79).
+#
+# `cloud_precip_threshold` also removed (deadcode v0.5.x).
+#
+# Phase 6 (#29): `saturation_at_zero` + `saturation_doubling_celsius` removed.
+# Saturation now follows physical Clausius-Clapeyron (Tetens) via the
+# `saturation_upper` function, parameterized only by `upper_layer_altitude_m`.
+
+[atmosphere.condensation_rate]
+min = 0.02
+max = 0.25
+
+[atmosphere.cloud_evap_hr_threshold]
+min = 0.20
+max = 0.55
+
+[atmosphere.cloud_evap_rate]
+min = 0.03
+max = 0.25
+
+[atmosphere.cloud_diffusion_rate]
+# min raised 0.05 -> 0.15: below that, clouds stay too localized
+# and the optim converges to "rain on the lakes" by default.
+# Test 2026-04-23 (issue #24): relaxing this constraint after #22/#23
+# (West wind + torus) doesn't unblock the cell-lake cycle. Top-20
+# rain_max goes from [236..365] to [357..365]. Constraint kept.
+min = 0.15
+max = 0.35
+
+[atmosphere.precip_neighbor_share]
+# min raised to 0.10: a minimum of dispersion onto neighbors breaks the
+# checkerboard pattern and forces rain to spread out spatially.
+# Test 2026-04-23 (issue #24): the prevailing wind isn't enough to
+# compensate, the dispersion constraints remain structural.
+min = 0.10
+max = 0.45
+
+# Phase 5 (#34): `max_precip_per_tick` removed from search_space. Physical
+# bound set by the terminal fall speed of raindrops ≈ 200 mm/day (Chow 1988).
+# Default Phase 3 = 4 mm/day, well under the physical ceiling, no point
+# varying it in the search.
+
+[atmosphere.orographic_boost]
+min = 0.2
+max = 0.9
+
+# ----- Atmosphere: 2-layer dynamics (uplift/subsidence) -----
+
+[atmosphere.uplift_rate]
+min = 0.03
+max = 0.20
+
+[atmosphere.uplift_thermal_coef]
+min = 0.0
+max = 0.010
+
+[atmosphere.uplift_orographic_coef]
+min = 0.5
+max = 3.0
+
+[atmosphere.subsidence_rate]
+min = 0.005
+max = 0.050
+
+# ----- Hydrology -----
+
+[hydro.flow_rate]
+min = 0.05
+max = 0.30
+
+[hydro.flow_concentration]
+min = 2.0
+max = 8.0
+
+# ----- Temperature (climate cycle) -----
+
+[temperature.base_temp]
+min = 10.0
+max = 22.0
+
+# v0.2.1 (#37): `season_amplitude` removed. Seasonality is now derived
+# from astronomy (latitude x solar declination x day length)
+# (Cooper 1969 + Duffie & Beckman 2013). No longer a free tuning knob.
+
+[temperature.latitude_deg]
+# Latitude of the simulated world (signed). Seasonality emerges automatically.
+# Reasonable range for tests: inhabited mid-latitudes. The extreme poles
+# (<-80, >80) remain valid but are little explored by the optim.
+min = -70.0
+max = 70.0
+
+# Phase 5 (#34): `lapse_rate` removed from search_space. ICAO standard
+# atmosphere value = 6.5 °C/km (project default already at 6.5). Tabulated
+# physical constant, nothing to gain by varying it in the search.
+
+# Phase 5 (#34): `cloud_albedo_coef` removed from search_space. Satellite
+# observation gives ~0.5 for average clouds (project default already at 0.5).
+# Physical constant, not a calibration knob.
+
+# ----- Wind (advection + turbulence) -----
+
+[wind.humidity_advection_rate]
+# min raised 0.10 -> 0.25: forces the atmosphere to actually move, avoids
+# the "weak wind = rain concentrated on the source" optimum.
+# Test 2026-04-23 (issue #24): even with the West bias active, lowering
+# this floor lets the optim fall back into the concentrated cycle. Kept.
+min = 0.25
+max = 0.55
+
+[wind.temperature_advection_rate]
+min = 0.05
+max = 0.30
+
+[wind.thermal_strength]
+min = 0.2
+max = 3.0
+
+[wind.noise_direction_amplitude]
+min = 0.3
+max = 1.8
+
+[wind.terrain_deflection]
+min = 0.0
+max = 1.0
+
+[wind.west_bias]
+# Constant vector bias toward the West (positive = dominant West wind).
+# Range extended to [-0.5, 0.5] after diagnosis via spatial hotspots:
+# the anti-concentration effect becomes clear from 0.3+. Keeps a
+# negative bound to let the optim test East wind if needed (debug).
+min = -0.5
+max = 0.5
+
+# ----- Groundwater -----
+
+[groundwater.infiltration_rate]
+min = 0.005
+max = 0.05
+
+[groundwater.diffusion_rate]
+min = 0.005
+max = 0.08
