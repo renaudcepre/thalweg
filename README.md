@@ -108,7 +108,7 @@ And once, to wire fmt + clippy into every commit:
 | `just diag` | compact diagnostics of the current state |
 | `just shot` | screenshot the 3D scene (Playwright) |
 
-The test suite is 441 tests across 83 integration files. Physical invariants
+The test suite is 403 tests across 82 integration files. Physical invariants
 (mass and energy conservation) are checked with `proptest`; a separate family
 of very small, very fast tests pins behaviours that are obvious to state and
 were hard to obtain — saturation rises with temperature, a fire goes out and

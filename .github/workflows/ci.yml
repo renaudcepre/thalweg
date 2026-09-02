@@ -1,0 +1,57 @@
+# Runs the same gate as a local `just check`: formatting, clippy, rustdoc
+# links, and the default test suite.
+#
+# This file ships to the public mirror, where it does a job nothing else does.
+# On the development repo it catches a broken push at the moment it happens;
+# on the mirror it checks that the **exported subset** builds on its own. The
+# export is an allowlist intersection, so a file the build needs but nobody
+# listed is invisible here: the development tree compiles because it has
+# everything. Only a build on the exported tree finds it.
+#
+# `dist.yml` does not cover that case: it only triggers on a `v*` tag, and the
+# publish script pushes no tags.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# A second push to the same branch cancels the run in progress: only the tip
+# matters, and a queue of stale runs hides the one that counts.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `crates/hexsim-cli/build.rs` reads the HEAD hash for the version
+      # badge. A shallow checkout is enough here (it degrades to "unknown"
+      # rather than failing), unlike the dist build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: simulation
+
+      - uses: extractions/setup-just@v3
+
+      - uses: taiki-e/install-action@nextest
+
+      # fmt + clippy (-D warnings) + rustdoc (-D warnings) + the default
+      # suite. Same command a contributor runs locally, so a green run here
+      # means the same thing as a green run there.
+      - run: just check
+
+      # Not part of `check`: the doctests are compiled separately, and one of
+      # them is a `compile_fail` proving that a metre cannot be added to a
+      # millimetre. A type-level prohibition has no other proof.
+      - run: just doctest

@@ -152,8 +152,11 @@ rebuild:
 # Doc tests (the `compile_fail`/executable examples embedded in doc comments,
 # e.g. `units::Meters`). Distinct from `just doc`, which lints the comments
 # themselves (broken links), not the code samples inside them.
+#
+# `--workspace` is not decorative: without it this ran 0 tests and reported
+# success, so the one proof that `Meters + Mm` is rejected proved nothing.
 doctest:
-    cargo test --doc
+    cargo test --doc --workspace
 
 # ── Optim: parameter evaluation harness ─────
 bench_bin := "./target/release/hexsim-bench"
