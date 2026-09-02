@@ -1,4 +1,6 @@
-# dem_import — real elevation survey on the hex grid
+# dem_import
+
+Real elevation survey on the hex grid.
 
 Projects a 30 m SRTM survey (via the public `opentopodata.org` API) onto the
 engine's hexagonal domain, to serve as a **validation oracle**: a world whose
@@ -40,7 +42,8 @@ HEXSIM_RADIUS=120 HEXSIM_DEM_OVERRIDE=../scripts/dem_import/out/drome_saou_r120.
 ## The two pitfalls, both hit in practice
 
 **The radius must match.** A radius-120 survey loaded into a radius-80 grid
-loses 55% of its cells — the border ones, i.e. the peripheral relief. Until
+loses 55% of its cells, and they are the border ones, i.e. the peripheral
+relief. Until
 2026-07-10 this was silent, and the world capped at 1059 m with nothing to
 flag it. The core now emits a `warn!` and counts the cells actually written
 (`DemApplyReport`).

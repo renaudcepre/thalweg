@@ -1,4 +1,6 @@
-# hexsim-shot — Playwright screenshots of the front end
+# hexsim-shot
+
+Playwright screenshots of the front end.
 
 Screenshot tool for the HexSim 3D scene, meant so Claude (or a human) can
 *see* the simulation instead of only reading JSON diagnostics.
@@ -44,9 +46,9 @@ The full list of options is documented in `shot.mjs`'s header
 
 Exposed by `frontend/main.js`. Angular convention (THREE.Spherical):
 
-- `radius` — camera→target distance in world units (1 hex ≈ 1.0)
-- `polarDeg` — tilt: `0` = top-down view, `90` = grazing
-- `azimuthDeg` — rotation around the vertical axis: `0` = view from the south
+- `radius`, camera→target distance in world units (1 hex ≈ 1.0)
+- `polarDeg`, tilt: `0` = top-down view, `90` = grazing
+- `azimuthDeg`, rotation around the vertical axis: `0` = view from the south
 
 Methods: `ready()`, `state()`, `view()`, `setView(opts)`, `zoom(factor)`,
 `fitAll(margin)`, `render()`, `setChromeVisible(bool)`, `cover()`, `mix()`.
@@ -57,9 +59,9 @@ Methods: `ready()`, `state()`, `view()`, `setView(opts)`, `zoom(factor)`,
 current state (no recomputation: the core supplies `dominant_species` +
 `species_mix`):
 
-- `count` / `pct` — cells per dominant species (+ `water`, `bare`)
-- `meanVeg` — mean total vegetation cover [0,1]
-- `mix` — mixing *within* hexes: `meanDominantShare` (share of the dominant
+- `count` / `pct`, cells per dominant species (+ `water`, `bare`)
+- `meanVeg`, mean total vegetation cover [0,1]
+- `mix`, mixing *within* hexes: `meanDominantShare` (share of the dominant
   species), `meanEffSpecies` (effective number of species/hex, inverse
   Simpson), `monoPct` (> 90% one species) / `mixedPct` (< 70% dominant),
   `communityPct` (average composition).
