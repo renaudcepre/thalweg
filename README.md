@@ -18,6 +18,8 @@ I mostly run it the way you watch a fire. The long-term plan is to put agents
 on the map and see whether they organise themselves, but the ground has to
 hold first.
 
+<img src="assets/world.jpg" alt="A night view of the simulated world: a forested plain, a lake settled in a hollow, mountains on the horizon" width="100%">
+
 <img src="assets/rule.svg" alt="" width="100%">
 
 ## How it works
@@ -36,6 +38,12 @@ invariant.
   never call each other; they interact only through the properties they
   mutate.
 - **A single seed determines the entire world**, terrain included.
+
+<img src="assets/thalweg.jpg" alt="Close-up of the hex grid: white arrows show the wind field on each cell, and a carved valley runs through the middle with water converging along its floor" width="100%">
+
+The arrows are the wind field, one vector per cell. The dark line running
+through the middle is a thalweg: nothing marks it as one, it is simply where
+the slope sends the water.
 
 Physics is written in strict SI units — W/m² for energy fluxes, J/(m²·K) for
 surface heat capacities, Pa for pressures — with the fundamental constants
