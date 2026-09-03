@@ -94,8 +94,10 @@ def main():
             "  instantiates but computes nothing (cf. release v0.8.0).\n"
             f"  wasm-opt used here: {_wasm_opt_version()}\n"
             "  macOS: brew upgrade binaryen\n"
-            "  CI     : see .github/workflows/dist.yml, binaryen is pinned\n"
-            "           from GitHub releases, not from apt."
+            "  Linux: remove the distro package (apt ships 108), then\n"
+            "         `just wasm-setup` fetches the pinned release\n"
+            "  CI   : see .github/workflows/dist.yml, binaryen is pinned\n"
+            "         from GitHub releases, not from apt."
         )
     print(f"✓ target_features intact ({len(now)} features)")
 

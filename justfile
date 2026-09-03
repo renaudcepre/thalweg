@@ -252,16 +252,18 @@ reset seed="":
 front-setup:
     cd ../frontend && npm install
 
-# Installs the WASM tooling, one-shot after a fresh clone (#138)
+# binaryen release fetched without brew (Linux). Mirrors BINARYEN_VERSION in
+# .github/workflows/dist.yml: bump both together.
+binaryen_version := "132"
+
+# Installs the WASM tooling, one-shot after a fresh clone (#138): wasm32
+# target, wasm-pack, wasm-opt. brew where it exists, `cargo install` and the
+# pinned binaryen release otherwise; see the script for the NixOS case.
+# wasm-pack's own binaryen download is disabled (`wasm-opt = false` in the
+# crate's Cargo.toml): it hits GitHub Releases at every build and fails
+# behind a restricted network, `just wasm` applies the system wasm-opt.
 wasm-setup:
-    #!/usr/bin/env bash
-    set -e
-    rustup target add wasm32-unknown-unknown
-    # binaryen comes from brew, not wasm-pack's automatic download: the latter
-    # hits GitHub Releases and fails behind a restricted network.
-    # Hence `wasm-opt = false` in the crate's Cargo.toml.
-    command -v wasm-pack >/dev/null || brew install wasm-pack
-    command -v wasm-opt  >/dev/null || brew install binaryen
+    ../scripts/wasm-setup.sh {{binaryen_version}}
 
 # Builds the WASM module into frontend/wasm/ (artifact, gitignored)
 wasm:

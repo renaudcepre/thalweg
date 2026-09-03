@@ -29,6 +29,6 @@ workspace = true
 
 # wasm-pack downloads its own copy of binaryen from GitHub Releases, which
 # fails behind a restricted network. We use the system's `wasm-opt`
-# (brew install binaryen), applied explicitly by the `just wasm` recipe.
+# (installed by `just wasm-setup`), applied explicitly by the `just wasm` recipe.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
