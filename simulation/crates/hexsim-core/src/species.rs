@@ -93,7 +93,11 @@ impl Species {
         if n.t_min < self.temp_lethal_min || n.t_max > self.temp_lethal_max {
             return 0.0;
         }
-        if n.moisture_min < self.moisture_lethal_min {
+        // `> 0.0` guard (#151): a species whose lethal threshold is 0
+        // has no drought limit, but `moisture_min` goes slightly
+        // negative through f32 rounding of the transfers, which killed
+        // oak, pine and grass on ~50% of the bare cells.
+        if self.moisture_lethal_min > 0.0 && n.moisture_min < self.moisture_lethal_min {
             return 0.0;
         }
 

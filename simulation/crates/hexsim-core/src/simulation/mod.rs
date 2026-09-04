@@ -30,7 +30,8 @@
 
 use crate::ablation::Ablation;
 use crate::atmosphere::{
-    AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, step_atmosphere_into,
+    AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, smooth_upper_air_mean_t,
+    step_atmosphere_into, surface_means,
 };
 use crate::climate::{ClimateHistory, DayRecord};
 use crate::climate_normals::ClimateNormalsAccumulator;
@@ -52,6 +53,7 @@ use crate::synoptic_mesh::SynopticMesh;
 use crate::temperature::{
     IllumCache, TemperatureForcing, TemperatureParams, aspect_insolation_correction,
     compute_illumination_cached, compute_surface_normals, solar_beam_at_tick, step_temperature,
+    terrain_annual_mean_insolation_factor,
 };
 use crate::time::{self, TICKS_PER_DAY};
 use crate::vegetation::{VegetationParams, step_vegetation};
@@ -274,6 +276,17 @@ pub struct Simulation {
     /// Persistent state of the global precipitation gate (hysteresis).
     /// See `AtmosphereParams.global_precip_gate`.
     precip_gate_open: bool,
+    /// Diurnally smoothed map-mean surface temperature (°C) anchoring the
+    /// upper layer (`atmosphere::upper_air_temperature`): exponential
+    /// moving average of the instantaneous map mean with
+    /// τ = `UPPER_AIR_SMOOTHING_TAU_S` (24 h), stepped every hour in
+    /// `step_hour` right before the atmosphere and handed to it as
+    /// `AtmoForcing::upper_air_mean_t`. One scalar for the whole map:
+    /// the free atmosphere is horizontally mixed and does not follow the
+    /// ~8 K day/night swing of the surface. Persistent state, hence
+    /// checkpointed (a hidden EMA would make restarts drift for ~3τ).
+    /// Initialised to the instantaneous mean at construction.
+    upper_air_mean_t: f32,
     // Scratch buffers reused each tick (zero malloc in step()).
     scratch_wind_snap: WindField,
     scratch_atmo: AtmoScratch,
@@ -303,6 +316,24 @@ pub struct Simulation {
     /// never serialized to checkpoint, reset at loading. Inert on wasm32
     /// (no-op clock).
     timings: PhaseTimings,
+}
+
+/// Builds the illumination cache for `grid` and calibrates
+/// `temperature_params.terrain_insolation_factor` against it (JOURNAL
+/// 2026-09-02/03: `calibration_offset` must target `base_temp` on the
+/// terrain the map actually has, not an assumed flat one). Factored out
+/// of `Simulation::new`/the erosion path so both share the exact same
+/// sequence (`ensure` then measure), and to keep `new` under clippy's
+/// line budget.
+fn init_illum_cache_and_terrain_factor(
+    grid: &HexGrid,
+    temperature_params: &mut TemperatureParams,
+) -> IllumCache {
+    let mut illum_cache = IllumCache::new();
+    illum_cache.ensure(grid);
+    temperature_params.terrain_insolation_factor =
+        terrain_annual_mean_insolation_factor(grid, &illum_cache, temperature_params);
+    illum_cache
 }
 
 impl Simulation {
@@ -341,7 +372,14 @@ impl Simulation {
         let mut temperature_params = temperature_params;
         temperature_params.aspect_correction =
             aspect_insolation_correction(&grid, &temperature_params);
+        // Real-terrain insolation deficit (relief occlusion + diffuse
+        // sky, JOURNAL 2026-09-02/03): the cache built here is adopted
+        // below instead of being rebuilt on the first tick.
+        let illum_cache = init_illum_cache_and_terrain_factor(&grid, &mut temperature_params);
         let next = grid.clone();
+        // The upper-air anchor starts on the instantaneous mean: no
+        // history yet, the EMA settles within ~3τ (3 days).
+        let (upper_air_mean_t, _) = surface_means(&grid);
 
         // Synoptic dynamics: seed + latitude inherited from world to stay
         // consistent with "one world". Solver integrates on its dedicated torus
@@ -446,6 +484,7 @@ impl Simulation {
             climate_history: ClimateHistory::new(),
             last_precipitation: vec![DayRecord::default(); n],
             precip_gate_open: false,
+            upper_air_mean_t,
             scratch_wind_snap,
             scratch_atmo: AtmoScratch::new(n),
             scratch_flux: vec![0.0; n],
@@ -454,7 +493,9 @@ impl Simulation {
             scratch_precip_tick: vec![DayRecord::default(); n],
             scratch_flux_factor: vec![0.0; n],
             scratch_illumination: vec![1.0; n],
-            illum_cache: IllumCache::new(),
+            // Already built above to compute `terrain_insolation_factor`:
+            // reused instead of rebuilding it on the first tick.
+            illum_cache,
             climate_normals: ClimateNormalsAccumulator::new(n),
             timings: PhaseTimings::default(),
         }
@@ -558,6 +599,13 @@ impl Simulation {
         self.timings.snow += elapsed_s(t0);
 
         let t0 = mark();
+        // Upper-air anchor: one EMA step on the instantaneous map-mean
+        // surface temperature of the state the atmosphere is about to
+        // read (post temperature + snow), τ = 24 h
+        // (`UPPER_AIR_SMOOTHING_TAU_S`). Persistent state, mutated here
+        // and nowhere else; the atmosphere only reads it.
+        let (mean_surface_t, _) = surface_means(&self.current);
+        self.upper_air_mean_t = smooth_upper_air_mean_t(self.upper_air_mean_t, mean_surface_t);
         step_atmosphere_into(
             &self.current,
             &mut self.next,
@@ -568,6 +616,7 @@ impl Simulation {
                 wind_field: &self.wind_field,
                 wind_mag: &self.wind_mag,
                 hour_tick: self.hour_tick,
+                upper_air_mean_t: self.upper_air_mean_t,
             },
             &mut self.precip_gate_open,
             &mut self.scratch_atmo,
@@ -757,7 +806,10 @@ impl Simulation {
         // recomputed after an effective step, O(n), negligible next to the 8
         // MFD passes. `aspect_correction` (N×8760, expensive) stays frozen at
         // construction: the normals' drift is second-order on the annual map
-        // average that it recalibrates.
+        // average that it recalibrates. `terrain_insolation_factor` IS
+        // recomputed below (sampled, ~7x cheaper than `aspect_correction`'s
+        // full year, and `step_erosion` itself only runs once a day): the
+        // relief occlusion it captures is first-order, unlike the tilt.
         if self.erosion_params.enabled {
             let t0 = mark();
             let totals = step_erosion(
@@ -773,8 +825,13 @@ impl Simulation {
             if totals.incised_m > 0.0 || totals.deposited_m > 0.0 {
                 compute_surface_normals(&mut self.current);
                 // Elevation moved: the illumination's horizon tangents are
-                // stale (#65), rebuild on the next tick.
-                self.illum_cache.mark_dirty();
+                // stale (#65). Rebuild NOW (not deferred to the next
+                // tick's `ensure`) via the same helper `new` uses, so
+                // `terrain_insolation_factor` reads a fresh cache too.
+                self.illum_cache = init_illum_cache_and_terrain_factor(
+                    &self.current,
+                    &mut self.temperature_params,
+                );
             }
             self.erosion_incised_total += f64::from(totals.incised_m);
             self.erosion_deposited_total += f64::from(totals.deposited_m);

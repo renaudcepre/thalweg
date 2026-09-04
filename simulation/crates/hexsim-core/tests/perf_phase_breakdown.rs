@@ -17,7 +17,8 @@
 use std::time::Instant;
 
 use hexsim_core::atmosphere::{
-    AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, step_atmosphere_into,
+    AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, smooth_upper_air_mean_t,
+    step_atmosphere_into, surface_means,
 };
 use hexsim_core::climate::DayRecord;
 use hexsim_core::dynamics::{SynopticParams, SynopticState};
@@ -256,6 +257,8 @@ fn run_phases(grid: HexGrid) -> (PhaseTimings, usize) {
     let p = p;
 
     let mut hour_tick: u64 = 0;
+    // Upper-air anchor (EMA τ = 24 h), same bookkeeping as `Simulation`.
+    let mut upper_air_mean_t = surface_means(&s.current).0;
     let mut t = PhaseTimings::default();
     let mut measuring = false;
     for h in 0..u64::from(WARMUP_HOURS + MEASURE_HOURS) {
@@ -332,6 +335,7 @@ fn run_phases(grid: HexGrid) -> (PhaseTimings, usize) {
             );
             std::mem::swap(&mut s.current, &mut s.next);
         });
+        upper_air_mean_t = smooth_upper_air_mean_t(upper_air_mean_t, surface_means(&s.current).0);
         time_phase(measuring, &mut t.atmo, || {
             step_atmosphere_into(
                 &s.current,
@@ -343,6 +347,7 @@ fn run_phases(grid: HexGrid) -> (PhaseTimings, usize) {
                     wind_field: &s.wind_field,
                     wind_mag: &s.wind_mag,
                     hour_tick,
+                    upper_air_mean_t,
                 },
                 &mut s.precip_gate_open,
                 &mut s.atmo,

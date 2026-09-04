@@ -28,7 +28,33 @@ pub struct GroundwaterParams {
     /// carry rivers. Conservative: `groundwater → water_level`.
     #[serde(default)]
     pub baseflow_coef: f32,
+    /// Field capacity, as a fraction of the cell's total storage
+    /// (`permeability × max_capacity`). Water below that level is held
+    /// by capillary forces against gravity and does NOT drain
+    /// laterally: only `groundwater − field_capacity` takes part in the
+    /// piezometric flow of step 2 (Veihmeyer & Hendrickson 1931, bucket
+    /// model of FAO-56 §22). Without it, the slopes' water table
+    /// emptied into the valley in 1-2 days at 130 m spacing and left
+    /// half the map bare (#151: ablation `diffusion = 0` → 2% bare
+    /// instead of 57% at 800-1500 m).
+    ///
+    /// 0.65 of total pore storage is the loam end of the range: the
+    /// proper value comes from the lithology of each cell, which the
+    /// engine does not model yet, which is why this is a single
+    /// world-wide fraction for now and not a per-cell soil property.
+    #[serde(default = "default_field_capacity_frac")]
+    pub field_capacity_frac: f32,
 }
+
+/// Serde default for [`GroundwaterParams::field_capacity_frac`], so a
+/// checkpoint written before #151 reloads with the current physics
+/// rather than with a silent 0.0 (no capillary water at all).
+fn default_field_capacity_frac() -> f32 {
+    DEFAULT_FIELD_CAPACITY_FRAC
+}
+
+/// See [`GroundwaterParams::field_capacity_frac`].
+pub const DEFAULT_FIELD_CAPACITY_FRAC: f32 = 0.65;
 
 impl Default for GroundwaterParams {
     fn default() -> Self {
@@ -52,6 +78,7 @@ impl Default for GroundwaterParams {
             // (#107). The retained value is set after proof on the
             // sustainability metric + strict conservation + climate.
             baseflow_coef: 0.0,
+            field_capacity_frac: DEFAULT_FIELD_CAPACITY_FRAC,
         }
     }
 }
@@ -91,8 +118,18 @@ pub fn step_groundwater(current: &HexGrid, next: &mut HexGrid, params: &Groundwa
         };
         // Frozen soil: linear transition between -2°C (impermeable) and
         // 0°C. Meltwater at the foot of glaciers stays on the surface →
-        // runs off.
-        let frozen_factor = f32::midpoint(cell.temperature, 2.0).clamp(0.0, 1.0);
+        // runs off. Written as an explicit ramp rather than
+        // `midpoint(T, 2.0).clamp(0.0, 1.0)` (#49): both compute the same
+        // numbers, but the midpoint form reads as a formula that keeps
+        // rising above 0°C, where it has no physical meaning, and hides
+        // the plateau inside the clamp.
+        let frozen_factor = if cell.temperature <= -2.0 {
+            0.0
+        } else if cell.temperature >= 0.0 {
+            1.0
+        } else {
+            (cell.temperature + 2.0) / 2.0
+        };
         let effective_rate =
             params.infiltration_rate * cell.permeability * (1.0 - saturation) * frozen_factor;
         let infiltration =
@@ -143,8 +180,13 @@ pub fn step_groundwater(current: &HexGrid, next: &mut HexGrid, params: &Groundwa
             if piezometric > neighbor_piezo {
                 let perm_factor = snap_perm[i].min(snap_perm[j]);
                 let diff = piezometric - neighbor_piezo;
-                let available = next_cells[i].groundwater;
-                let transfer = (base_rate * perm_factor * diff).min(available.max(0.0));
+                // Only the water above field capacity is drainable
+                // (#151): below that level capillary forces hold it
+                // against gravity, whatever the piezometric gradient.
+                let field_capacity =
+                    snap_perm[i] * params.max_capacity * params.field_capacity_frac;
+                let drainable = (next_cells[i].groundwater - field_capacity).max(0.0);
+                let transfer = (base_rate * perm_factor * diff).min(drainable);
                 if transfer > 0.0 {
                     next_cells[i].groundwater -= transfer;
                     next_cells[j].groundwater += transfer;
@@ -327,25 +369,34 @@ mod tests {
 
     #[test]
     fn piezometric_gradient_flows_uphill_to_downhill() {
-        // Mountain with moderate gw and plain with higher gw: the
-        // piezometric level (elev + gw) stays higher on the mountain, so
-        // water must flow toward the plain even if the plain is "richer"
-        // in groundwater. This is the mechanism that feeds natural
-        // springs.
+        // Mountain and plain both above field capacity, the plain
+        // richer: the piezometric level (elev + gw) stays higher on the
+        // mountain, so water must flow toward the plain even though the
+        // plain holds more groundwater. This is the mechanism that feeds
+        // natural springs.
+        //
+        // Both stocks are set above field capacity on purpose (#151):
+        // below it the water is capillary-held and drains nowhere, which
+        // is what `water_below_field_capacity_does_not_drain` pins. The
+        // earlier version of this test ran on 1 mm of mountain water
+        // table, i.e. exactly the leak #151 measured.
+        let params = GroundwaterParams::default();
+        let field_capacity = params.max_capacity * params.field_capacity_frac;
+
         let mut grid = HexGrid::from_radius(1);
         let mountain = crate::coord::HexCoord::new(0, 0);
         let plain_neighbors: Vec<_> = grid.neighbors(mountain).iter().map(|(c, _)| *c).collect();
 
         if let Some(cell) = grid.get_mut(mountain) {
             cell.elevation = 500.0;
-            cell.groundwater = 1.0; // piezo = 501
+            cell.groundwater = field_capacity + 10.0; // piezo = 575
             cell.water_level = 0.0;
             cell.permeability = 1.0;
         }
         for &coord in &plain_neighbors {
             if let Some(cell) = grid.get_mut(coord) {
                 cell.elevation = 0.0;
-                cell.groundwater = 3.0; // piezo = 3 (much lower than 501)
+                cell.groundwater = field_capacity + 30.0; // piezo = 95
                 cell.water_level = 0.0;
                 cell.permeability = 1.0;
             }
@@ -353,7 +404,7 @@ mod tests {
 
         let before_mountain = grid.get(mountain).unwrap().groundwater;
         let mut next = grid.clone();
-        step_groundwater(&grid, &mut next, &GroundwaterParams::default());
+        step_groundwater(&grid, &mut next, &params);
         let after_mountain = next.get(mountain).unwrap().groundwater;
 
         assert!(
@@ -415,6 +466,7 @@ mod tests {
             max_capacity: 1000.0,
             infiltration_rate: 0.0, // no surface water to infiltrate back
             diffusion_rate: 0.0,
+            field_capacity_frac: DEFAULT_FIELD_CAPACITY_FRAC,
         };
         let mut grid = HexGrid::from_radius(0);
         let c0 = crate::coord::HexCoord::new(0, 0);
@@ -457,6 +509,7 @@ mod tests {
             max_capacity: 10_000.0,
             infiltration_rate: 0.0,
             diffusion_rate: 0.0,
+            field_capacity_frac: DEFAULT_FIELD_CAPACITY_FRAC,
         };
         let mut current = HexGrid::from_radius(0);
         let c0 = crate::coord::HexCoord::new(0, 0);
@@ -494,6 +547,117 @@ mod tests {
         assert!(
             GroundwaterParams::default().baseflow_coef == 0.0,
             "baseflow_coef should stay 0 by default until proven on a metric"
+        );
+    }
+    /// `frozen_factor` is a linear ramp between -2°C and 0°C: no
+    /// infiltration below -2°C, half rate at -1°C, full rate from 0°C up.
+    /// Pins the explicit form against a rewrite back to `midpoint()`,
+    /// which is what produced the unreadable version of #49.
+    #[test]
+    fn frozen_factor_is_a_linear_ramp() {
+        // Radius 0 is legitimate here: infiltration is cell-local, the
+        // ramp involves no transport between neighbours.
+        let params = GroundwaterParams {
+            infiltration_rate: 0.1,
+            ..GroundwaterParams::default()
+        };
+        let c0 = crate::coord::HexCoord::new(0, 0);
+
+        for (temperature, factor) in [(-3.0, 0.0), (-1.0, 0.5), (0.0, 1.0), (15.0, 1.0)] {
+            let mut grid = HexGrid::from_radius(0);
+            if let Some(cell) = grid.get_mut(c0) {
+                cell.water_level = 10.0;
+                cell.groundwater = 0.0;
+                cell.permeability = 1.0;
+                cell.temperature = temperature;
+            }
+            let mut next = grid.clone();
+            step_groundwater(&grid, &mut next, &params);
+
+            // rate * permeability * (1 - saturation) * factor * water_level,
+            // far below capacity (100 mm), so the min() never binds.
+            let expected: f32 = 0.1 * 10.0 * factor;
+            let gw = next.get(c0).unwrap().groundwater;
+            assert!(
+                (gw - expected).abs() < 1e-4,
+                "at {temperature}°C the ramp should give {factor}: gw={gw}, expected≈{expected}"
+            );
+        }
+    }
+    /// Capillary water does not drain (#151): with a water table below
+    /// field capacity, the piezometric gradient of step 2 moves nothing,
+    /// however steep the slope. Radius 2, not 0: lateral drainage is
+    /// transport, and on the torus a radius-0 cell is its own neighbour
+    /// six times over.
+    #[test]
+    fn water_below_field_capacity_does_not_drain() {
+        let params = GroundwaterParams::default();
+        let field_capacity = params.max_capacity * params.field_capacity_frac;
+
+        let mut grid = HexGrid::from_radius(2);
+        // A slope: elevation grows with q, so the piezometric gradient
+        // has somewhere to push the water table towards.
+        let mut elevation = 0.0_f32;
+        for cell in grid.cells_slice_mut() {
+            cell.elevation = elevation;
+            elevation += 100.0;
+            cell.permeability = 1.0;
+            cell.water_level = 0.0;
+            cell.temperature = 10.0;
+            cell.groundwater = field_capacity - 5.0;
+        }
+
+        let mut next = grid.clone();
+        step_groundwater(&grid, &mut next, &params);
+
+        for (coord, cell) in next.iter() {
+            let before = grid.get(*coord).unwrap().groundwater;
+            assert!(
+                (cell.groundwater - before).abs() < 1e-6,
+                "held water moved: {before} → {}",
+                cell.groundwater
+            );
+        }
+    }
+
+    /// Above field capacity, only the excess drains, and a cell never
+    /// falls below field capacity through lateral flow alone (#151).
+    #[test]
+    fn only_the_excess_above_field_capacity_drains() {
+        let params = GroundwaterParams::default();
+        let field_capacity = params.max_capacity * params.field_capacity_frac;
+
+        let mut grid = HexGrid::from_radius(2);
+        let mut elevation = 0.0_f32;
+        for cell in grid.cells_slice_mut() {
+            cell.elevation = elevation;
+            elevation += 100.0;
+            cell.permeability = 1.0;
+            cell.water_level = 0.0;
+            cell.temperature = 10.0;
+            cell.groundwater = field_capacity + 10.0;
+        }
+
+        let mut next = grid.clone();
+        let total_before = total_groundwater(&grid);
+        step_groundwater(&grid, &mut next, &params);
+
+        let mut drained = false;
+        for cell in next.cells_slice() {
+            assert!(
+                cell.groundwater >= field_capacity - 1e-4,
+                "drained below field capacity: {}",
+                cell.groundwater
+            );
+            if cell.groundwater < field_capacity + 10.0 - 1e-4 {
+                drained = true;
+            }
+        }
+        assert!(drained, "the excess should drain somewhere");
+        assert!(
+            (total_groundwater(&next) - total_before).abs() < 1e-2,
+            "step 2 is a transfer, not a source: {total_before} → {}",
+            total_groundwater(&next)
         );
     }
 }

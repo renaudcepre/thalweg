@@ -1,4 +1,7 @@
-use hexsim_core::atmosphere::{AtmoForcing, AtmosphereParams, step_atmosphere, total_humidity};
+use hexsim_core::atmosphere::{
+    AtmoForcing, AtmosphereParams, smooth_upper_air_mean_t, step_atmosphere, surface_means,
+    total_humidity,
+};
 use hexsim_core::grid::HexGrid;
 use hexsim_core::groundwater::{GroundwaterParams, step_groundwater, total_groundwater};
 use hexsim_core::hydro::{HydroParams, step_hydro_mfd, total_water};
@@ -32,9 +35,12 @@ fn water_cycle_conservation() {
     );
 
     let mut wind_mag = Vec::new();
+    // Upper-air anchor (EMA τ = 24 h), same bookkeeping as `Simulation`.
+    let mut upper_air_mean_t = surface_means(&current).0;
     for tick in 1..=500_u64 {
         let wf = compute_wind_field(&current, &wp, tick);
         compute_wind_magnitudes_into(&wf, &mut wind_mag);
+        upper_air_mean_t = smooth_upper_air_mean_t(upper_air_mean_t, surface_means(&current).0);
         step_atmosphere(
             &current,
             &mut next,
@@ -45,6 +51,7 @@ fn water_cycle_conservation() {
                 wind_field: &wf,
                 wind_mag: &wind_mag,
                 hour_tick: tick,
+                upper_air_mean_t,
             },
             &mut precip_gate_open,
         );

@@ -548,9 +548,6 @@ pub struct MetricsAccumulator {
     // Days where NO cell receives rain (alpine snow tolerated), the true
     // indicator of a high-pressure phase, de-confounded from snow.
     fully_rain_free_ticks: u64,
-    // Atmo config needed for the RH calculation (Tetens, Phase 6)
-    upper_layer_altitude_m: f32,
-    lapse_rate: f32,
     // Conservation
     initial_water: f32,
     // Detection of a NaN/Inf in the main stocks
@@ -564,7 +561,7 @@ impl MetricsAccumulator {
     /// `initial_water` is fixed to the value of `water_budget` at this
     /// exact moment; conservation is measured relative to that.
     #[must_use]
-    pub fn start(sim: &Simulation, effective: &EffectiveParams, measure_ticks: u64) -> Self {
+    pub fn start(sim: &Simulation, measure_ticks: u64) -> Self {
         let grid = sim.grid();
         let cell_count = grid.len();
         let elevations: Vec<f32> = grid.iter().map(|(_, c)| c.elevation).collect();
@@ -583,8 +580,6 @@ impl MetricsAccumulator {
             precip_per_tick: Vec::with_capacity(measure_ticks as usize),
             fully_dry_ticks: 0,
             fully_rain_free_ticks: 0,
-            upper_layer_altitude_m: effective.atmosphere.upper_layer_altitude_m,
-            lapse_rate: effective.temperature.lapse_rate,
             initial_water: total_water_budget(sim),
             nan_inf_seen: false,
             ticks_observed: 0,
@@ -599,8 +594,14 @@ impl MetricsAccumulator {
         let mut snow_total = 0.0_f32;
         let mut any_rain_this_tick = false;
         let mut any_rain_only_this_tick = false;
-        let t_offset = self.lapse_rate * self.upper_layer_altitude_m / 1000.0;
-        let altitude_m = self.upper_layer_altitude_m;
+        // Same upper air as the engine (`upper_air_temperature`): the
+        // sim's diurnally smoothed map-mean surface T (source of truth,
+        // anti-pattern #2: never recompute it here), map-mean elevation
+        // and standard lapse from the map-mean ground.
+        let mean_t = sim.upper_air_mean_t();
+        let (_, mean_z) = crate::atmosphere::surface_means(grid);
+        let atmo_params = sim.atmosphere_params();
+        let temp_params = sim.temperature_params();
 
         for (i, (_, cell)) in grid.iter().enumerate() {
             // NaN/Inf check on the main stocks
@@ -657,8 +658,14 @@ impl MetricsAccumulator {
             // Visible cloud: RH > 0.6 (same Tetens saturation as
             // step_cloud_dynamics). Phase 6 (#29): Clausius-Clapeyron via
             // `saturation_upper_pw` (pure, depends only on altitude).
-            let t_upper = cell.temperature - t_offset;
-            let sat = crate::atmosphere::saturation_upper_pw(t_upper, altitude_m);
+            let t_upper = crate::atmosphere::upper_air_temperature(
+                mean_t,
+                mean_z,
+                cell.elevation,
+                atmo_params,
+                temp_params,
+            );
+            let sat = crate::atmosphere::saturation_upper(t_upper, atmo_params);
             let hr = if sat > 0.0 {
                 cell.humidity_upper / sat
             } else {
@@ -977,11 +984,11 @@ mod tests {
 
     #[test]
     fn accumulator_runs_without_panic() {
-        let (mut sim, effective) = build_bench_sim(42, 3, &BenchParams::default());
+        let (mut sim, _) = build_bench_sim(42, 3, &BenchParams::default());
         for _ in 0..30 {
             sim.step();
         }
-        let mut acc = MetricsAccumulator::start(&sim, &effective, 30);
+        let mut acc = MetricsAccumulator::start(&sim, 30);
         for _ in 0..30 {
             sim.step();
             acc.observe(&sim);

@@ -15,15 +15,38 @@ use crate::coord::hex_direction_to_world;
 use crate::dynamics::CELL_SPACING_M;
 use crate::grid::HexGrid;
 
-use super::SolarBeam;
+use super::{SolarBeam, TemperatureParams, solar_beam_at_tick};
 
-/// Diffuse fraction of clear sky (dimensionless). Upstream relief
-/// blocks the DIRECT beam but not the diffuse radiation from the whole
-/// sky: a fully occluded cell still keeps this fraction (not an
-/// arbitrary safeguard, it's the diffuse component, ~15-25% under
-/// clear sky, Duffie & Beckman 2013). Coarse model (no sky-view
-/// factor) to refine.
+/// Diffuse fraction of the clear-sky global irradiance (dimensionless,
+/// ~15-25 % under clear sky, Duffie & Beckman 2013 §2.10). The direct
+/// beam depends on the incidence angle and is blocked by upstream
+/// relief; the diffuse component comes from the whole sky dome and
+/// reaches a slope turned away from the sun or a cell in a relief
+/// shadow alike, weighted by its sky-view factor (isotropic sky model,
+/// Liu & Jordan 1960). Before 2026-09-02 the diffuse part was only
+/// applied under relief occlusion, and a slope facing away from the
+/// sun received nothing at all: at 130 m spacing (relief 8x steeper
+/// than at the 1074 m calibration) that zero on every ubac and every
+/// occluded valley collapsed the map-wide lapse rate to ~1 °C/km and
+/// turned the coldest cells into permanent condensers (bisected to
+/// e3594f9 + d6be105, JOURNAL 2026-09-02).
 pub const DIFFUSE_SKY_FRACTION: f32 = 0.2;
+
+/// Flux factor of a tilted surface under a clear sky partially hidden
+/// by relief: `(1 − D)·direct + D·diffuse`, with the direct beam
+/// `cos_inc·(1 − t)` (fully blocked at `t = 1`) and the isotropic
+/// diffuse component `s_u·(1 + n_u)/2` (sky-view factor of a plane of
+/// upward normal component `n_u`). Written as `direct + D·(diffuse −
+/// direct)` so that a flat unoccluded cell (`cos_inc = s_u`, `n_u = 1`,
+/// `t = 0`) yields exactly `s_u`, the historical horizontal beam,
+/// bit-identical.
+#[inline]
+#[must_use]
+fn tilted_flux_factor(s_u: f32, n_u: f32, cos_inc: f32, occlusion_t: f32) -> f32 {
+    let direct = cos_inc * (1.0 - occlusion_t);
+    let diffuse = s_u * 0.5 * (1.0 + n_u);
+    direct + DIFFUSE_SKY_FRACTION * (diffuse - direct)
+}
 
 /// Max number of steps in the shadow march (beyond this, potential
 /// obstruction is negligible and the cost climbs). Step = 1 cell.
@@ -138,15 +161,12 @@ pub fn compute_illumination(
         let (ne, nn) = (cells[i].normal_east, cells[i].normal_north);
         let n_u = (1.0 - ne * ne - nn * nn).max(0.0).sqrt();
         let cos_inc = (beam.s_e * ne + beam.s_n * nn + beam.s_u * n_u).max(0.0);
-        if cos_inc <= 0.0 {
-            flux_factor[i] = 0.0;
-            illumination[i] = 0.0; // slope facing away from the sun: no direct
-            continue;
-        }
         let cy = cells[i].elevation;
         let mut over = 0.0_f32; // max exceedance of the ray by an upstream relief
         let mut eff_cloud = cells[i].cloud_water; // default: local (zenith) cloud
-        if has_azimuth && !ko_raymarch {
+        // Slope facing away from the sun (`cos_inc = 0`): no direct beam
+        // to occlude, no march; it still receives the diffuse sky below.
+        if cos_inc > 0.0 && has_azimuth && !ko_raymarch {
             let mut idx = i;
             let mut dist = 0.0_f32;
             // Sub-cell cloud shadow (offset < 1 cell, sun high) → keep
@@ -171,10 +191,9 @@ pub fn compute_illumination(
             }
         }
         let t = (over / ILLUM_FULL_M).min(1.0);
-        let occlusion = 1.0 - (1.0 - DIFFUSE_SKY_FRACTION) * t; // ∈ [DIFFUSE, 1]
         let cover = eff_cloud.clamp(0.0, 1.0); // cloud_water normalized to 1 mm PW
         let transm = 1.0 - (cover * cloud_albedo_coef).min(0.95);
-        let ff = cos_inc * occlusion * transm;
+        let ff = tilted_flux_factor(beam.s_u, n_u, cos_inc, t) * transm;
         flux_factor[i] = ff;
         illumination[i] = (ff / beam.s_u).clamp(0.0, 1.0);
     }
@@ -398,14 +417,11 @@ pub fn compute_illumination_cached(
         let (ne, nn) = (cells[i].normal_east, cells[i].normal_north);
         let n_u = (1.0 - ne * ne - nn * nn).max(0.0).sqrt();
         let cos_inc = (beam.s_e * ne + beam.s_n * nn + beam.s_u * n_u).max(0.0);
-        if cos_inc <= 0.0 {
-            flux_factor[i] = 0.0;
-            illumination[i] = 0.0; // slope facing away from the sun: no direct
-            continue;
-        }
         let mut t = 0.0_f32; // normalized occlusion = (over / ILLUM_FULL_M).min(1)
         let mut eff_cloud = cells[i].cloud_water; // default: local (zenith) cloud
-        if let Some((sun_dir, ray_slope)) = march {
+        // Same gate as the reference march: a slope facing away from
+        // the sun has no direct beam to occlude, only the diffuse sky.
+        if let Some((sun_dir, ray_slope)) = march.filter(|_| cos_inc > 0.0) {
             // Cloud shadow: cell at the layer crossing, via 2^j jumps.
             if kstar > 0 {
                 let mut idx = i;
@@ -445,19 +461,194 @@ pub fn compute_illumination_cached(
                 t = (over / ILLUM_FULL_M).min(1.0);
             }
         }
-        let occlusion = 1.0 - (1.0 - DIFFUSE_SKY_FRACTION) * t; // ∈ [DIFFUSE, 1]
         let cover = eff_cloud.clamp(0.0, 1.0); // cloud_water normalized to 1 mm PW
         let transm = 1.0 - (cover * cloud_albedo_coef).min(0.95);
-        let ff = cos_inc * occlusion * transm;
+        let ff = tilted_flux_factor(beam.s_u, n_u, cos_inc, t) * transm;
         flux_factor[i] = ff;
         illumination[i] = (ff / beam.s_u).clamp(0.0, 1.0);
     }
+}
+
+/// Day-of-year sampling stride for
+/// [`terrain_annual_mean_insolation_factor`]: every 7th day, 24h each
+/// (~53 days × 24h instead of the full 365 × 24h annual sweep, ~7x
+/// cheaper: ~0.03 s instead of ~0.2 s at r30 release). The annual
+/// insolation cycle is a smooth trig curve (`daily_insolation_factor`),
+/// so weekly sampling barely moves the mean (checked against the full
+/// sweep by the unit test below). Mirrors the sweep in
+/// `tests/diag_illumination_budget.rs`.
+const TERRAIN_INSOLATION_SAMPLE_STRIDE_DAYS: u16 = 7;
+
+/// Annual mean ratio `flux_factor / s_u` (dimensionless) the REAL
+/// terrain lets through, against the flat horizontal beam `s_u`: the
+/// full illumination pass ([`compute_illumination_cached`], relief
+/// occlusion + diffuse sky, clouds ignored via `cloud_albedo_coef =
+/// 0.0`) rather than [`super::aspect_insolation_correction`]'s pure-tilt
+/// approximation (no shadow march, no diffuse-sky mixing). This is the
+/// number [`TemperatureParams::terrain_insolation_factor`] carries into
+/// `calibration_offset` so `base_temp` is reached on the actual relief
+/// instead of an assumed flat one (JOURNAL 2026-09-02/03).
+///
+/// A flat, unoccluded world returns EXACTLY 1.0: there,
+/// `tilted_flux_factor` reduces to `s_u` bit-for-bit (`n_u = 1`,
+/// `cos_inc = s_u`, `t = 0`), so `flux_factor == s_u` for every cell and
+/// every daylight hour.
+///
+/// Sampled every `TERRAIN_INSOLATION_SAMPLE_STRIDE_DAYS` days (see its
+/// doc for the cost/accuracy tradeoff). `cache` must already be
+/// [`IllumCache::ensure`]d against `grid` (same contract as
+/// [`compute_illumination_cached`]).
+///
+/// # Panics
+/// Same as [`compute_illumination_cached`]: a stale `cache` (missing
+/// `ensure()` after a relief change) panics rather than silently
+/// mismeasuring the terrain.
+#[must_use]
+pub fn terrain_annual_mean_insolation_factor(
+    grid: &HexGrid,
+    cache: &IllumCache,
+    params: &TemperatureParams,
+) -> f32 {
+    let n = grid.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let cells_per_hour = f64::from(u32::try_from(n).expect("grid size fits u32"));
+    let mut flux_factor = Vec::with_capacity(n);
+    let mut illumination = Vec::with_capacity(n);
+    let mut flux_sum = 0.0_f64;
+    let mut beam_sum = 0.0_f64;
+    let mut day = 0_u16;
+    while day < 365 {
+        for hour in 0..24_u64 {
+            let hour_tick = u64::from(day) * 24 + hour;
+            let beam = solar_beam_at_tick(params, hour_tick);
+            if beam.s_u <= 0.0 {
+                continue; // night: flux = 0 everywhere, ratio unaffected
+            }
+            // Clouds ignored (`cloud_albedo_coef = 0.0`): this is a
+            // terrain property (relief + sky geometry), not a weather
+            // one, and mirrors `diag_illumination_budget.rs`.
+            compute_illumination_cached(
+                grid,
+                &beam,
+                0.0,
+                1500.0, // cloud altitude: irrelevant at cloud_albedo_coef = 0
+                cache,
+                &mut flux_factor,
+                &mut illumination,
+            );
+            let cell_flux: f64 = flux_factor.iter().map(|&f| f64::from(f)).sum();
+            flux_sum += cell_flux;
+            beam_sum += f64::from(beam.s_u) * cells_per_hour;
+        }
+        day += TERRAIN_INSOLATION_SAMPLE_STRIDE_DAYS;
+    }
+    if beam_sum <= 0.0 {
+        return 1.0; // polar night at every sampled hour: degenerate, keep flat behavior
+    }
+    let ratio = flux_sum / beam_sum;
+    // Ratio of two positive sums of physically bounded terms
+    // (flux_factor ≤ beam, both in [0, ~1.25]): `ratio` itself sits in
+    // that same narrow band, nowhere near f32's ~7-digit precision
+    // limit. The narrowing is the field's own SI unit (dimensionless
+    // factor stored as f32 across the codebase, see
+    // `TemperatureParams::terrain_insolation_factor`), not a precision
+    // bug.
+    #[expect(clippy::cast_possible_truncation)]
+    let ratio_f32 = ratio as f32;
+    ratio_f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coord::HexCoord;
+    use crate::temperature::compute_surface_normals;
+
+    /// A slope turned away from the sun (or a cell in a relief shadow)
+    /// still receives the diffuse sky: the flux factor never drops to
+    /// zero in daylight, and a flat unoccluded cell keeps the exact
+    /// horizontal beam (JOURNAL 2026-09-02, lapse-rate collapse at
+    /// 130 m spacing).
+    #[test]
+    fn tilted_flux_keeps_the_diffuse_sky() {
+        let s_u = 0.5_f32; // sun at 30° elevation
+        // Flat, unoccluded: exactly the horizontal beam, bit-identical.
+        assert_eq!(
+            tilted_flux_factor(s_u, 1.0, s_u, 0.0).to_bits(),
+            s_u.to_bits()
+        );
+        // Flat, fully occluded: the diffuse fraction survives.
+        let flat_shaded = tilted_flux_factor(s_u, 1.0, s_u, 1.0);
+        assert!((flat_shaded - DIFFUSE_SKY_FRACTION * s_u).abs() < 1e-6);
+        // 30° slope facing away from the sun (`cos_inc = 0`): diffuse
+        // only, weighted by its sky-view factor, strictly positive.
+        let n_u = 30.0_f32.to_radians().cos();
+        let away = tilted_flux_factor(s_u, n_u, 0.0, 0.0);
+        let expected = DIFFUSE_SKY_FRACTION * s_u * 0.5 * (1.0 + n_u);
+        assert!(
+            away > 0.0 && (away - expected).abs() < 1e-6,
+            "{away} vs {expected}"
+        );
+        // The same slope facing the sun receives more than flat, and
+        // more than when turned away.
+        let toward = tilted_flux_factor(s_u, n_u, 0.9, 0.0);
+        assert!(toward > s_u && toward > away);
+        // Occlusion removes the direct beam only: the shaded slope
+        // converges to the diffuse floor, never below it.
+        let shaded = tilted_flux_factor(s_u, n_u, 0.9, 1.0);
+        assert!((shaded - expected).abs() < 1e-6, "{shaded} vs {expected}");
+    }
+
+    /// `terrain_annual_mean_insolation_factor` on a FLAT world: every
+    /// cell has a vertical normal and nothing occludes anything, so
+    /// `flux_factor == s_u` every daylight hour (bit-for-bit, see
+    /// `tilted_flux_keeps_the_diffuse_sky`) and the ratio must be
+    /// EXACTLY 1.0, not merely close. Pins the multiplicative identity
+    /// `calibration_offset` relies on: default params
+    /// (`terrain_insolation_factor = 1.0`) must reproduce the
+    /// historical flat-terrain offset bit-for-bit.
+    #[test]
+    fn flat_world_terrain_factor_is_exactly_one() {
+        let mut grid = HexGrid::from_radius(2);
+        compute_surface_normals(&mut grid); // all-flat -> vertical normals
+        let mut cache = IllumCache::new();
+        cache.ensure(&grid);
+        let params = TemperatureParams::default();
+        let factor = terrain_annual_mean_insolation_factor(&grid, &cache, &params);
+        assert_eq!(factor.to_bits(), 1.0_f32.to_bits(), "flat world: {factor}");
+    }
+
+    /// A built ridge (steep enough to self-shadow, mirrors
+    /// `tests/phys_aspect_insolation.rs`) must let LESS of the flat beam
+    /// through than a flat world: the factor is strictly below 1.0,
+    /// never above (`aspect_insolation_correction`'s pure-tilt term can
+    /// be positive OR negative, but occlusion + the diffuse-sky floor
+    /// only ever remove flux). This is the deficit
+    /// `terrain_insolation_factor` exists to carry into
+    /// `calibration_offset` (JOURNAL 2026-09-02/03).
+    #[test]
+    fn steep_ridge_terrain_factor_is_below_one() {
+        let radius = 3;
+        let mut grid = HexGrid::from_radius(radius);
+        for coord in grid.coords().copied().collect::<Vec<_>>() {
+            let r = f32::from(i16::try_from(coord.r.abs()).unwrap_or(0));
+            // Steep enough to self-shadow at CELL_SPACING_M (130 m):
+            // slope = 120/130 rad ≈ 43°, well above the ~29° map-mean
+            // measured at r30 (JOURNAL 2026-09-03).
+            grid.get_mut(coord).unwrap().elevation = 500.0 - 120.0 * r;
+        }
+        compute_surface_normals(&mut grid);
+        let mut cache = IllumCache::new();
+        cache.ensure(&grid);
+        let params = TemperatureParams::default();
+        let factor = terrain_annual_mean_insolation_factor(&grid, &cache, &params);
+        assert!(
+            factor < 1.0 && factor > 0.0,
+            "steep ridge must let through strictly less than the flat beam, got {factor}"
+        );
+    }
 
     #[test]
     fn illumination_relief_occludes_toward_sun() {

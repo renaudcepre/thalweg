@@ -42,7 +42,7 @@ fn write_layer(cell: &mut CellProperties, layer: HumidityLayer, value: f32) {
 /// `step_atmosphere_into` via `compute_upper_wind_field_into`), a
 /// precondition the caller must guarantee for `Upper`. Additional shared
 /// precondition: `scratch.sat_upper_offset` must have been filled by
-/// `AtmoScratch::fill_sat_upper_offset` before the call (LCL bound of the lift).
+/// `AtmoScratch::fill_upper_air` before the call (LCL bound of the lift).
 pub(crate) fn advect_humidity_layer_into(
     current: &HexGrid,
     next: &mut HexGrid,
@@ -138,7 +138,7 @@ pub(crate) fn advect_humidity_layer_into(
                     let to_upper_brut = flux * lift;
                     // LCL bound: lift capped by the saturation deficit at the
                     // destination. The surplus goes back to humidity_surface dest.
-                    // `sat_upper_offset[j]` = `saturation_upper(T_j - t_offset)`
+                    // `sat_upper_offset[j]` = `saturation_upper(T_upper_j)` (homogeneous upper air)
                     // precomputed (#97) on the same `current` temperature, so
                     // bit-identical to the inline call it replaces.
                     let sat_j = sat_upper_offset[j];
@@ -334,7 +334,7 @@ mod tests {
     use crate::atmosphere::test_support::{
         assert_lcl_slack, default_temp_params, default_wind_params, oro_pump_world,
     };
-    use crate::atmosphere::total_humidity;
+    use crate::atmosphere::{surface_means, total_humidity};
     use crate::coord::HexCoord;
     use crate::wind::WindVec;
 
@@ -363,7 +363,7 @@ mod tests {
             ];
             let mut next = grid.clone();
             let mut scratch = AtmoScratch::new(grid.len());
-            scratch.fill_sat_upper_offset(grid, &params, &temp_params);
+            scratch.fill_upper_air(grid, surface_means(grid).0, &params, &temp_params);
             advect_humidity_layer_into(
                 grid,
                 &mut next,

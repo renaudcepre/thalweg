@@ -2,7 +2,7 @@ use crate::grid::HexGrid;
 use crate::temperature::TemperatureParams;
 use crate::wind::{WindField, WindVec};
 
-use super::{AtmosphereParams, EvapStats, saturation_upper};
+use super::{AtmosphereParams, EvapStats, saturation_upper, surface_means, upper_air_temperature};
 
 /// Scratch buffers for `step_atmosphere_into`, owned by the caller
 /// (`Simulation`) and reused every tick: zero malloc in the hot path
@@ -18,7 +18,7 @@ pub struct AtmoScratch {
     pub deltas: Vec<f32>,
     pub temp_deltas: Vec<f32>,
     pub wind_upper: WindField,
-    /// Precomputed `saturation_upper(T_current - t_offset)` per cell
+    /// Precomputed `saturation_upper(T_upper)` per cell
     /// (#97). `T_current` = pre-advection temperature, shared
     /// identically by orographic convection and the Surface advection
     /// lift (both gather the same `sat_upper(T_neighbor)`). Memoizing
@@ -27,6 +27,10 @@ pub struct AtmoScratch {
     /// iterations prevent LLVM's CSE, unlike intra-cell redundancy
     /// (cf. the powf lesson, JOURNAL 05-07).
     pub sat_upper_offset: Vec<f32>,
+    /// Upper-air temperature per cell (`upper_air_temperature`), filled
+    /// with `sat_upper_offset` by `fill_upper_air`; consumed by the
+    /// vapor ↔ droplet transition.
+    pub t_upper: Vec<f32>,
     // Surface advection with orographic lift.
     pub lift_deltas_upper: Vec<f32>,
     pub lift_upper_snap: Vec<f32>,
@@ -61,6 +65,7 @@ impl AtmoScratch {
             temp_deltas: Vec::with_capacity(n),
             wind_upper: vec![WindVec::default(); n],
             sat_upper_offset: Vec::with_capacity(n),
+            t_upper: Vec::with_capacity(n),
             lift_deltas_upper: Vec::with_capacity(n),
             lift_upper_snap: Vec::with_capacity(n),
             oro_src_surface: Vec::with_capacity(n),
@@ -77,7 +82,7 @@ impl AtmoScratch {
         }
     }
 
-    /// Precomputes `saturation_upper(T_current - t_offset)` per cell
+    /// Precomputes the upper-air temperature and `saturation_upper` per cell
     /// (#97). Single source of truth consumed by orographic convection
     /// and the Surface advection lift (LCL bound): both passes gather
     /// the same `sat_upper(T_neighbor)` on the pre-advection
@@ -86,19 +91,30 @@ impl AtmoScratch {
     /// cell referencing it). Called at the top of
     /// `step_atmosphere_into`; direct callers of orographic convection
     /// (unit tests) must invoke it first.
-    pub(crate) fn fill_sat_upper_offset(
+    ///
+    /// Since 2026-09-02 the upper-air temperature is horizontally
+    /// homogeneous (`upper_air_temperature`: map-mean surface T and
+    /// standard lapse from the map-mean ground), so both buffers only
+    /// depend on each cell's elevation, on the map-mean elevation and on
+    /// `upper_air_mean_t`, the diurnally smoothed map-mean surface
+    /// temperature owned by the simulation (`AtmoForcing::upper_air_mean_t`,
+    /// see `UPPER_AIR_SMOOTHING_TAU_S`): the free atmosphere does not
+    /// follow the day/night swing of the surface. The mean elevation is
+    /// read from the grid each call (constant until erosion moves it).
+    pub(crate) fn fill_upper_air(
         &mut self,
         current: &HexGrid,
+        upper_air_mean_t: f32,
         params: &AtmosphereParams,
         temp_params: &TemperatureParams,
     ) {
-        let t_offset = temp_params.lapse_rate * params.upper_layer_altitude_m / 1000.0;
+        let (_, mean_z) = surface_means(current);
+        self.t_upper.clear();
+        self.t_upper.extend(current.cells_slice().iter().map(|c| {
+            upper_air_temperature(upper_air_mean_t, mean_z, c.elevation, params, temp_params)
+        }));
         self.sat_upper_offset.clear();
-        self.sat_upper_offset.extend(
-            current
-                .cells_slice()
-                .iter()
-                .map(|c| saturation_upper(c.temperature - t_offset, params)),
-        );
+        self.sat_upper_offset
+            .extend(self.t_upper.iter().map(|&t| saturation_upper(t, params)));
     }
 }

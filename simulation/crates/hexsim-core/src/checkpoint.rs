@@ -161,6 +161,16 @@ pub(crate) struct Checkpoint {
     pub(crate) climate_history: ClimateHistory,
     pub(crate) last_precipitation: Vec<DayRecord>,
     pub(crate) precip_gate_open: bool,
+    /// Diurnally smoothed map-mean surface temperature anchoring the
+    /// upper layer (`Simulation::upper_air_mean_t`, EMA τ = 24 h). Real
+    /// state, not derivable from the grid: without it a restart would
+    /// see the upper air jump by the diurnal anomaly and drift for ~3τ
+    /// (JOURNAL 2026-07-07: the state is NOT just the grid).
+    /// `serde(default)` → `None` on a checkpoint predating it; `load_state`
+    /// then restarts on the loaded grid's instantaneous mean, exactly
+    /// like `Simulation::new`.
+    #[serde(default)]
+    pub(crate) upper_air_mean_t: Option<f32>,
     pub(crate) climate_normals: ClimateNormalsAccumulator,
 
     pub(crate) hydro_params: HydroParams,
@@ -260,10 +270,11 @@ mod tests {
 
     /// Reproduces an "old" checkpoint (pre-#105/#106): a ghost struct that
     /// carries EXACTLY the mandatory fields of [`Checkpoint`], same names,
-    /// since `to_vec_named` maps by field name, omitting the 7
+    /// since `to_vec_named` maps by field name, omitting the 8
     /// `#[serde(default)]` fields added since (`edge_flux_map`,
     /// `discharge_ema`, `edge_flux_ema`, `erosion_incised_total`,
-    /// `erosion_deposited_total`, `erosion_params`, `lake_params`).
+    /// `erosion_deposited_total`, `erosion_params`, `lake_params`,
+    /// `upper_air_mean_t`).
     /// Encoding this faithfully simulates a file produced by an engine
     /// predating those PRs: the missing keys don't appear at all in the
     /// `MessagePack` map, exactly like a real old file.
@@ -379,7 +390,7 @@ mod tests {
 
     /// The gap left by `checkpoint_restart_is_bit_identical` (which only
     /// round-trips a COMPLETE checkpoint): a pre-#105/#106 checkpoint,
-    /// where the 7 `serde(default)` fields are absent from the
+    /// where the 8 `serde(default)` fields are absent from the
     /// `MessagePack` keys, must stay loadable and the defaults must
     /// actually apply, not just coincide with values already at default
     /// in the original.
@@ -387,7 +398,7 @@ mod tests {
     /// To prove this unambiguously, we force the affected fields to
     /// non-default values BEFORE saving (`erosion.enabled=1`,
     /// `lake.min_surplus_mm` marker), let it run long enough for the
-    /// derived counters/EMA to become non-zero, then strip those 7 keys
+    /// derived counters/EMA to become non-zero, then strip those 8 keys
     /// from the blob before loading. If `load_state` mistakenly restored
     /// the original's values (or panicked), the test would catch it.
     #[test]
@@ -409,7 +420,7 @@ mod tests {
 
         let n = sim.grid().len();
 
-        // Sanity check: the 7 quantities we're about to omit are indeed
+        // Sanity check: the 8 quantities we're about to omit are indeed
         // non-trivial in the original, otherwise the test would prove
         // nothing.
         let (incised, deposited) = sim.erosion_totals();
@@ -425,6 +436,15 @@ mod tests {
         assert!(
             (sim.lake_params().min_surplus_mm - 12345.0).abs() < f32::EPSILON,
             "precondition: the non-default marker must be set on the original"
+        );
+        // After 5 days the smoothed upper-air anchor (EMA τ = 24 h) lags
+        // the instantaneous mean by a good part of the diurnal swing at
+        // midnight: omitting it must be observable.
+        let instantaneous_mean_t = crate::atmosphere::surface_means(sim.grid()).0;
+        assert!(
+            (sim.upper_air_mean_t() - instantaneous_mean_t).abs() > 1e-3,
+            "precondition: the smoothed upper-air anchor must differ from the \
+             instantaneous mean, otherwise omitting it is unobservable"
         );
 
         let bytes = sim.save_state().expect("save_state must not fail");
@@ -452,6 +472,16 @@ mod tests {
             (restored.lake_params().min_surplus_mm - LakeParams::default().min_surplus_mm).abs()
                 < f32::EPSILON,
             "lake_params absent → default (50 mm), not the marker (12345) from the original"
+        );
+        // Upper-air anchor absent → restarted on the loaded grid's
+        // instantaneous mean (the `Simulation::new` rule), not the
+        // original's EMA.
+        let restored_mean_t = crate::atmosphere::surface_means(restored.grid()).0;
+        assert!(
+            (restored.upper_air_mean_t() - restored_mean_t).abs() < f32::EPSILON,
+            "upper_air_mean_t absent → instantaneous mean of the loaded grid \
+             ({restored_mean_t}), got {}",
+            restored.upper_air_mean_t()
         );
         let (restored_incised, restored_deposited) = restored.erosion_totals();
         assert!(

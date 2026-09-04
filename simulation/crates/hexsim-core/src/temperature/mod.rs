@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::snow::{AIR_DENSITY_KG_PER_M3, AIR_SPECIFIC_HEAT_J_PER_KG_K};
+
 mod balance;
 mod illumination;
 mod solar;
@@ -32,6 +34,7 @@ pub use balance::{
 };
 pub use illumination::{
     DIFFUSE_SKY_FRACTION, IllumCache, compute_illumination, compute_illumination_cached,
+    terrain_annual_mean_insolation_factor,
 };
 // Crate-internal only: consumed by `ablation::Ablation::defaults` to build
 // the compiled-in default without duplicating the constant.
@@ -129,6 +132,42 @@ pub const ATMO_IR_BACK_CLEAR: f32 = 280.0;
 /// the Environment 25, 441-475.
 pub const ATMO_IR_BACK_CLOUDY_BOOST: f32 = 60.0;
 
+/// Bulk transfer coefficient for sensible heat `C_H` (dimensionless,
+/// ratio of the turbulent heat flux to `ρ·c_p·U·ΔT`). 2e-3 = moderately
+/// rough vegetated land in near-neutral stratification (Garratt J.
+/// 1992, *The Atmospheric Boundary Layer*, table 4.1: 1-3e-3; Stull R.
+/// 1988, *An Introduction to Boundary Layer Meteorology*, §7.4). Same
+/// value as the snowpack melt balance (`SnowParams::sensible_exchange_coef`),
+/// the two exchanges are the same physics on the same air.
+pub const BULK_HEAT_TRANSFER_COEF: f32 = 2.0e-3;
+
+/// Reference 10 m wind speed (m/s) driving the turbulent exchange:
+/// climatological mean over inland temperate terrain (Drôme stations,
+/// 2-3 m/s). A single map-wide value keeps the exchange energy-neutral
+/// (see `SENSIBLE_EXCHANGE_COEF`); a per-cell wind is a later refinement.
+pub const MIXING_WIND_REF_MS: f32 = 2.5;
+
+/// Sensible heat exchange coefficient between the surface and the
+/// mixed boundary-layer air (W/(m²·K)): `H = ρ·c_p·C_H·U ≈ 6`. This is
+/// the bulk aerodynamic formula `Q_H = ρ·c_p·C_H·U·(T_s − T_air)`
+/// (Garratt 1992 §4.3), the term the balance lacked: without it every
+/// local radiative anomaly (aspect, relief shadow, cloud) maps into
+/// surface temperature through the radiative damping alone
+/// (`LIN_RADIATIVE_COEF` ≈ 5.4 W/(m²·K)), so a 40° south face at
+/// 1000 m sat 8-11 °C above its band and a shaded winter plain 5 °C
+/// below it (JOURNAL 2026-09-02, bisected to the 130 m spacing d6be105,
+/// relief 8x steeper than at calibration). The exchange partner is the
+/// horizontally mixed air of the terrarium at the cell's elevation,
+/// `T̄ + Γ·(z̄ − z)/1000`: the same mixing that the atmosphere assumes
+/// for its upper layer (`atmosphere::upper_air_temperature`). Summed
+/// over the map the exchange is exactly zero (`Σ(T_i − T_air(z_i)) =
+/// 0`), a pure redistribution: the calibration of `base_temp` through
+/// `calibration_offset` is untouched.
+pub const SENSIBLE_EXCHANGE_COEF: f32 = AIR_DENSITY_KG_PER_M3
+    * AIR_SPECIFIC_HEAT_J_PER_KG_K
+    * BULK_HEAT_TRANSFER_COEF
+    * MIXING_WIND_REF_MS;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TemperatureParams {
     /// Target mean annual temperature (°C) on dry flat ground (no
@@ -195,6 +234,29 @@ pub struct TemperatureParams {
     /// Flat world (or default params) ⇒ 0.0 ⇒ offset bit-identical to
     /// the historical behavior.
     pub aspect_correction: f32,
+    /// Annual mean ratio of the REAL terrain's illumination to the flat
+    /// horizontal beam (relief occlusion + diffuse sky, clouds
+    /// ignored), dimensionless in `(0, ~1]`. **Value derived from
+    /// terrain**, not a user setting: computed once by
+    /// [`terrain_annual_mean_insolation_factor`] in `Simulation::new`
+    /// (and again wherever erosion invalidates the [`IllumCache`], since
+    /// the relief changed) and injected here so `calibration_offset`
+    /// targets `base_temp` on the terrain the map actually has, not on
+    /// an assumed flat one. At `CELL_SPACING_M = 130`, mean slope ≈29°
+    /// (r30 seed 42), only ≈0.856 of the flat beam gets through
+    /// (`tests/diag_illumination_budget.rs`), so a flat-world
+    /// calibration ran the whole map ≈4 K below `base_temp` (JOURNAL
+    /// 2026-09-02/03). Flat world (or default params) ⇒ 1.0 ⇒ offset
+    /// bit-identical to the historical flat-terrain behavior.
+    #[serde(default = "default_terrain_insolation_factor")]
+    pub terrain_insolation_factor: f32,
+}
+
+/// `serde(default)` value for [`TemperatureParams::terrain_insolation_factor`]:
+/// 1.0 = flat terrain, so a checkpoint or params file predating this
+/// field restores the historical flat-calibration behavior exactly.
+fn default_terrain_insolation_factor() -> f32 {
+    1.0
 }
 
 impl Default for TemperatureParams {
@@ -212,6 +274,7 @@ impl Default for TemperatureParams {
             thermal_coupling: 1.0,
             mean_cloud_cover_for_calibration: 0.5,
             aspect_correction: 0.0,
+            terrain_insolation_factor: default_terrain_insolation_factor(),
         }
     }
 }

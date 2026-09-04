@@ -24,8 +24,10 @@ pub struct AtmosphereParams {
     pub uplift_rate: f32,
     /// Uplift boost per °C of surface temperature above 0°C.
     pub uplift_thermal_coef: f32,
-    /// Reference altitude (m) to compute `T_upper` via the lapse rate:
-    /// `T_upper = T_surface - lapse * h/1000`. 1500 m = mid-low clouds.
+    /// Height (m) of the upper layer above the ground, used to compute
+    /// `T_upper` via the lapse rate from the map-mean surface temperature
+    /// (`upper_air_temperature`: `T̄ − lapse·(z − z̄ + h)/1000`). 1500 m =
+    /// mid-low clouds.
     pub upper_layer_altitude_m: f32,
     /// Global precipitation gate with hysteresis: if the average of
     /// `humidity_upper` is below this threshold, NO cell precipitates

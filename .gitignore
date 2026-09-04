@@ -40,3 +40,6 @@ dist/
 
 # Local clone of the public `thalweg` mirror, rebuilt by scripts/publish.sh.
 .publish/
+
+# Python bytecode
+__pycache__/

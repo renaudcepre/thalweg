@@ -14,8 +14,8 @@ jq_compact := "walk(if type == \"object\" then del(.top, .bottom) else . end)"
 # by `just reds`, which alarms if one heals. Measured on 2026-08-28:
 # these 4 binaries contain ONLY these 5 tests, so filtering by binary
 # hides no green test. Delist here once the physics fix lands.
-known_reds := "binary(phys_wet_peak_snows) | binary(physics_lake_concentration) | binary(scale_seasonal_climatology) | binary(scale_universal_invariants)"
-known_reds_count := "5"
+known_reds := "binary(phys_wet_peak_snows) | binary(physics_lake_concentration) | test(summer_temperature_targets_plain_and_mountain) | binary(scale_universal_invariants)"
+known_reds_count := "4"
 
 # ── Dev ──────────────────────────────────────────────
 
@@ -43,8 +43,10 @@ alias test-fast := test
 # before merging a physics change; target a single heavy one with:
 #   cargo nextest run --profile heavy -E 'test(dry_periods)'
 #
-# The 5 tracked reds (`known_reds`) are excluded from it: they're measured by
-# `just reds`, which checks that they ALWAYS fail all 5. See
+# The 4 tracked reds (`known_reds`) are excluded from it: they're measured by
+# `just reds`, which checks that they ALWAYS fail all 4 (the winter half of
+# `scale_seasonal_climatology` is green since 2026-09-03, the summer half
+# stays tracked by test name). See
 # scripts/known-reds.sh for why exclusion alone isn't enough.
 test-all:
     cargo nextest run --profile heavy --no-fail-fast -E "not ({{known_reds}})"
@@ -252,16 +254,18 @@ reset seed="":
 front-setup:
     cd ../frontend && npm install
 
-# Installs the WASM tooling, one-shot after a fresh clone (#138)
+# binaryen release fetched without brew (Linux). Mirrors BINARYEN_VERSION in
+# .github/workflows/dist.yml: bump both together.
+binaryen_version := "132"
+
+# Installs the WASM tooling, one-shot after a fresh clone (#138): wasm32
+# target, wasm-pack, wasm-opt. brew where it exists, `cargo install` and the
+# pinned binaryen release otherwise; see the script for the NixOS case.
+# wasm-pack's own binaryen download is disabled (`wasm-opt = false` in the
+# crate's Cargo.toml): it hits GitHub Releases at every build and fails
+# behind a restricted network, `just wasm` applies the system wasm-opt.
 wasm-setup:
-    #!/usr/bin/env bash
-    set -e
-    rustup target add wasm32-unknown-unknown
-    # binaryen comes from brew, not wasm-pack's automatic download: the latter
-    # hits GitHub Releases and fails behind a restricted network.
-    # Hence `wasm-opt = false` in the crate's Cargo.toml.
-    command -v wasm-pack >/dev/null || brew install wasm-pack
-    command -v wasm-opt  >/dev/null || brew install binaryen
+    ../scripts/wasm-setup.sh {{binaryen_version}}
 
 # Builds the WASM module into frontend/wasm/ (artifact, gitignored)
 wasm:

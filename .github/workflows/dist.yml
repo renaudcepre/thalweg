@@ -23,7 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Aligned with the dev machine (`wasm-opt --version`). See the wasm-opt
-      # step below for what a too-old version causes.
+      # step below for what a too-old version causes. Mirrors
+      # `binaryen_version` in the justfile (`just wasm-setup` fetches the
+      # same tarball on a Linux dev machine): bump both together.
       BINARYEN_VERSION: "132"
     steps:
       - uses: actions/checkout@v4

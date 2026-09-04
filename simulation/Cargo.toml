@@ -3,12 +3,17 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# Disabled: this lint rewrites an explicit ramp into `f32::midpoint(a, b)`,
+# which reads as a physical relation that keeps rising past its plateau and
+# is then silently truncated by a clamp (#49). Readable equations win over
+# the shorter call.
+manual_midpoint = { level = "allow", priority = 1 }
 
 # Aggressive release profile for the sim, issue #41.
 # The hot path is CPU-bound, deterministic, and benchmarked in a loop; we

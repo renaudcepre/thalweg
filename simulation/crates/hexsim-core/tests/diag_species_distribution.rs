@@ -37,7 +37,17 @@ use hexsim_core::vegetation::{cell_total_vegetation, dominant_species, is_open_w
 use hexsim_core::wind::WindParams;
 
 const RADIUS: i32 = 30;
-const SEED: u32 = 42;
+const DEFAULT_SEED: u32 = 42;
+
+/// Seed of the run, overridable so the #151 guard metric (bare fraction
+/// per band on 3 seeds) does not need an edit between runs:
+/// `HEXSIM_DIAG_SEED=7 cargo test --release ... -- --ignored --nocapture`.
+fn seed() -> u32 {
+    std::env::var("HEXSIM_DIAG_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SEED)
+}
 const WARMUP_DAYS: u64 = 365;
 const RUN_YEARS: u64 = 10;
 
@@ -100,7 +110,7 @@ fn build_sim() -> Simulation {
     generate_terrain(
         &mut grid,
         &TerrainParams {
-            seed: SEED,
+            seed: seed(),
             ..TerrainParams::default()
         },
     );
@@ -112,7 +122,7 @@ fn build_sim() -> Simulation {
         SnowParams::default(),
         TemperatureParams::default(),
         WindParams {
-            seed: SEED,
+            seed: seed(),
             ..WindParams::default()
         },
     )
@@ -151,7 +161,7 @@ fn diag_species_distribution() {
     let mut sim = build_sim();
     let labels = cat_labels();
 
-    println!("== Emergent species (seed {SEED}, radius {RADIUS}) ==");
+    println!("== Emergent species (seed {}, radius {RADIUS}) ==", seed());
     println!("warmup {WARMUP_DAYS}d then {RUN_YEARS} years measured\n");
 
     for _ in 0..WARMUP_DAYS {

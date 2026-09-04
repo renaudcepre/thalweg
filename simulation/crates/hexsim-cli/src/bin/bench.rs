@@ -85,7 +85,7 @@ fn main() -> Result<()> {
         sim.step();
     }
 
-    let mut acc = MetricsAccumulator::start(&sim, &effective, cli.measure_ticks);
+    let mut acc = MetricsAccumulator::start(&sim, cli.measure_ticks);
     let t0 = Instant::now();
     for _ in 0..cli.measure_ticks {
         sim.step();

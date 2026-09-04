@@ -12,7 +12,11 @@
 //!
 //! Winter (January):
 //! - plains (<200m): January `T_mean` in [-10, 5] C
-//! - altitude (>=1000m): January `T_max` < 0 C (never a thaw)
+//! - altitude (>=1000m): January `T_mean` of the band < 0 C. Until
+//!   2026-09-03 this was "no cell above 1000 m ever exceeds 0 C", which
+//!   the owner ruled out as physically wrong: a sunny south-facing slope
+//!   at 1100 m thaws on a fine January afternoon in the Drôme, the band
+//!   as a whole stays below freezing on the monthly mean.
 //!
 //! If a test fails after a change, two possibilities:
 //! 1. The change unintentionally breaks the energy budget -> bug, to fix.
@@ -156,6 +160,7 @@ fn winter_temperature_targets_plain_and_mountain() {
     assert!(t_count > 0, "empty winter window");
 
     let mut plain_mean: Vec<f32> = Vec::new();
+    let mut high_mean: Vec<f32> = Vec::new();
     let mut high_max: Vec<f32> = Vec::new();
     for (coord, &sum) in &t_sum_per_cell {
         let Some(cell) = sim.grid().get(*coord) else {
@@ -165,6 +170,7 @@ fn winter_temperature_targets_plain_and_mountain() {
         if cell.elevation < PLAIN_MAX_ELEV {
             plain_mean.push(mean_t);
         } else if cell.elevation >= HIGH_MIN {
+            high_mean.push(mean_t);
             let tmax = *t_max_per_cell.get(coord).unwrap();
             high_max.push(tmax);
         }
@@ -180,6 +186,7 @@ fn winter_temperature_targets_plain_and_mountain() {
         v.iter().copied().sum::<f32>() / f32::from(u16::try_from(v.len()).expect("fits u16"))
     };
     let plain_winter_mean = mean(&plain_mean);
+    let high_winter_mean = mean(&high_mean);
     let high_winter_max_mean = mean(&high_max);
     let high_winter_max_peak = high_max.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
@@ -194,9 +201,11 @@ fn winter_temperature_targets_plain_and_mountain() {
         plain_winter_mean
     );
     eprintln!(
-        "  Altitude (>={:.0}m, n={}) T_max mean = {:.1} C, individual peak = {:.1} C (target < 0 for all cells)",
+        "  Altitude (>={:.0}m, n={}) T_mean = {:.1} C (target < 0), T_max mean = {:.1} C, \
+         individual peak = {:.1} C (informative: a sunny adret thaws)",
         HIGH_MIN,
-        high_max.len(),
+        high_mean.len(),
+        high_winter_mean,
         high_winter_max_mean,
         high_winter_max_peak
     );
@@ -206,7 +215,7 @@ fn winter_temperature_targets_plain_and_mountain() {
         "plains out of target in winter: T_mean {plain_winter_mean:.1} C outside [-10, 5] C"
     );
     assert!(
-        high_winter_max_peak < 0.0,
-        "altitude >={HIGH_MIN}m: at least one cell exceeds 0 C in January (peak {high_winter_max_peak:.1} C)"
+        high_winter_mean < 0.0,
+        "altitude >={HIGH_MIN}m: January band mean {high_winter_mean:.1} C is not below freezing"
     );
 }

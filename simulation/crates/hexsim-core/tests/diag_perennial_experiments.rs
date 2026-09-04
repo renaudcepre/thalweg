@@ -208,6 +208,7 @@ fn aquifer_sweep_seed7() {
             infiltration_rate: 0.3,
             diffusion_rate: 0.003,
             baseflow_coef: 0.05,
+            ..GroundwaterParams::default()
         },
     );
     run(
@@ -219,6 +220,7 @@ fn aquifer_sweep_seed7() {
             infiltration_rate: 0.5,
             diffusion_rate: 0.003,
             baseflow_coef: 0.03,
+            ..GroundwaterParams::default()
         },
     );
     run(
@@ -230,6 +232,7 @@ fn aquifer_sweep_seed7() {
             infiltration_rate: 0.5,
             diffusion_rate: 0.0,
             baseflow_coef: 0.02,
+            ..GroundwaterParams::default()
         },
     );
 }

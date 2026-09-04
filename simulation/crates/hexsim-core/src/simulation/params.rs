@@ -30,6 +30,9 @@ impl Simulation {
             "groundwater.diffusion_rate" => self.groundwater_params.diffusion_rate = value,
             "groundwater.max_capacity" => self.groundwater_params.max_capacity = value,
             "groundwater.baseflow_coef" => self.groundwater_params.baseflow_coef = value,
+            "groundwater.field_capacity_frac" => {
+                self.groundwater_params.field_capacity_frac = value;
+            }
             // Snow
             "snow.snow_albedo_dry" => self.snow_params.snow_albedo_dry = value,
             "snow.snow_albedo_melt" => self.snow_params.snow_albedo_melt = value,

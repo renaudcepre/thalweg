@@ -3,7 +3,7 @@
 
 use super::Simulation;
 use crate::ablation::Ablation;
-use crate::atmosphere::AtmoScratch;
+use crate::atmosphere::{AtmoScratch, surface_means};
 use crate::checkpoint::{CHECKPOINT_FORMAT_VERSION, Checkpoint, CheckpointError, MAGIC};
 use crate::climate::DayRecord;
 use crate::phase_timing::PhaseTimings;
@@ -52,6 +52,7 @@ impl Simulation {
             climate_history: self.climate_history.clone(),
             last_precipitation: self.last_precipitation.clone(),
             precip_gate_open: self.precip_gate_open,
+            upper_air_mean_t: Some(self.upper_air_mean_t),
             climate_normals: self.climate_normals.clone(),
             hydro_params: self.hydro_params.clone(),
             atmosphere_params: self.atmosphere_params.clone(),
@@ -93,6 +94,13 @@ impl Simulation {
         edge_flux_ema.resize(n, [0.0; 6]);
         // `next` is a double-buffer: it must mirror `current` before each
         // phase (exact parity with `Simulation::new`, which does `grid.clone()`).
+        // Field absent from checkpoints predating the smoothed upper-air
+        // anchor (`serde(default)` → `None`): restart on the instantaneous
+        // mean of the loaded grid, exactly like `Simulation::new`; the EMA
+        // settles within ~3τ (3 days).
+        let upper_air_mean_t = ckpt
+            .upper_air_mean_t
+            .unwrap_or_else(|| surface_means(&current).0);
         let next = current.clone();
         // Mesh rebuilt at the PERSISTED radius (not the current env's): the
         // verbatim-restored synoptic state stays aligned with its torus.
@@ -140,6 +148,7 @@ impl Simulation {
             climate_history: ckpt.climate_history,
             last_precipitation: ckpt.last_precipitation,
             precip_gate_open: ckpt.precip_gate_open,
+            upper_air_mean_t,
             scratch_wind_snap: vec![WindVec::default(); n],
             scratch_atmo: AtmoScratch::new(n),
             scratch_flux: vec![0.0; n],

@@ -9,12 +9,13 @@
 //! [`super::illumination`] (the `flux_factor`) without depending on their
 //! implementation.
 
+use crate::atmosphere::surface_means;
 use crate::grid::HexGrid;
 use crate::snow::SnowParams;
 
 use super::{
     ATMO_IR_BACK_CLEAR, ATMO_IR_BACK_CLOUDY_BOOST, LIN_RADIATIVE_COEF, SECONDS_PER_HOUR,
-    SOLAR_CONSTANT, STEFAN_BOLTZMANN_AT_T0, TemperatureParams,
+    SENSIBLE_EXCHANGE_COEF, SOLAR_CONSTANT, STEFAN_BOLTZMANN_AT_T0, TemperatureParams,
     cached_annual_mean_insolation_factor, local_heat_capacity, solar_beam_at_tick,
 };
 
@@ -75,8 +76,19 @@ pub fn local_t_ref(
 /// non-radiative losses (latent ~−50 W/m², turbulent sensible
 /// ~−50 W/m²). Before #44 it was −12.85 °C; after #44 it is ~+2 °C,
 /// which is the sign of the greenhouse effect decoupling.
+///
+/// `mean_factor` composes the flat-world astronomical average
+/// (`cached_annual_mean_insolation_factor`) with two terrain
+/// corrections: `terrain_insolation_factor` (multiplicative, the real
+/// relief's occlusion + diffuse-sky deficit against the flat beam,
+/// [`super::terrain_annual_mean_insolation_factor`]) and `aspect_correction`
+/// (additive, the pure sunny/shaded-slope tilt). Both default to the
+/// flat-world identity (1.0 and 0.0), so `mean_factor` is bit-identical
+/// to the pre-terrain-calibration value on a flat map.
 fn calibration_offset(params: &TemperatureParams, lat_rad: f32) -> f32 {
-    let mean_factor = cached_annual_mean_insolation_factor(lat_rad) + params.aspect_correction;
+    let mean_factor = cached_annual_mean_insolation_factor(lat_rad)
+        * params.terrain_insolation_factor
+        + params.aspect_correction;
     let mean_solar_flux_annual = SOLAR_CONSTANT
         * params.atmospheric_transmittance
         * (1.0 - params.ground_albedo)
@@ -168,7 +180,14 @@ pub fn step_temperature(
 
     let offset = calibration_offset(params, lat_rad);
 
-    // Purely local radiative balance (no neighbor) → parallelizable per cell.
+    // Mixed boundary-layer air the surface exchanges sensible heat with:
+    // map-mean temperature, standard lapse from the map-mean ground
+    // (`SENSIBLE_EXCHANGE_COEF`). One pass over the grid per tick.
+    let (mean_t, mean_z) = surface_means(current);
+    let air_lapse_per_m = params.lapse_rate / 1000.0;
+
+    // Local radiative balance plus the exchange with the shared air
+    // (no neighbor lookup) → parallelizable per cell.
     // Index-based (cur[i] → next[i]): zero HashMap lookup, zero coord alloc.
     let cur = current.cells_slice();
     next.cells_slice_mut()
@@ -225,9 +244,16 @@ pub fn step_temperature(
             // latent + sensible heat). In fully consistent SI we'd have
             // `(T - T0_C)`; equivalent here since t_ref is calibrated
             // to give the right T_avg by construction.
+            // Turbulent sensible heat toward the mixed air at this
+            // elevation (bulk aerodynamic formula, `SENSIBLE_EXCHANGE_COEF`):
+            // damps the aspect/shadow/cloud anomalies of the surface
+            // toward the boundary layer, energy-neutral over the map.
+            let t_air = mean_t + air_lapse_per_m * (mean_z - cell.elevation);
+            let sensible = SENSIBLE_EXCHANGE_COEF * (cell.temperature - t_air);
             let net_radiative = solar_in + back_rad
                 - STEFAN_BOLTZMANN_AT_T0
-                - LIN_RADIATIVE_COEF * (cell.temperature - t_ref);
+                - LIN_RADIATIVE_COEF * (cell.temperature - t_ref)
+                - sensible;
 
             // Local surface heat capacity (J/(m²·K)). Fixed soil +
             // water proportional to depth. A 5 m lake: c_local =
@@ -368,9 +394,18 @@ mod tests {
         let n = f32::from(u16::try_from(measure).expect("365×24 fits u16"));
         let wet_mean = sum_wet / n;
         let dry_mean = sum_dry / n;
+        // The `t_ref` offset of a 5 m lake is `water_cooling × ln(6)` ≈
+        // 1.79 °C, and the sensible exchange with the mixed air damps
+        // every surface anomaly by `LIN / (LIN + H)` (≈ 0.47 with H ≈ 6
+        // W/(m²·K)): expected ≈ 0.85 °C, measured 0.85 on 2026-09-02.
+        // Half of it is the floor, the sign is the property.
+        let nominal = params.water_cooling * (1.0_f32 + 5000.0 / 1000.0).ln();
+        let expected = nominal * LIN_RADIATIVE_COEF / (LIN_RADIATIVE_COEF + SENSIBLE_EXCHANGE_COEF);
         assert!(
-            wet_mean < dry_mean - 1.0,
-            "annual mean lake must be < plain by at least 1°C: wet={wet_mean:.2} dry={dry_mean:.2}"
+            wet_mean < dry_mean - 0.5 * expected,
+            "annual mean lake must be < plain by at least {:.2}°C (half the damped \
+             water_cooling offset {expected:.2}): wet={wet_mean:.2} dry={dry_mean:.2}",
+            0.5 * expected
         );
     }
 

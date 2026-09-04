@@ -338,7 +338,7 @@ mod tests {
     use super::*;
     use crate::atmosphere::scaling::scale_atmosphere_for_hourly_tick;
     use crate::atmosphere::test_support::{assert_lcl_slack, default_temp_params, oro_pump_world};
-    use crate::atmosphere::total_humidity;
+    use crate::atmosphere::{surface_means, total_humidity, upper_air_temperature};
     use crate::coord::DIRECTIONS;
     use crate::coord::HexCoord;
     use crate::units::MetersPerSecond;
@@ -478,7 +478,6 @@ mod tests {
         let neighbors: Vec<HexCoord> = coords.iter().copied().filter(|&c| c != center).collect();
         let temp_params = default_temp_params();
         let params = AtmosphereParams::default();
-        let t_offset = temp_params.lapse_rate * params.upper_layer_altitude_m / 1000.0;
 
         // Low source, saturated with surface humidity
         if let Some(c) = current.get_mut(center) {
@@ -487,16 +486,23 @@ mod tests {
             c.humidity_upper = 0.0;
             c.temperature = 20.0;
         }
-        // High neighbors, already close to upper saturation
+        // High neighbors, already close to upper saturation. The upper
+        // air is homogeneous (map means + lapse), so its saturation over
+        // a 200 m neighbor is read from the same helper the engine uses.
         for &nc in &neighbors {
             if let Some(c) = current.get_mut(nc) {
                 c.elevation = 200.0;
                 c.temperature = 18.0; // slightly colder T
-                let t_upper = 18.0 - t_offset;
-                let sat = saturation_upper(t_upper, &params);
-                c.humidity_upper = sat * 0.99;
                 c.humidity_surface = 0.0;
             }
+        }
+        let (mean_t, mean_z) = surface_means(&current);
+        let sat_high = saturation_upper(
+            upper_air_temperature(mean_t, mean_z, 200.0, &params, &temp_params),
+            &params,
+        );
+        for &nc in &neighbors {
+            current.get_mut(nc).unwrap().humidity_upper = sat_high * 0.99;
         }
         let mut next = current.clone();
 
@@ -504,14 +510,13 @@ mod tests {
         // Orographic convection consumes the precomputed `sat_upper_offset`
         // (#97); on a direct call outside `step_atmosphere_into`, fill it
         // here.
-        scratch.fill_sat_upper_offset(&current, &params, &temp_params);
+        scratch.fill_upper_air(&current, mean_t, &params, &temp_params);
         step_orographic_convection(&current, &mut next, &params, &mut scratch);
 
         // LCL invariant: no high neighbor should be oversaturated.
         for &nc in &neighbors {
             let cell = next.get(nc).unwrap();
-            let t_upper = cell.temperature - t_offset;
-            let sat = saturation_upper(t_upper, &params);
+            let sat = sat_high;
             let hr = cell.humidity_upper / sat;
             assert!(
                 hr <= 1.05,
@@ -548,7 +553,7 @@ mod tests {
         let temp_params = default_temp_params();
         let mut next = current.clone();
         let mut scratch = AtmoScratch::new(current.len());
-        scratch.fill_sat_upper_offset(current, &params, &temp_params);
+        scratch.fill_upper_air(current, surface_means(current).0, &params, &temp_params);
         step_orographic_convection(current, &mut next, &params, &mut scratch);
         next
     }

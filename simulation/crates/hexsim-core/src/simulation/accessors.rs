@@ -258,6 +258,16 @@ impl Simulation {
         &self.atmosphere_params
     }
 
+    /// Diurnally smoothed map-mean surface temperature (°C) that anchors
+    /// the upper layer this tick (see the field doc). Source of truth for
+    /// metrics and diagnostics that need the engine's upper-air
+    /// temperature: read it here, never recompute it from the grid
+    /// (anti-pattern #2).
+    #[must_use]
+    pub fn upper_air_mean_t(&self) -> f32 {
+        self.upper_air_mean_t
+    }
+
     #[must_use]
     pub fn hydro_params(&self) -> &HydroParams {
         &self.hydro_params

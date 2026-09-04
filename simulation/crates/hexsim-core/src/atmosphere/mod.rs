@@ -30,7 +30,10 @@ use uplift::{step_orographic_convection, step_uplift};
 // Symbols imported elsewhere as `hexsim_core::atmosphere::X` (stable public
 // surface), re-exported here from their implementation sub-module.
 pub use advection::advect_cloud_water_into;
-pub use condensation::{saturation_surface, saturation_upper, saturation_upper_pw};
+pub use condensation::{
+    UPPER_AIR_SMOOTHING_TAU_S, saturation_surface, saturation_upper, saturation_upper_pw,
+    smooth_upper_air_mean_t, surface_means, upper_air_temperature,
+};
 pub use params::AtmosphereParams;
 pub use precipitation::cloud_water_to_qc;
 pub use scratch::AtmoScratch;
@@ -73,6 +76,14 @@ pub struct AtmoForcing<'a> {
     pub wind_field: &'a WindField,
     pub wind_mag: &'a [f32],
     pub hour_tick: u64,
+    /// Diurnally smoothed map-mean surface temperature (°C) that anchors
+    /// the upper layer (`upper_air_temperature`): persistent state owned
+    /// by `Simulation` (`Simulation::upper_air_mean_t`, EMA with
+    /// τ = `UPPER_AIR_SMOOTHING_TAU_S`, checkpointed), stepped before the
+    /// atmosphere and read-only here. Not the instantaneous mean of
+    /// `current`: the free atmosphere keeps the seasons and the lapse
+    /// with elevation, not the ~8 K day/night swing of the surface.
+    pub upper_air_mean_t: f32,
 }
 
 /// Two-layer atmospheric cycle, strictly closed terrarium.
@@ -130,6 +141,7 @@ pub fn step_atmosphere_into(
         wind_field,
         wind_mag,
         hour_tick,
+        upper_air_mean_t,
     } = *forcing;
 
     // v0.3.0 PR2: shadow with scaled params for the hourly regime.
@@ -161,13 +173,14 @@ pub fn step_atmosphere_into(
         .sin()
         .max(0.0);
 
-    // Tetens memoization (#97): `saturation_upper(T - t_offset)` on the
-    // pre-advection temperature, shared identically by the orographic
-    // convection (LCL bound by upper neighbor) and the Surface advection's
-    // lift (LCL bound by upward flux). Both read the `current` temperature
-    // (temperature advection only happens afterward), so the value is
-    // bit-identical to the inline call it replaces.
-    scratch.fill_sat_upper_offset(current, params, temp_params);
+    // Upper-air temperature + Tetens memoization (#97): horizontally
+    // homogeneous upper air (`upper_air_temperature`: the diurnally
+    // smoothed map-mean surface T carried by the forcing, map-mean
+    // elevation of the pre-advection `current` state), shared
+    // identically by the orographic convection (LCL bound by upper
+    // neighbor), the Surface advection's lift (LCL bound by upward flux)
+    // and the vapor ↔ droplet transition.
+    scratch.fill_upper_air(current, upper_air_mean_t, params, temp_params);
 
     step_evaporation(current, next, params, wind_mag, &mut scratch.evap);
     // Orographic convection BEFORE advection: fresh vapor evaporated near a
@@ -223,7 +236,7 @@ pub fn step_atmosphere_into(
     // stable. We do the vapor ↔ droplet transition before
     // precipitation so cloud_water can accumulate/discharge in
     // equilibrium with the local vapor field.
-    step_cloud_dynamics(next, params, temp_params);
+    step_cloud_dynamics(next, params, &scratch.t_upper);
     // Issue #45: surface condensation (radiative fog), after the upper
     // cloud_water dynamics, so fog adds its "low" cloud_water to the
     // stock. The cloud_water diffusion + advection that follow will
@@ -307,6 +320,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&current).0,
             },
             &mut false,
         );
@@ -339,6 +353,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&current).0,
             },
             &mut false,
         );
@@ -375,6 +390,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&grid).0,
             },
             &mut false,
         );
@@ -411,6 +427,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&grid).0,
             },
             &mut false,
         );
@@ -449,6 +466,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&grid).0,
             },
             &mut false,
         );
@@ -496,6 +514,7 @@ mod tests {
                 wind_field: &wf_cold,
                 wind_mag: &wind_mag_cold,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&cold).0,
             },
             &mut false,
         );
@@ -519,6 +538,7 @@ mod tests {
                 wind_field: &wf_warm,
                 wind_mag: &wind_mag_warm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&warm).0,
             },
             &mut false,
         );
@@ -565,6 +585,7 @@ mod tests {
                 wind_field: &wf,
                 wind_mag: &wm,
                 hour_tick: 0,
+                upper_air_mean_t: surface_means(&grid).0,
             },
             &mut false,
         );
@@ -602,6 +623,7 @@ mod tests {
                     wind_field: &wf,
                     wind_mag: &wm,
                     hour_tick: 0,
+                    upper_air_mean_t: surface_means(&current).0,
                 },
                 &mut false,
             );
