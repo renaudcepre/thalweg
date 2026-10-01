@@ -1,19 +1,26 @@
 //! Structural diagnostic, distribution of emergent **species** (epic #78,
-//! step D: #82). Replaces the former `diag_vegetation_biomes` (abstract biomes).
+//! step D: #82; strata and light, #161 steps 1-3). Replaces the former
+//! `diag_vegetation_biomes` (abstract biomes).
 //!
 //! Objective metric **before any tuning** of the niches (`species::SPECIES`)
 //! and rates (`VegetationParams`) - no physical balance change without
 //! global metrics at scale. Measured over
 //! 10 years (daily resolution):
 //! - **temporal succession**: surface fraction per dominant species, year
-//!   by year (pioneers first, then climax, or steady-state);
+//!   by year (pioneers first, then climax, or steady-state), next to the
+//!   mean cover of each stratum (herbs first, then shrubs, then trees);
 //! - **species × altitude band distribution** (band × category matrix);
-//! - biomass bounding / NaN-free check;
+//! - **strata × altitude band**: mean cover per stratum and canopy cover,
+//!   the vertical structure the light coupling builds (#161 step 2);
+//! - biomass bounding / NaN-free check, per species and per stratum;
 //! - determinism (same seed → same total biomass per species).
 //!
-//! **Known limitation to quantify here**: v0 competition = shared space,
-//! without succession (shade tolerance) → a generalist species with a wide
-//! niche (pine) can dominate everywhere. This diag is built to show it.
+//! "Dominant" is `vegetation::dominant_species`, the species **seen from
+//! the sky** (canopy first, then what its gaps let through): a meadow
+//! under an oak canopy counts as oak in the matrix but still shows in the
+//! herb cover column. The palette has 16 species over 3 strata; a
+//! generalist that wins everywhere (pine before #85) or an understory that
+//! never establishes under the trees is what this diag is built to show.
 //!
 //! **Eval style** (`scale_tests_eval_style`): `#[ignore]`, no assert,
 //! structured output meant to be read to calibrate `Species` / `VegetationParams`.
@@ -23,6 +30,9 @@
 //!     -- --ignored --nocapture
 //! ```
 
+mod common;
+
+use common::species_label;
 use hexsim_core::atmosphere::AtmosphereParams;
 use hexsim_core::cell::CellProperties;
 use hexsim_core::grid::HexGrid;
@@ -30,10 +40,10 @@ use hexsim_core::groundwater::GroundwaterParams;
 use hexsim_core::hydro::HydroParams;
 use hexsim_core::simulation::Simulation;
 use hexsim_core::snow::SnowParams;
-use hexsim_core::species::{SPECIES, SpeciesId};
+use hexsim_core::species::{SPECIES, SPECIES_COUNT, STRATA, STRATUM_COUNT, Stratum, species_index};
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::terrain::{TerrainParams, generate_terrain};
-use hexsim_core::vegetation::{cell_total_vegetation, dominant_species, is_open_water};
+use hexsim_core::vegetation::{canopy_cover, dominant_species, is_open_water, stratum_cover};
 use hexsim_core::wind::WindParams;
 
 const RADIUS: i32 = 30;
@@ -59,32 +69,27 @@ const BANDS: &[(&str, f32, f32)] = &[
     (">1500m", 1500.0, f32::INFINITY),
 ];
 
+const N_BANDS: usize = BANDS.len();
+
 /// Cover categories: open water, bare soil, then one per species.
 /// `N_CAT = 2 + number of species`.
-const N_CAT: usize = 2 + SPECIES.len();
+const N_CAT: usize = 2 + SPECIES_COUNT;
 
-fn cat_labels() -> [String; N_CAT] {
-    let mut out: [String; N_CAT] = core::array::from_fn(|_| String::new());
-    out[0] = "water".to_string();
-    out[1] = "bare".to_string();
-    for (i, s) in SPECIES.iter().enumerate() {
-        out[2 + i] = species_label(s.id).to_string();
+fn cat_labels() -> [&'static str; N_CAT] {
+    let mut out = ["water"; N_CAT];
+    out[1] = "bare";
+    for (slot, s) in out[2..].iter_mut().zip(SPECIES.iter()) {
+        *slot = species_label(s.id);
     }
     out
 }
 
-fn species_label(id: SpeciesId) -> &'static str {
-    match id {
-        SpeciesId::OakPubescent => "oak",
-        SpeciesId::Pine => "pine",
-        SpeciesId::Beech => "beech",
-        SpeciesId::Fir => "fir",
-        SpeciesId::AlpineGrass => "grass",
+fn stratum_label(s: Stratum) -> &'static str {
+    match s {
+        Stratum::Herb => "herb",
+        Stratum::Shrub => "shrub",
+        Stratum::Tree => "tree",
     }
-}
-
-fn species_index(id: SpeciesId) -> usize {
-    SPECIES.iter().position(|s| s.id == id).unwrap_or(0)
 }
 
 /// Category of a cell: 0 = water, 1 = bare soil, 2+i = dominant species i.
@@ -145,14 +150,62 @@ fn fractions(sim: &Simulation) -> [f64; N_CAT] {
 }
 
 /// Total biomass per species across the whole grid (determinism).
-fn biomass_per_species(sim: &Simulation) -> [f64; 5] {
-    let mut out = [0.0_f64; 5];
+fn biomass_per_species(sim: &Simulation) -> [f64; SPECIES_COUNT] {
+    let mut out = [0.0_f64; SPECIES_COUNT];
     for (_, cell) in sim.grid().iter() {
         for (o, &v) in out.iter_mut().zip(cell.vegetation.iter()) {
             *o += f64::from(v);
         }
     }
     out
+}
+
+/// Mean cover per stratum and mean canopy cover over the **land** cells
+/// of a set (open water carries no terrestrial vegetation and would only
+/// dilute the means). Both read from the core (`stratum_cover`,
+/// `canopy_cover`), never re-summed here (anti-pattern #2).
+#[derive(Default, Clone, Copy)]
+struct CoverMeans {
+    n_land: u32,
+    strata: [f64; STRATUM_COUNT],
+    canopy: f64,
+}
+
+impl CoverMeans {
+    fn add(&mut self, cell: &CellProperties) {
+        if is_open_water(cell) {
+            return;
+        }
+        self.n_land += 1;
+        for (acc, &s) in self.strata.iter_mut().zip(STRATA.iter()) {
+            *acc += f64::from(stratum_cover(cell, s));
+        }
+        self.canopy += f64::from(canopy_cover(cell));
+    }
+
+    fn of(sim: &Simulation) -> Self {
+        let mut out = Self::default();
+        for (_, cell) in sim.grid().iter() {
+            out.add(cell);
+        }
+        out
+    }
+
+    /// Prints the stratum means then the canopy mean, 7 chars each.
+    fn print_columns(&self) {
+        let n = f64::from(self.n_land.max(1));
+        for acc in self.strata {
+            print!("{:>7.3}", acc / n);
+        }
+        print!("{:>7.3}", self.canopy / n);
+    }
+}
+
+fn print_cover_header() {
+    for &s in &STRATA {
+        print!("{:>7}", stratum_label(s));
+    }
+    print!("{:>7}", "canopy");
 }
 
 #[test]
@@ -168,70 +221,106 @@ fn diag_species_distribution() {
         sim.step();
     }
 
-    // --- Temporal succession: fractions per dominant species, year by year ---
-    println!("== Surface fractions by dominant cover (year end, %) ==");
+    // --- Temporal succession: fractions per dominant species, year by
+    // year, then the mean cover per stratum over land cells ---
+    println!(
+        "== Surface fractions by dominant cover seen from the sky (year end, %) \
+         | mean cover over land [0, 1] =="
+    );
     print!("{:>5}", "year");
     for l in &labels {
-        print!("{l:>8}");
+        print!("{l:>7}");
     }
-    println!("{:>10}", "veg_tot");
+    print!(" |");
+    print_cover_header();
+    println!();
 
     for year in 1..=RUN_YEARS {
         for _ in 0..365 {
             sim.step();
         }
-        let frac = fractions(&sim);
         print!("{year:>5}");
-        for f in frac {
-            print!("{f:>8.1}");
+        for f in fractions(&sim) {
+            print!("{f:>7.1}");
         }
-        let veg_tot: f32 = sim
-            .grid()
-            .iter()
-            .map(|(_, c)| cell_total_vegetation(c))
-            .sum();
-        println!("{veg_tot:>10.0}");
+        print!(" |");
+        CoverMeans::of(&sim).print_columns();
+        println!();
     }
 
+    print_final_distribution(&sim, &labels);
+    print_determinism();
+}
+
+/// Band × category matrix, stratum cover per band and biomass bounds of
+/// the final state.
+fn print_final_distribution(sim: &Simulation, labels: &[&str; N_CAT]) {
     // --- Final distribution: category × altitude band ---
     println!("\n== Final distribution: cover × altitude band (% of band) ==");
-    let mut matrix = [[0u32; N_CAT]; 5];
-    let mut band_totals = [0u32; 5];
-    let mut min_v = f32::INFINITY;
-    let mut max_v = f32::NEG_INFINITY;
+    let mut matrix = [[0u32; N_CAT]; N_BANDS];
+    let mut band_totals = [0u32; N_BANDS];
+    let mut band_cover = [CoverMeans::default(); N_BANDS];
+    let mut min_v = [f32::INFINITY; SPECIES_COUNT];
+    let mut max_v = [f32::NEG_INFINITY; SPECIES_COUNT];
+    let mut max_stratum = [f32::NEG_INFINITY; STRATUM_COUNT];
     let mut nan_count = 0u32;
     for (_, cell) in sim.grid().iter() {
         let bi = band_index(cell.elevation);
         matrix[bi][category(cell)] += 1;
         band_totals[bi] += 1;
-        for &v in &cell.vegetation {
+        band_cover[bi].add(cell);
+        for ((&v, lo), hi) in cell.vegetation.iter().zip(&mut min_v).zip(&mut max_v) {
             if v.is_finite() {
-                min_v = min_v.min(v);
-                max_v = max_v.max(v);
+                *lo = lo.min(v);
+                *hi = hi.max(v);
             } else {
                 nan_count += 1;
             }
         }
+        for (m, &s) in max_stratum.iter_mut().zip(STRATA.iter()) {
+            *m = m.max(stratum_cover(cell, s));
+        }
     }
 
     print!("{:>12}", "band");
-    for l in &labels {
-        print!("{l:>8}");
+    for l in labels {
+        print!("{l:>7}");
     }
     println!("{:>7}", "n");
     for (bi, (label, _, _)) in BANDS.iter().enumerate() {
         let total = f64::from(band_totals[bi].max(1));
         print!("{label:>12}");
         for count in matrix[bi] {
-            print!("{:>8.1}", f64::from(count) / total * 100.0);
+            print!("{:>7.1}", f64::from(count) / total * 100.0);
         }
         println!("{:>7}", band_totals[bi]);
     }
 
-    println!("\n== Biomass bounds (per species) ==");
-    println!("  min={min_v:.3}  max={max_v:.3}  NaN={nan_count}");
+    // --- Vertical structure: mean cover per stratum × altitude band ---
+    println!("\n== Final mean cover per stratum × altitude band (land cells, [0, 1]) ==");
+    print!("{:>12}", "band");
+    print_cover_header();
+    println!("{:>7}", "n_land");
+    for ((label, _, _), cover) in BANDS.iter().zip(band_cover.iter()) {
+        print!("{label:>12}");
+        cover.print_columns();
+        println!("{:>7}", cover.n_land);
+    }
 
-    // --- Determinism: two short sims, same seed → same biomass/species ---
+    println!("\n== Biomass bounds (per species, per stratum; stratum cover ≤ k_total) ==");
+    for (s, (lo, hi)) in SPECIES.iter().zip(min_v.iter().zip(max_v.iter())) {
+        print!("  {}=[{lo:.3}, {hi:.3}]", species_label(s.id));
+    }
+    println!();
+    print!(" ");
+    for (&s, m) in STRATA.iter().zip(max_stratum.iter()) {
+        print!(" max_{}={m:.3}", stratum_label(s));
+    }
+    println!("  NaN={nan_count}");
+}
+
+/// Two short sims, same seed → same biomass per species.
+fn print_determinism() {
     let mut a = build_sim();
     let mut b = build_sim();
     for _ in 0..(WARMUP_DAYS + 60) {
@@ -245,8 +334,8 @@ fn diag_species_distribution() {
     }
     println!("\n== Determinism ({} d) ==", WARMUP_DAYS + 60);
     print!("  biomass/species A=[");
-    for v in ba {
-        print!("{v:.1} ");
+    for (s, v) in SPECIES.iter().zip(ba) {
+        print!("{}={v:.1} ", species_label(s.id));
     }
     println!("]  drift_abs_total={drift:.2e}");
 }

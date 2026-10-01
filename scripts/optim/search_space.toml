@@ -31,13 +31,10 @@
 min = 0.02
 max = 0.25
 
-[atmosphere.cloud_evap_hr_threshold]
-min = 0.20
-max = 0.55
-
-[atmosphere.cloud_evap_rate]
-min = 0.03
-max = 0.25
+# #63 L2b: `cloud_evap_hr_threshold` and `cloud_evap_rate` removed from
+# the engine and from this space. The vapour <- droplet transition is a
+# saturation adjustment bounded by the layer's deficit, with no
+# coefficient left to search over.
 
 [atmosphere.cloud_diffusion_rate]
 # min raised 0.05 -> 0.15: below that, clouds stay too localized
@@ -154,9 +151,9 @@ max = 0.5
 
 # ----- Groundwater -----
 
-[groundwater.infiltration_rate]
-min = 0.005
-max = 0.05
+[groundwater.saturated_conductivity_mm_per_day]
+min = 14.0
+max = 2820.0
 
 [groundwater.diffusion_rate]
 min = 0.005

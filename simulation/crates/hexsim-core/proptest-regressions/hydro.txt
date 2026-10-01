@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a99383a52b6775e89a8c693b42634bae7f898e34fb9108a9df254ed62dec6cd7 # shrinks to water_source = 18.72108, water_cap = 0.0, elev_source = 983.28107, elev_sink = 0.0, flow_rate = 0.01

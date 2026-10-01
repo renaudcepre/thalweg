@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::coord::hex_direction_to_world;
+use crate::coord::{hex_direction_to_world, opposite_direction};
 use crate::dynamics::{CELL_SPACING_M, STEEP_SLOPE_GRADE};
 use crate::grid::HexGrid;
+use crate::par::{for_each_chunk_mut, for_each_chunk_mut2, for_each_chunk_mut6, sum_dir_out};
+use crate::phase_timing::{HydroStepTimings, elapsed_s, mark};
 
 /// Average outgoing flux vector per cell, in world coordinates.
 /// Accumulates transfers weighted by direction for each substep.
@@ -31,6 +33,34 @@ pub struct HydroMaps<'a> {
     pub discharge: &'a [f32],
     pub flow_vec: &'a [(f32, f32)],
     pub edge_flux: &'a [[f32; 6]],
+}
+
+/// Scratch buffers for the two-phase scatter -> gather MFD routing
+/// (r250 perf effort, chunk C1), owned by the caller and reused every
+/// call to [`step_hydro_mfd_into`]: content between two calls is
+/// undefined, same convention as `atmosphere::AtmoScratch`.
+/// `dir_out[d][i]` is the amount cell `i` routes toward its toric
+/// neighbor in direction `d` (`coord::DIRECTIONS[d]`) this substep,
+/// filled by a parallel per-source outflow pass
+/// (`fill_hydro_outflow`) and read back by the following
+/// per-destination gather pass via `coord::opposite_direction`.
+pub struct HydroScratch {
+    pub dir_out: [Vec<f32>; 6],
+    /// This substep's `hydro` sub-phase durations, filled by
+    /// `step_hydro_mfd_into` and read back by the caller (`Simulation`)
+    /// right after the call. See [`HydroStepTimings`] for why this isn't
+    /// cumulative.
+    pub step_timings: HydroStepTimings,
+}
+
+impl HydroScratch {
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        Self {
+            dir_out: std::array::from_fn(|_| Vec::with_capacity(n)),
+            step_timings: HydroStepTimings::default(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -114,10 +144,12 @@ pub fn step_hydro_mfd(
     let mut flux_out: FluxMap = vec![0.0; n];
     let mut flow_vec: FlowVecMap = vec![(0.0, 0.0); n];
     let mut edge_flux: EdgeFluxMap = vec![[0.0; 6]; n];
+    let mut scratch = HydroScratch::new(n);
     step_hydro_mfd_into(
         current,
         next,
         params,
+        &mut scratch,
         &mut flux_out,
         &mut flow_vec,
         &mut edge_flux,
@@ -125,117 +157,250 @@ pub fn step_hydro_mfd(
     (flux_out, flow_vec)
 }
 
-/// Zero-malloc variant: writes into the provided buffers (resize + reset
-/// to 0).
+/// Zero-malloc variant: writes into the provided buffers (resize; every
+/// element is unconditionally overwritten by the phases below, so no
+/// separate reset-to-0 pass is needed).
+///
+/// Two-phase scatter -> gather (r250 perf effort, chunk C1): the
+/// historical single serial loop computed, per source cell, the MFD
+/// split toward its downhill neighbors and immediately scattered each
+/// share into `next_cells[j].water_level` — a write into ANOTHER cell's
+/// output, unsafe to hand to a chunked parallel iterator as-is. Phase 1
+/// (`fill_hydro_outflow`) computes that same per-source split into
+/// `scratch.dir_out`, reading only `current` (untouched by this whole
+/// function): fully independent per source, parallelizable
+/// (`par::for_each_chunk_mut6`). `flux_out`/`flow_vec` are pure
+/// per-source aggregates of the same split
+/// (`fill_hydro_source_aggregates`), and the per-edge history is the
+/// same buffer transposed to the `AoS` layout its consumers expect
+/// (`fill_hydro_edge_flux`) — no physics recomputed for either.
+/// Phase 2 (`gather_hydro_water`) gathers the routed water back per
+/// destination cell via `coord::opposite_direction`.
 pub fn step_hydro_mfd_into(
     current: &HexGrid,
     next: &mut HexGrid,
     params: &HydroParams,
+    scratch: &mut HydroScratch,
     flux_out: &mut FluxMap,
     flow_vec: &mut FlowVecMap,
     edge_flux_out: &mut EdgeFluxMap,
 ) {
     let n = current.len();
     flux_out.resize(n, 0.0);
-    flux_out.fill(0.0);
     flow_vec.resize(n, (0.0, 0.0));
-    flow_vec.fill((0.0, 0.0));
     edge_flux_out.resize(n, [0.0; 6]);
-    edge_flux_out.fill([0.0; 6]);
 
-    let cur_cells = current.cells_slice();
-    next.cells_slice_mut().clone_from_slice(cur_cells);
+    // Fresh per-substep sub-phase durations (`HydroStepTimings` carries
+    // no meaning between calls, cf. its doc): the caller reads this back
+    // right after the call and accumulates it into the cumulative
+    // `PhaseTimings::hydro_*` fields.
+    scratch.step_timings = HydroStepTimings::default();
 
-    let next_cells = next.cells_slice_mut();
-    for i in 0..n {
-        let cell = &cur_cells[i];
-        if cell.water_level <= 0.0 {
-            continue;
-        }
-        let eff = cell.effective_elevation();
-        // Toroidal neighborhood: surface water also flows across the
-        // seam (periodic terrain → the elevation delta there is
-        // physical). A river can exit through one edge and continue
-        // through the opposite edge.
-        let neighbors = current.neighbor_indices_toric(i);
-
-        // Temporary structure: (neighbor_idx, weight, dir_idx). We first
-        // compute the "desired flow" = flow_rate * sum(delta_i) to
-        // preserve the CFL behavior, then the split among neighbors
-        // according to weights delta_i^p (Tarboton D-inf).
-        let mut targets: [(usize, f32, usize); 6] = [(0, 0.0, 0); 6];
-        let mut n_targets = 0usize;
-        let mut total_delta = 0.0_f32;
-        let mut total_weight = 0.0_f32;
-        let mut max_slope = 0.0_f32;
-        for (dir_idx, &j) in neighbors.iter().enumerate() {
-            let delta = eff - cur_cells[j].effective_elevation();
-            if delta <= 0.0 {
-                continue;
-            }
-            if delta > max_slope {
-                max_slope = delta;
-            }
-            let weight = delta.powf(params.flow_concentration);
-            targets[n_targets] = (j, weight, dir_idx);
-            n_targets += 1;
-            total_delta += delta;
-            total_weight += weight;
-        }
-        if n_targets == 0 || total_weight <= 0.0 {
-            continue;
-        }
-
-        let total_desired = params.flow_rate * total_delta;
-
-        // Sub-cap water is mobilized proportionally to the local slope:
-        // flat (slope=0) → only the surplus flows (stable lake/puddle).
-        // Steep slope (>= slope_full_mobility) → the whole water_level
-        // can flow.
-        let surplus = (cell.water_level - cell.water_capacity).max(0.0);
-        let piege = cell.water_level - surplus;
-        let slope_factor = (max_slope / params.slope_full_mobility).clamp(0.0, 1.0);
-        let mobile = surplus + piege * slope_factor;
-        if mobile <= 0.0 {
-            continue;
-        }
-
-        let scale = if total_desired > 0.0 {
-            (mobile / total_desired).min(1.0)
-        } else {
-            0.0
-        };
-
-        let mut vec_x = 0.0_f32;
-        let mut vec_y = 0.0_f32;
-        let mut total_transfer = 0.0_f32;
-        for &(j, weight, dir_idx) in &targets[..n_targets] {
-            let raw = total_desired * (weight / total_weight);
-            let transfer = raw * scale;
-            if transfer <= 0.0 {
-                continue;
-            }
-            let (dx, dy) = hex_direction_to_world(dir_idx);
-            vec_x += dx * transfer;
-            vec_y += dy * transfer;
-            total_transfer += transfer;
-            edge_flux_out[i][dir_idx] += transfer;
-            next_cells[j].water_level += transfer;
-        }
-        if total_transfer > 0.0 {
-            next_cells[i].water_level -= total_transfer;
-            flux_out[i] += total_transfer;
-            flow_vec[i].0 += vec_x;
-            flow_vec[i].1 += vec_y;
-        }
+    let t0 = mark();
+    for dir in &mut scratch.dir_out {
+        dir.clear();
+        dir.resize(n, 0.0);
     }
+    fill_hydro_outflow(current, params, &mut scratch.dir_out);
+    scratch.step_timings.outflow += elapsed_s(t0);
+    let t0 = mark();
+    fill_hydro_source_aggregates(&scratch.dir_out, flux_out, flow_vec);
+    scratch.step_timings.aggregates += elapsed_s(t0);
+    let t0 = mark();
+    fill_hydro_edge_flux(&scratch.dir_out, edge_flux_out);
+    scratch.step_timings.edge_flux += elapsed_s(t0);
+    let t0 = mark();
+    gather_hydro_water(current, &scratch.dir_out, next);
+    scratch.step_timings.gather += elapsed_s(t0);
+}
+
+/// Phase 1 of [`step_hydro_mfd_into`]: per source cell, the amount
+/// routed toward each of its 6 toric neighbors this substep (the
+/// symmetric MFD split, Tarboton D-inf), 0 in every direction that
+/// isn't downhill or when the source has no mobile water. Reads only
+/// `current`, immutable for the whole substep (nothing in this
+/// function touches it): fully independent per source, parallelizable
+/// (`par::for_each_chunk_mut6`). Same formulas as the historical serial
+/// loop, split out so the split doesn't change the physics.
+fn fill_hydro_outflow(current: &HexGrid, params: &HydroParams, dir_out: &mut [Vec<f32>; 6]) {
+    let cur_cells = current.cells_slice();
+    for_each_chunk_mut6(dir_out, |start, chunks| {
+        for local in 0..chunks[0].len() {
+            let i = start + local;
+            for chunk in chunks.iter_mut() {
+                chunk[local] = 0.0;
+            }
+            let cell = &cur_cells[i];
+            if cell.water_level <= 0.0 {
+                continue;
+            }
+            let eff = cell.effective_elevation();
+            // Toroidal neighborhood: surface water also flows across the
+            // seam (periodic terrain → the elevation delta there is
+            // physical). A river can exit through one edge and continue
+            // through the opposite edge.
+            let neighbors = current.neighbor_indices_toric(i);
+
+            // Temporary structure: (weight, dir_idx). We first compute the
+            // "desired flow" = flow_rate * sum(delta_i) to preserve the CFL
+            // behavior, then the split among neighbors according to
+            // weights delta_i^p (Tarboton D-inf).
+            let mut targets: [(f32, usize); 6] = [(0.0, 0); 6];
+            let mut n_targets = 0_usize;
+            let mut total_delta = 0.0_f32;
+            let mut total_weight = 0.0_f32;
+            let mut max_slope = 0.0_f32;
+            for (dir_idx, &j) in neighbors.iter().enumerate() {
+                let delta = eff - cur_cells[j].effective_elevation();
+                if delta <= 0.0 {
+                    continue;
+                }
+                if delta > max_slope {
+                    max_slope = delta;
+                }
+                let weight = delta.powf(params.flow_concentration);
+                targets[n_targets] = (weight, dir_idx);
+                n_targets += 1;
+                total_delta += delta;
+                total_weight += weight;
+            }
+            if n_targets == 0 || total_weight <= 0.0 {
+                continue;
+            }
+
+            let total_desired = params.flow_rate * total_delta;
+
+            // Sub-cap water is mobilized proportionally to the local slope:
+            // flat (slope=0) → only the surplus flows (stable lake/puddle).
+            // Steep slope (>= slope_full_mobility) → the whole water_level
+            // can flow.
+            let surplus = (cell.water_level - cell.water_capacity).max(0.0);
+            let piege = cell.water_level - surplus;
+            let slope_factor = (max_slope / params.slope_full_mobility).clamp(0.0, 1.0);
+            let mobile = surplus + piege * slope_factor;
+            if mobile <= 0.0 {
+                continue;
+            }
+
+            let scale = if total_desired > 0.0 {
+                (mobile / total_desired).min(1.0)
+            } else {
+                0.0
+            };
+
+            for &(weight, dir_idx) in &targets[..n_targets] {
+                let raw = total_desired * (weight / total_weight);
+                let transfer = raw * scale;
+                if transfer > 0.0 {
+                    chunks[dir_idx][local] = transfer;
+                }
+            }
+        }
+    });
+}
+
+/// `flux_out[i]`/`flow_vec[i]` are pure per-source aggregates of what
+/// [`fill_hydro_outflow`] just computed — `Σ_d dir_out[d][i]` and that
+/// same sum weighted by each direction's world unit vector — so no
+/// gather across cells is needed for either, unlike `water_level`
+/// itself. A pure per-cell map over already-fully-computed data,
+/// parallelizable (`par::for_each_chunk_mut2`).
+fn fill_hydro_source_aggregates(
+    dir_out: &[Vec<f32>; 6],
+    flux_out: &mut FluxMap,
+    flow_vec: &mut FlowVecMap,
+) {
+    for_each_chunk_mut2(flux_out, flow_vec, |start, flux_chunk, vec_chunk| {
+        for local in 0..flux_chunk.len() {
+            let i = start + local;
+            let mut vec_x = 0.0_f32;
+            let mut vec_y = 0.0_f32;
+            let mut total = 0.0_f32;
+            for (d, dir) in dir_out.iter().enumerate() {
+                let transfer = dir[i];
+                if transfer == 0.0 {
+                    continue;
+                }
+                let (dx, dy) = hex_direction_to_world(d);
+                vec_x += dx * transfer;
+                vec_y += dy * transfer;
+                total += transfer;
+            }
+            flux_chunk[local] = total;
+            vec_chunk[local] = (vec_x, vec_y);
+        }
+    });
+}
+
+/// Per-edge export (#103): `edge_flux_out[i][d] = dir_out[d][i]`, the
+/// `SoA` outflow buffer transposed into the `AoS` layout `edge_flux_map`
+/// and its consumers (front ribbons, `erosion::update_edge_ema`)
+/// expect. The two layouts can't be the same allocation — `dir_out`
+/// needs six separate `Vec<f32>` for `for_each_chunk_mut6`, while
+/// `EdgeFluxMap` is one `[f32; 6]` per cell — so this is a transpose,
+/// not a free reinterpretation; it's cheap (pure data movement, no
+/// physics recomputed) and parallelizable (`par::for_each_chunk_mut`).
+fn fill_hydro_edge_flux(dir_out: &[Vec<f32>; 6], edge_flux_out: &mut EdgeFluxMap) {
+    for_each_chunk_mut(edge_flux_out, |start, chunk| {
+        for (local, edges) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            for (d, edge) in edges.iter_mut().enumerate() {
+                *edge = dir_out[d][i];
+            }
+        }
+    });
+}
+
+/// Phase 2 of [`step_hydro_mfd_into`]: per destination cell, applies
+/// the net `water_level` change — self-loss (`Σ_d dir_out[d][j]`,
+/// exactly what `j` itself routed away in phase 1) and the inflow
+/// gathered from its neighbors via `coord::opposite_direction`. Also
+/// where the historical `current → next` full-grid copy now lives
+/// (r250 perf effort, chunk B2): nothing between the top of
+/// [`step_hydro_mfd_into`] and this gather ever touches `next` (phase 1
+/// reads only `current` and writes the `dir_out` scratch), so this is
+/// the phase's first per-cell pass to write `next[j]` — starting each
+/// cell from `*cell = current[j].clone()` before adding the delta is
+/// bit-identical to the separate copy, one fewer 88-byte full-grid
+/// stream per substep (×8/day).
+///
+/// `k == j` skips a neighbor slot that
+/// [`HexGrid::neighbor_indices_toric`]'s doc calls out as its
+/// self-transfer fallback ("wrap unreachable (non-hexagonal grid)"): on
+/// a genuine `HexGrid::from_radius` torus this never fires (the tiling
+/// is exact, every direction reaches a distinct cell), but on any grid
+/// built by hand (proptests included) a filler self-loop at direction
+/// `d` makes `opposite_direction(d)` alias one of `j`'s OWN real
+/// outgoing directions — gathering it back would double-count `j`'s
+/// outflow as its own inflow. The scatter form this replaced was immune
+/// by construction (a self-transfer nets `+t; -t` on the same cell);
+/// this guard is its gather-form equivalent, load-bearing for
+/// `prop_flux_out_never_exceeds_water_level` (2-cell ad hoc grid).
+fn gather_hydro_water(current: &HexGrid, dir_out: &[Vec<f32>; 6], next: &mut HexGrid) {
+    let cur_cells = current.cells_slice();
+    for_each_chunk_mut(next.cells_slice_mut(), |start, chunk| {
+        for (local, cell) in chunk.iter_mut().enumerate() {
+            let j = start + local;
+            *cell = cur_cells[j].clone();
+            let self_loss = sum_dir_out(dir_out, j);
+            let neighbors = current.neighbor_indices_toric(j);
+            let mut gathered_in = 0.0_f32;
+            for (d, &k) in neighbors.iter().enumerate() {
+                if k == j {
+                    continue;
+                }
+                gathered_in += dir_out[opposite_direction(d)][k];
+            }
+            cell.water_level += gathered_in - self_loss;
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cell::CellProperties;
-    use crate::coord::HexCoord;
+    use crate::coord::{DIRECTIONS, HexCoord};
     use proptest::prelude::*;
 
     // --- Symmetric MFD tests ---
@@ -374,10 +539,12 @@ mod tests {
         let mut flux_out = vec![0.0; n];
         let mut flow_vec = vec![(0.0, 0.0); n];
         let mut edge_flux = vec![[0.0_f32; 6]; n];
+        let mut scratch = HydroScratch::new(n);
         step_hydro_mfd_into(
             &current,
             &mut next,
             &mfd_default_params(),
+            &mut scratch,
             &mut flux_out,
             &mut flow_vec,
             &mut edge_flux,
@@ -425,10 +592,12 @@ mod tests {
         let mut flux_out = vec![0.0; n];
         let mut flow_vec = vec![(0.0, 0.0); n];
         let mut edge_flux = vec![[0.0_f32; 6]; n];
+        let mut scratch = HydroScratch::new(n);
         step_hydro_mfd_into(
             &current,
             &mut next,
             &mfd_default_params(),
+            &mut scratch,
             &mut flux_out,
             &mut flow_vec,
             &mut edge_flux,
@@ -450,6 +619,154 @@ mod tests {
             edge_flux[ci][0] == 0.0 && edge_flux[ci][1] == 0.0,
             "no flux upstream (east/northeast): {:?}",
             edge_flux[ci]
+        );
+    }
+
+    /// r250 perf effort, chunk C1 gate: one loaded cell with two
+    /// downhill neighbors at different elevations lands EXACTLY the
+    /// per-neighbor split the MFD formula predicts by hand, not merely
+    /// "conserves in aggregate" — pins that the two-phase scatter ->
+    /// gather split didn't change which neighbor gets how much.
+    /// `flow_concentration=1.0` (linear weight, `weight = delta`) and
+    /// `water_capacity == water_level` (surplus = 0, so
+    /// `effective_elevation` == raw `elevation`, no mm/m offset) keep
+    /// the arithmetic exact:
+    ///   `total_delta = 10 + 5 = 15`, `total_weight = 15` (weight=delta)
+    ///   `total_desired = flow_rate * total_delta = 0.1 * 15 = 1.5`
+    ///   `slope_full_mobility = 1.0 <= max_slope(10)` -> `slope_factor = 1`
+    ///   `mobile = surplus(0) + piege(10) * 1 = 10` -> `scale = min(10/1.5, 1) = 1`
+    ///   `transfer_A = 1.5 * (10/15) = 1.0`, `transfer_B = 1.5 * (5/15) = 0.5`
+    #[test]
+    fn hydro_two_phase_split_matches_hand_computed_transfers() {
+        let params = HydroParams {
+            flow_rate: 0.1,
+            flow_concentration: 1.0,
+            slope_full_mobility: 1.0,
+        };
+        let mut current = HexGrid::from_radius(2);
+        let center = HexCoord::new(0, 0);
+        for coord in current.coords().copied().collect::<Vec<_>>() {
+            if let Some(c) = current.get_mut(coord) {
+                c.elevation = 110.0;
+                c.water_level = 0.0;
+                c.water_capacity = 10.0;
+            }
+        }
+        if let Some(c) = current.get_mut(center) {
+            c.elevation = 100.0;
+            c.water_level = 10.0;
+            c.water_capacity = 10.0; // surplus = 0: eff == elevation exactly
+        }
+        let down_a = center + DIRECTIONS[0];
+        let down_b = center + DIRECTIONS[1];
+        current.get_mut(down_a).unwrap().elevation = 90.0; // delta 10
+        current.get_mut(down_b).unwrap().elevation = 95.0; // delta 5
+
+        let mut next = current.clone();
+        let (flux, _) = step_hydro_mfd(&current, &mut next, &params);
+
+        let center_after = next.get(center).unwrap().water_level;
+        let a_after = next.get(down_a).unwrap().water_level;
+        let b_after = next.get(down_b).unwrap().water_level;
+        assert!(
+            (a_after - 1.0).abs() < 1e-4,
+            "neighbor A (Δz=10) should receive 1.0, got {a_after}"
+        );
+        assert!(
+            (b_after - 0.5).abs() < 1e-4,
+            "neighbor B (Δz=5) should receive 0.5, got {b_after}"
+        );
+        assert!(
+            (center_after - 8.5).abs() < 1e-4,
+            "center should lose exactly 1.5, got {center_after}"
+        );
+        let ci = current.cell_index(center).expect("center present");
+        assert!(
+            (flux[ci] - 1.5).abs() < 1e-4,
+            "flux_out should be 1.5, got {}",
+            flux[ci]
+        );
+        for &dir in &DIRECTIONS[2..] {
+            let lvl = next.get(center + dir).unwrap().water_level;
+            assert!(
+                lvl == 0.0,
+                "uphill neighbor at dir {dir:?} should receive nothing, got {lvl}"
+            );
+        }
+    }
+
+    /// r250 perf effort, chunk C1 gate: mass conservation of the
+    /// two-phase scatter -> gather split across exactly ONE routing
+    /// sub-step (not accumulated over many, unlike `mfd_conserves_mass`),
+    /// on a radius-2 grid with several downhill directions active at
+    /// once (cone shape, same terrain as `edge_flux_sums_to_flux_out`).
+    #[test]
+    fn hydro_two_phase_conserves_water_within_one_substep() {
+        let mut current = HexGrid::from_radius(2);
+        for coord in current.coords().copied().collect::<Vec<_>>() {
+            if let Some(c) = current.get_mut(coord) {
+                let d = coord.distance(HexCoord::new(0, 0));
+                c.elevation = f32::from(i16::try_from(100 - 30 * d).expect("fits i16"));
+                c.water_level = if d == 0 { 20.0 } else { 2.0 };
+                c.water_capacity = 1.0;
+            }
+        }
+        let before = total_water(&current);
+        let mut next = current.clone();
+        step_hydro_mfd(&current, &mut next, &mfd_default_params());
+        let after = total_water(&next);
+        let drift = (after - before).abs() / before.max(1.0);
+        assert!(
+            drift < 1e-4,
+            "not conservative within one substep: before={before} after={after} drift={drift}"
+        );
+    }
+
+    /// r250 perf effort, chunk C1: regression pin for the self-loop
+    /// aliasing bug the gather introduced on non-hexagonal ad hoc grids.
+    /// `HexGrid::neighbor_indices_toric`'s documented "wrap unreachable"
+    /// fallback fills a missing direction with the cell itself; without
+    /// the `k == j` guard in `gather_hydro_water`, that self-loop's
+    /// `opposite_direction` can alias one of the SAME cell's own real
+    /// outgoing directions, so the cell gathered back its own outflow as
+    /// inflow — first caught by `prop_flux_out_never_exceeds_water_level`
+    /// shrinking to this exact 2-cell shape; this is its deterministic
+    /// pin.
+    #[test]
+    fn hydro_two_phase_conserves_mass_on_non_hexagonal_ad_hoc_grid() {
+        let src = HexCoord::new(0, 0);
+        let sink = HexCoord::new(1, 0);
+        let mut current = HexGrid::new();
+        current.insert(
+            src,
+            CellProperties {
+                elevation: 500.0,
+                water_level: 20.0,
+                water_capacity: 1.0,
+                ..Default::default()
+            },
+        );
+        current.insert(
+            sink,
+            CellProperties {
+                elevation: 0.0,
+                water_level: 0.0,
+                water_capacity: 1.0,
+                ..Default::default()
+            },
+        );
+        let before = total_water(&current);
+        let mut next = current.clone();
+        step_hydro_mfd(&current, &mut next, &mfd_default_params());
+        let after = total_water(&next);
+        assert!(
+            (before - after).abs() < 1e-4,
+            "self-loop aliasing on a non-hexagonal grid broke conservation: {before} -> {after}"
+        );
+        let src_after = next.get(src).unwrap().water_level;
+        assert!(
+            src_after <= 20.0 + 1e-4,
+            "src must not gain back its own outflow via the self-loop alias: {src_after}"
         );
     }
 

@@ -3,7 +3,7 @@
 //! Anti-pattern #1 (overengineering before diagnostic) + #5 (measure before
 //! touching). Before recalibrating or remodeling the water table, isolate
 //! the cause by knock-out ablation of each lever:
-//!   - `infiltration_rate`: does surface fill the table adequately?
+//!   - `saturated_conductivity_mm_per_day`: does surface fill the table adequately?
 //!   - `diffusion_rate`: does piezometric diffusion drain the peaks?
 //!   - `max_capacity`: does the ceiling constrain the stock?
 //!
@@ -149,7 +149,7 @@ fn groundwater_ablation() {
     let d = GroundwaterParams::default();
     eprintln!(
         "  (default: infiltration {}, diffusion {}, max_capacity {})",
-        d.infiltration_rate, d.diffusion_rate, d.max_capacity
+        d.saturated_conductivity_mm_per_day, d.diffusion_rate, d.max_capacity
     );
 
     run_case("default", seed, radius, GroundwaterParams::default());
@@ -176,7 +176,6 @@ fn groundwater_ablation() {
         seed,
         radius,
         GroundwaterParams {
-            infiltration_rate: 0.2,
             ..GroundwaterParams::default()
         },
     );
@@ -194,7 +193,6 @@ fn groundwater_ablation() {
         seed,
         radius,
         GroundwaterParams {
-            infiltration_rate: 0.2,
             diffusion_rate: 0.003,
             ..GroundwaterParams::default()
         },

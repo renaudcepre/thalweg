@@ -37,6 +37,12 @@ pub mod cell;
 pub mod coord;
 /// The `HexGrid` itself: cells, neighbour indices, double buffering.
 pub mod grid;
+/// Deterministic draws hashed from world state, so "one seed = one world"
+/// survives a checkpoint restart without a generator to serialise.
+pub(crate) mod hashing;
+/// Per-cell parallel iteration (rayon, `parallel` feature), so call sites
+/// never spell out a `#[cfg]` themselves.
+pub(crate) mod par;
 /// The serialised view an external consumer renders. Depends on the
 /// phenomena; the grid does not depend on it.
 pub mod snapshot;
@@ -46,6 +52,10 @@ pub mod time;
 pub mod units;
 
 // --- World generation: what exists before the first tick.
+/// The climatological initial state deduced from that relief (#152):
+/// water table by wetness index, lakes in the depressions, snow above the
+/// frost line, analytic climate normals and the vegetation they carry.
+pub mod climatology;
 /// The mineral substrate beneath each cell, which sets what erodes and how
 /// fast.
 pub mod lithology;

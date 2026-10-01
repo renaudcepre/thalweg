@@ -43,6 +43,8 @@ use hexsim_core::snow::SnowParams;
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::{WindParams, WindVec};
 
+mod common;
+
 const RADIUS: i32 = 5;
 const SEED: u32 = 42;
 const PULSE_MM: f32 = 5.0;
@@ -62,21 +64,27 @@ fn world_x(c: HexCoord) -> f32 {
 }
 
 /// Atmosphere: no `cloud_water` regeneration, KK2000 disabled.
+///
+/// #63 L2b: the vapour ↔ droplet transition used to be knocked out with
+/// `condensation_rate = 0` (forward) and `cloud_evap_rate = 0`
+/// (reverse). The reverse branch has no rate any more, so
+/// `common::freeze_phase_transition` does both halves — see its doc.
+/// Without it the 5 mm pulse evaporates into the bone-dry layer within
+/// the first hour and this test measures the advection of nothing.
 fn build_atmosphere() -> AtmosphereParams {
-    AtmosphereParams {
+    let mut atmo = AtmosphereParams {
         transpiration_coef: 0.0,
         sublimation_rate: 0.0,
         uplift_rate: 0.0,
         uplift_thermal_coef: 0.0,
-        condensation_rate: 0.0,
-        cloud_evap_rate: 0.0,
         fog_condensation_rate: 0.0,
         orographic_lift_coef: 0.0,
         convective_diurnal_coef: 0.0,
-        initial_humidity_floor: 0.0,
         kk2000_droplet_count: 0.0,
         ..AtmosphereParams::default()
-    }
+    };
+    common::freeze_phase_transition(&mut atmo);
+    atmo
 }
 
 /// Pure west wind: all field mechanisms (noise, thermal, relief

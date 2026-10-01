@@ -64,6 +64,15 @@ pub enum Schedule {
 pub enum ApplyError {
     #[error("unknown parameter: `{key}`")]
     UnknownParam { key: String },
+    /// A `reset` asked for a radius different from the DEM survey's: the
+    /// procedural generator (what `reset` regenerates with) is not the DEM,
+    /// so honoring it would silently swap a real-relief world for a
+    /// synthetic one at the requested size. Same radius, or no radius at
+    /// all, still resets normally (today's behaviour).
+    #[error(
+        "cannot reset to radius {requested}: this world was loaded from a DEM survey, locked to radius {dem}"
+    )]
+    DemRadiusLocked { requested: i32, dem: i32 },
 }
 
 /// Simulation plus what surrounds it: generation parameters, radius, build
@@ -77,6 +86,12 @@ pub struct World {
     terrain: TerrainParams,
     radius: i32,
     build: BuildInfo,
+    /// `Some(r)` once this world was built over an external DEM survey (see
+    /// `hexsim-cli`'s `load_dem_override`), `r` being the radius it was
+    /// loaded at. A `reset` may then change the seed and regenerate the
+    /// (procedural) terrain, as it always has, but not the radius: `r` is
+    /// the survey's footprint, not a size the procedural generator owns.
+    dem_radius: Option<i32>,
 }
 
 impl World {
@@ -115,6 +130,7 @@ impl World {
             terrain,
             radius,
             build,
+            dem_radius: None,
         }
     }
 
@@ -128,7 +144,17 @@ impl World {
             terrain,
             radius,
             build,
+            dem_radius: None,
         }
+    }
+
+    /// Locks this world's radius to its current value: an external DEM
+    /// survey has been applied to the grid, and `reset`'s procedural
+    /// generator must not silently replace it with a differently-sized
+    /// synthetic terrain. Called once, right after `from_grid`, only by the
+    /// shell that loaded the DEM (`hexsim-cli`'s boot path).
+    pub fn lock_to_dem(&mut self) {
+        self.dem_radius = Some(self.radius);
     }
 
     #[must_use]
@@ -185,11 +211,20 @@ impl World {
 
     /// Regenerates the world while preserving physics parameters tuned at
     /// runtime: otherwise a `reset` after tuning would keep the fresh
-    /// terrain but lose all the tuning.
-    pub fn reset(&mut self, seed: Option<u32>) {
+    /// terrain but lose all the tuning. `radius` rebuilds the grid at that
+    /// size (small worlds run much faster, #L6); the DEM-lock check that
+    /// guards it lives in [`World::apply`], this function trusts its
+    /// caller.
+    pub fn reset(&mut self, seed: Option<u32>, radius: i32) {
         if let Some(seed) = seed {
             self.terrain.seed = seed;
         }
+        self.radius = radius;
+        // One climate target (#152): the world is generated for the
+        // temperature parameters the live simulation runs with, sliders
+        // included, so the seeded state and the primed normals agree.
+        let temperature = self.sim.temperature_params().clone();
+        self.terrain.temperature = temperature.clone();
         let mut grid = HexGrid::from_radius(self.radius);
         generate_terrain(&mut grid, &self.terrain);
 
@@ -197,7 +232,6 @@ impl World {
         let atmosphere = self.sim.atmosphere_params().clone();
         let groundwater = self.sim.groundwater_params().clone();
         let snow = self.sim.snow_params().clone();
-        let temperature = self.sim.temperature_params().clone();
         let wind = self.sim.wind_params().clone();
         let fire = *self.sim.fire_params();
         let erosion = self.sim.erosion_params().clone();
@@ -270,16 +304,22 @@ impl World {
             }
             // Water budget seeded at worldgen (#107). The terrarium is closed →
             // these two values fix the total liquid water budget, conserved
-            // forever. Raising `initial_water`/`initial_groundwater` is the
-            // only measured lever that grows water body persistence (JOURNAL
-            // 2026-07-12). See also `atmosphere.initial_humidity_floor` (the
-            // other line item of the budget, ~80%).
+            // forever. Raising `initial_water`/`initial_groundwater_frac` is
+            // the only measured lever that grows water body persistence
+            // (JOURNAL 2026-07-12). See also `atmosphere.initial_humidity_floor`,
+            // the other line item of the budget; since #151 the water table
+            // seeded at field capacity is by far the largest one. Since #152
+            // `initial_water` is the runoff sheet routed into the basins
+            // (the lakes of the first image), no longer a uniform puddle.
             "initial_water" => {
                 self.terrain.initial_water = value.max(0.0);
                 true
             }
-            "initial_groundwater" => {
-                self.terrain.initial_groundwater = value.max(0.0);
+            // Fraction of a cell's pore storage (#151), physically bounded
+            // to [0, 1]: below 0 there is no such thing as negative water,
+            // above 1 the water table would exceed the cell's own capacity.
+            "initial_groundwater_frac" => {
+                self.terrain.initial_groundwater_frac = value.clamp(0.0, 1.0);
                 true
             }
             _ => false,
@@ -304,8 +344,17 @@ impl World {
                 n: *n,
                 hourly: *hourly,
             }),
-            Command::Reset { seed } => {
-                self.reset(*seed);
+            Command::Reset { seed, radius } => {
+                let target_radius = radius.unwrap_or(self.radius);
+                if let Some(dem_radius) = self.dem_radius
+                    && target_radius != dem_radius
+                {
+                    return Err(ApplyError::DemRadiusLocked {
+                        requested: target_radius,
+                        dem: dem_radius,
+                    });
+                }
+                self.reset(*seed, target_radius);
                 Ok(Outcome::Snapshot)
             }
             Command::SetParam { key, value } => self.set_param(key, *value),
@@ -400,7 +449,11 @@ mod tests {
         let mut w = tiny_world();
         w.set_param("wind.humidity_advection_rate", 2.5)
             .expect("known key");
-        w.apply(&Command::Reset { seed: Some(7) }).expect("reset");
+        w.apply(&Command::Reset {
+            seed: Some(7),
+            radius: None,
+        })
+        .expect("reset");
         assert_eq!(w.seed(), 7);
         let rate = w.answer(&Query::Params)["wind"]["humidity_advection_rate"]
             .as_f64()
@@ -412,8 +465,90 @@ mod tests {
     fn reset_without_seed_keeps_the_current_seed() {
         let mut w = tiny_world();
         let seed = w.seed();
-        w.apply(&Command::Reset { seed: None }).expect("reset");
+        w.apply(&Command::Reset {
+            seed: None,
+            radius: None,
+        })
+        .expect("reset");
         assert_eq!(w.seed(), seed);
+    }
+
+    /// #L6: a `reset` with an explicit radius rebuilds the grid at that
+    /// size. `cell_count = 3R(R+1)+1` is the grid's own formula (`HexGrid`),
+    /// pinned here as the contract `World::apply` must honor.
+    #[test]
+    fn reset_with_radius_rebuilds_the_grid_at_that_size() {
+        let mut w = tiny_world();
+        assert_eq!(w.radius(), 2);
+        w.apply(&Command::Reset {
+            seed: None,
+            radius: Some(5),
+        })
+        .expect("reset");
+        assert_eq!(w.radius(), 5);
+        let expected = 3 * 5 * (5 + 1) + 1;
+        assert_eq!(w.sim().grid().len(), expected);
+    }
+
+    /// Absent `radius` = keep the current one, byte-for-byte today's
+    /// behaviour, even after a previous reset changed it.
+    #[test]
+    fn reset_without_radius_keeps_the_current_radius() {
+        let mut w = tiny_world();
+        w.apply(&Command::Reset {
+            seed: None,
+            radius: Some(6),
+        })
+        .expect("first reset, changes the radius");
+        assert_eq!(w.radius(), 6);
+        w.apply(&Command::Reset {
+            seed: Some(99),
+            radius: None,
+        })
+        .expect("second reset, no radius");
+        assert_eq!(w.radius(), 6, "radius must survive a reset without one");
+    }
+
+    /// A DEM-loaded world refuses a reset that would change its radius: the
+    /// procedural generator regenerating at some other size is not "the
+    /// same world, smaller", it's a different world.
+    #[test]
+    fn reset_on_a_dem_locked_world_refuses_a_different_radius() {
+        let mut w = tiny_world();
+        w.lock_to_dem();
+        assert_eq!(
+            w.apply(&Command::Reset {
+                seed: None,
+                radius: Some(5)
+            }),
+            Err(ApplyError::DemRadiusLocked {
+                requested: 5,
+                dem: 2
+            })
+        );
+        assert_eq!(w.radius(), 2, "a refused reset must not touch the world");
+    }
+
+    /// The same radius, or no radius at all, still resets normally on a
+    /// DEM-locked world (today's behaviour): the lock only guards against a
+    /// *different* size, not against resetting altogether.
+    #[test]
+    fn reset_on_a_dem_locked_world_accepts_the_same_radius_or_none() {
+        let mut w = tiny_world();
+        w.lock_to_dem();
+        w.apply(&Command::Reset {
+            seed: Some(3),
+            radius: Some(2),
+        })
+        .expect("same radius as the DEM: allowed");
+        assert_eq!(w.seed(), 3);
+        w.apply(&Command::Reset {
+            seed: Some(4),
+            radius: None,
+        })
+        .expect("no radius: allowed");
+        assert_eq!(w.seed(), 4);
+        assert_eq!(w.radius(), 2);
     }
 
     /// A physics `set_param` resynchronizes the sliders of all clients; a
@@ -423,7 +558,7 @@ mod tests {
     fn set_param_physique_broadcast_terrain_non() {
         let mut w = tiny_world();
         assert!(matches!(
-            w.set_param("atmosphere.cloud_evap_rate", 0.2),
+            w.set_param("atmosphere.condensation_rate", 0.2),
             Ok(Outcome::Broadcast(_))
         ));
         assert_eq!(

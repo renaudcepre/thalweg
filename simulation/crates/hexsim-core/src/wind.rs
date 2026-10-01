@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::coord::hex_direction_to_world;
 use crate::dynamics::{CELL_SPACING_M, STEEP_SLOPE_GRADE};
 use crate::grid::HexGrid;
+use crate::par::for_each_chunk_mut;
 use crate::units::MetersPerSecond;
 
 /// Conversion factor from the internal `WindVec` magnitude unit to an
@@ -237,7 +238,14 @@ pub fn compute_wind_field_into(
 /// every N hours (perf project #88).
 pub fn compute_wind_magnitudes_into(field: &WindField, out: &mut Vec<f32>) {
     out.clear();
-    out.extend(field.iter().map(|w| w.magnitude()));
+    out.resize(field.len(), 0.0);
+    // Elementwise map (`out[i] = field[i].magnitude()`), parallelizable
+    // (`par::for_each_chunk_mut`).
+    for_each_chunk_mut(out, |start, chunk| {
+        for (local, o) in chunk.iter_mut().enumerate() {
+            *o = field[start + local].magnitude();
+        }
+    });
 }
 
 /// Phase 1: stochastic background wind (temporally seeded Perlin noise).
@@ -278,29 +286,34 @@ fn add_thermal_component(grid: &HexGrid, params: &WindParams, field: &mut WindFi
         return;
     }
     let cells = grid.cells_slice();
-    for (i, cell) in cells.iter().enumerate() {
-        // Toric neighborhood: the thermal gradient is computed over the 6
-        // neighbors, seam included (temperature is continuous across the
-        // torus). The truncated edge neighborhood used to systematically
-        // bias the breeze along the outer ring. j == i (degenerate grid) →
-        // diff 0.
-        let neighbors = grid.neighbor_indices_toric(i);
+    // Gather over the 6 toric neighbors, write only `field[i]`: a pure
+    // per-cell map, parallelizable (`par::for_each_chunk_mut`).
+    for_each_chunk_mut(field, |start, chunk| {
+        for (local, w) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            let cell = &cells[i];
+            // Toric neighborhood: the thermal gradient is computed over the 6
+            // neighbors, seam included (temperature is continuous across the
+            // torus). The truncated edge neighborhood used to systematically
+            // bias the breeze along the outer ring. j == i (degenerate grid) →
+            // diff 0.
+            let neighbors = grid.neighbor_indices_toric(i);
 
-        let mut tg_x = 0.0_f32;
-        let mut tg_y = 0.0_f32;
-        for (di, &j) in neighbors.iter().enumerate() {
-            let (dx, dy) = hex_direction_to_world(di);
-            let temp_diff = cells[j].temperature - cell.temperature;
-            tg_x += dx * temp_diff;
-            tg_y += dy * temp_diff;
+            let mut tg_x = 0.0_f32;
+            let mut tg_y = 0.0_f32;
+            for (di, &j) in neighbors.iter().enumerate() {
+                let (dx, dy) = hex_direction_to_world(di);
+                let temp_diff = cells[j].temperature - cell.temperature;
+                tg_x += dx * temp_diff;
+                tg_y += dy * temp_diff;
+            }
+            tg_x /= 6.0;
+            tg_y /= 6.0;
+
+            w.x += tg_x * params.thermal_strength;
+            w.y += tg_y * params.thermal_strength;
         }
-        tg_x /= 6.0;
-        tg_y /= 6.0;
-
-        let w = &mut field[i];
-        w.x += tg_x * params.thermal_strength;
-        w.y += tg_y * params.thermal_strength;
-    }
+    });
 }
 
 /// Phase 2: deflection by relief.
@@ -308,58 +321,64 @@ fn add_thermal_component(grid: &HexGrid, params: &WindParams, field: &mut WindFi
 /// Uphill → blocking + circumvention. Downhill → catabatic acceleration.
 fn apply_terrain_deflection(grid: &HexGrid, params: &WindParams, field: &mut WindField) {
     let cells = grid.cells_slice();
-    for (i, cell) in cells.iter().enumerate() {
-        // Toric neighborhood: relief is periodic, its gradient across the
-        // seam is physical (same reason as the thermal component).
-        let neighbors = grid.neighbor_indices_toric(i);
+    // Gather over the 6 toric neighbors, read-then-write only `field[i]`:
+    // a pure per-cell map, parallelizable (`par::for_each_chunk_mut`).
+    for_each_chunk_mut(field, |start, chunk| {
+        for (local, slot) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            let cell = &cells[i];
+            // Toric neighborhood: relief is periodic, its gradient across the
+            // seam is physical (same reason as the thermal component).
+            let neighbors = grid.neighbor_indices_toric(i);
 
-        let mut grad_x = 0.0_f32;
-        let mut grad_y = 0.0_f32;
-        for (di, &j) in neighbors.iter().enumerate() {
-            let (dx, dy) = hex_direction_to_world(di);
-            let elev_diff = cells[j].elevation - cell.elevation;
-            grad_x += dx * elev_diff;
-            grad_y += dy * elev_diff;
+            let mut grad_x = 0.0_f32;
+            let mut grad_y = 0.0_f32;
+            for (di, &j) in neighbors.iter().enumerate() {
+                let (dx, dy) = hex_direction_to_world(di);
+                let elev_diff = cells[j].elevation - cell.elevation;
+                grad_x += dx * elev_diff;
+                grad_y += dy * elev_diff;
+            }
+            grad_x /= 6.0;
+            grad_y /= 6.0;
+
+            let wind = *slot;
+            let grad_mag = (grad_x * grad_x + grad_y * grad_y).sqrt();
+
+            if grad_mag > 1e-6 {
+                let gn_x = grad_x / grad_mag;
+                let gn_y = grad_y / grad_mag;
+                // Threshold derived from CELL_SPACING_M (see
+                // dynamics::STEEP_SLOPE_GRADE): without this, a change in the
+                // engine's resolution would silently skew this threshold (cf.
+                // feat/dem-terrain-validation, where this threshold used to be
+                // hardcoded).
+                let slope = (grad_mag / (STEEP_SLOPE_GRADE * CELL_SPACING_M)).min(1.0);
+
+                let dot = wind.x * gn_x + wind.y * gn_y;
+                let par_x = gn_x * dot;
+                let par_y = gn_y * dot;
+                let perp_x = wind.x - par_x;
+                let perp_y = wind.y - par_y;
+
+                *slot = if dot > 0.0 {
+                    let block = (1.0 - params.terrain_deflection * slope).max(0.0);
+                    let block_sq = block * block;
+                    let deflect = 1.0 + params.terrain_deflection * slope * dot.abs().min(1.0);
+                    WindVec {
+                        x: par_x * block_sq + perp_x * deflect,
+                        y: par_y * block_sq + perp_y * deflect,
+                    }
+                } else {
+                    let boost = 1.0 + params.terrain_speed_factor * slope * 0.5;
+                    WindVec {
+                        x: wind.x * boost,
+                        y: wind.y * boost,
+                    }
+                };
+            }
         }
-        grad_x /= 6.0;
-        grad_y /= 6.0;
-
-        let wind = field[i];
-        let grad_mag = (grad_x * grad_x + grad_y * grad_y).sqrt();
-
-        if grad_mag > 1e-6 {
-            let gn_x = grad_x / grad_mag;
-            let gn_y = grad_y / grad_mag;
-            // Threshold derived from CELL_SPACING_M (see
-            // dynamics::STEEP_SLOPE_GRADE): without this, a change in the
-            // engine's resolution would silently skew this threshold (cf.
-            // feat/dem-terrain-validation, where this threshold used to be
-            // hardcoded).
-            let slope = (grad_mag / (STEEP_SLOPE_GRADE * CELL_SPACING_M)).min(1.0);
-
-            let dot = wind.x * gn_x + wind.y * gn_y;
-            let par_x = gn_x * dot;
-            let par_y = gn_y * dot;
-            let perp_x = wind.x - par_x;
-            let perp_y = wind.y - par_y;
-
-            field[i] = if dot > 0.0 {
-                let block = (1.0 - params.terrain_deflection * slope).max(0.0);
-                let block_sq = block * block;
-                let deflect = 1.0 + params.terrain_deflection * slope * dot.abs().min(1.0);
-                WindVec {
-                    x: par_x * block_sq + perp_x * deflect,
-                    y: par_y * block_sq + perp_y * deflect,
-                }
-            } else {
-                let boost = 1.0 + params.terrain_speed_factor * slope * 0.5;
-                WindVec {
-                    x: wind.x * boost,
-                    y: wind.y * boost,
-                }
-            };
-        }
-    }
+    });
 }
 
 /// Phase 3: asymmetric propagation (wind shadow).
@@ -373,30 +392,39 @@ fn propagate_upstream(
 ) {
     for _ in 0..params.smoothing_passes {
         snapshot.clone_from(field);
-        for i in 0..grid.len() {
-            let wind = snapshot[i];
+        // Gather from the frozen `snapshot`, write only `field[i]`: a pure
+        // per-cell map, parallelizable (`par::for_each_chunk_mut`). Each
+        // pass depends on the previous pass's fully-settled `field`
+        // (copied into `snapshot` above), never on another cell's `field`
+        // write from THIS pass, so the passes stay sequential while each
+        // one parallelizes internally.
+        for_each_chunk_mut(field, |start, chunk| {
+            for (local, slot) in chunk.iter_mut().enumerate() {
+                let i = start + local;
+                let wind = snapshot[i];
 
-            let mut sum_x = wind.x * 4.0;
-            let mut sum_y = wind.y * 4.0;
-            let mut weight = 4.0_f32;
+                let mut sum_x = wind.x * 4.0;
+                let mut sum_y = wind.y * 4.0;
+                let mut weight = 4.0_f32;
 
-            let neighbors = grid.neighbor_indices_toric(i);
-            for (dir_idx, &n_idx) in neighbors.iter().enumerate() {
-                let nw = snapshot[n_idx];
-                let (dx, dy) = hex_direction_to_world(dir_idx);
-                let upstream = -(wind.x * dx + wind.y * dy);
-                if upstream > 0.0 {
-                    sum_x += nw.x * upstream;
-                    sum_y += nw.y * upstream;
-                    weight += upstream;
+                let neighbors = grid.neighbor_indices_toric(i);
+                for (dir_idx, &n_idx) in neighbors.iter().enumerate() {
+                    let nw = snapshot[n_idx];
+                    let (dx, dy) = hex_direction_to_world(dir_idx);
+                    let upstream = -(wind.x * dx + wind.y * dy);
+                    if upstream > 0.0 {
+                        sum_x += nw.x * upstream;
+                        sum_y += nw.y * upstream;
+                        weight += upstream;
+                    }
                 }
-            }
 
-            field[i] = WindVec {
-                x: sum_x / weight,
-                y: sum_y / weight,
-            };
-        }
+                *slot = WindVec {
+                    x: sum_x / weight,
+                    y: sum_y / weight,
+                };
+            }
+        });
     }
 }
 

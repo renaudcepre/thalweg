@@ -14,6 +14,7 @@ use hexsim_core::groundwater::GroundwaterParams;
 use hexsim_core::hydro::HydroParams;
 use hexsim_core::simulation::Simulation;
 use hexsim_core::snow::SnowParams;
+use hexsim_core::species::{SPECIES_COUNT, SpeciesId, species_index};
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::WindParams;
 
@@ -26,7 +27,9 @@ fn watered_world(base_temp: f32) -> Simulation {
         c.elevation = 200.0;
         c.groundwater = 80.0;
         c.water_level = 0.0;
-        c.vegetation = [0.6, 0.0, 0.0, 0.0, 0.0];
+        // 0.6 of downy oak (canopy, full light), seeded by id.
+        c.vegetation = [0.0; SPECIES_COUNT];
+        c.vegetation[species_index(SpeciesId::OakPubescent)] = 0.6;
         c.humidity_surface = 0.0;
         c.humidity_upper = 0.0;
         c.cloud_water = 0.0;

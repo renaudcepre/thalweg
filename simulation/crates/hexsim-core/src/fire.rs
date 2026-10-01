@@ -24,8 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::grid::HexGrid;
-use crate::species::SPECIES_COUNT;
 use crate::temperature::local_heat_capacity;
+use crate::vegetation::canopy_cover;
 
 /// Combustion enthalpy of dry wood (J/kg). Standard value ~18 MJ/kg.
 const COMBUSTION_ENTHALPY_J_PER_KG: f32 = 18.0e6;
@@ -56,9 +56,11 @@ pub struct FireParams {
     pub fuel_age_half_years: f32,
     /// Fraction of biomass consumed per day when cell burns.
     pub combustion_fraction_per_day: f32,
-    /// Residual cover below which fire extinguishes (no more fuel).
+    /// Residual cover (`vegetation::canopy_cover`) below which fire
+    /// extinguishes (no more fuel).
     pub extinguish_fuel_min: f32,
-    /// Dry fuel load per unit cover (kg/m²). Forest assumption.
+    /// Dry fuel load per unit of cover seen from above
+    /// (`vegetation::canopy_cover`, kg/m²). Forest assumption.
     pub fuel_load_kg_per_m2: f32,
     /// Fraction of combustion energy that heats ground locally (rest goes to
     /// plume/radiation to atmosphere). Small.
@@ -94,32 +96,24 @@ impl Default for FireParams {
     }
 }
 
-/// Deterministic hash `(seed, day, q, r, salt)` → `[0, 1)`. FNV-1a + splitmix
-/// finalizer. `salt` separates independent streams (ignition vs spread).
+/// Deterministic hash `(seed, day, q, r, salt)` → `[0, 1)`. `salt`
+/// separates independent streams (ignition vs spread). The hash itself
+/// lives in [`crate::hashing`], shared with the weather regime (#63)
+/// rather than written a second time; the word order below is the one
+/// this phenomenon has always used, so its stream is unchanged.
 #[must_use]
 fn hash01(seed: u32, day: u64, q: i32, r: i32, salt: u32) -> f32 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    // Bit reinterpretation of the signed coords (no sign loss).
-    for v in [
+    crate::hashing::hash01(&[
         u64::from(seed),
         day,
-        u64::from(u32::from_ne_bytes(q.to_ne_bytes())),
-        u64::from(u32::from_ne_bytes(r.to_ne_bytes())),
+        crate::hashing::coord_word(q),
+        crate::hashing::coord_word(r),
         u64::from(salt),
-    ] {
-        h ^= v;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    // 23 bits → mantissa of an f32 in [1, 2), then −1 → [0, 1). All in
-    // integer + from_bits: no lossy float cast.
-    let mantissa = u32::try_from((h >> 41) & 0x007F_FFFF).unwrap_or(0);
-    f32::from_bits(0x3F80_0000 | mantissa) - 1.0
+    ])
 }
 
-/// Flammability ∈ [0, 1], saturating increase with canopy age.
+/// Flammability ∈ [0, 1], saturating increase with canopy age (the mean
+/// age of the tree stratum, `CellProperties::stand_age`).
 #[must_use]
 fn flammability(stand_age: f32, params: &FireParams) -> f32 {
     let a = stand_age.max(0.0);
@@ -137,10 +131,15 @@ fn dryness(temperature: f32, root_water_mm: f32, params: &FireParams) -> f32 {
     heat * water_dry
 }
 
-/// Fuel of a cell = total cover × flammability (age).
+/// Fuel of a cell = cover × flammability (age). The cover is the one seen
+/// from above, `vegetation::canopy_cover` ∈ [0, 1] (#161): an understory
+/// adds fuel only through the gaps of the layers above it, it does not
+/// stack on the canopy (the plain sum of biomasses reaches 3 under a full
+/// three-layer stand and would push the spread probability over its
+/// sub-critical calibration).
 #[must_use]
-fn fuel(total_veg: f32, stand_age: f32, params: &FireParams) -> f32 {
-    total_veg * flammability(stand_age, params)
+fn fuel(cover: f32, stand_age: f32, params: &FireParams) -> f32 {
+    cover * flammability(stand_age, params)
 }
 
 /// Counters for one fire step, for calibration metrics.
@@ -181,21 +180,30 @@ pub(crate) fn step_fire(
         let next_cells = next.cells_slice_mut();
         for (i, cell) in cur.iter().enumerate() {
             let coord = coords[i];
-            let total_veg: f32 = cell.vegetation.iter().sum();
-            let wet = cell.snow_level > 1e-3;
+            let cover = canopy_cover(cell);
+            let wet = cell.frozen_surface() > 1e-3;
 
             if cell.fire_intensity > 1e-3 {
                 sources.push(i);
                 let consume =
                     (params.combustion_fraction_per_day * cell.fire_intensity).clamp(0.0, 1.0);
-                let mut burned_cover = 0.0;
-                for s in 0..SPECIES_COUNT {
-                    let b = cell.vegetation[s] * consume;
-                    next_cells[i].vegetation[s] = (cell.vegetation[s] - b).max(0.0);
-                    burned_cover += b;
+                // Every stratum burns: the same fraction of every species'
+                // biomass goes up in flames.
+                for (nv, &v) in next_cells[i]
+                    .vegetation
+                    .iter_mut()
+                    .zip(cell.vegetation.iter())
+                {
+                    *nv = (v - v * consume).max(0.0);
                 }
+                let remaining = canopy_cover(&next_cells[i]);
                 // Combustion heat (energy source) → ΔT via the local heat
                 // capacity shared with step_temperature. Does not alter water.
+                // The load is per unit of cover seen from above, so the
+                // burned fuel is the cover lost (the calibration of
+                // `fuel_load_kg_per_m2` predates the strata, when the sum of
+                // biomasses was that cover).
+                let burned_cover = cover - remaining;
                 let energy_j_per_m2 = burned_cover
                     * params.fuel_load_kg_per_m2
                     * COMBUSTION_ENTHALPY_J_PER_KG
@@ -203,7 +211,6 @@ pub(crate) fn step_fire(
                 next_cells[i].temperature = cell.temperature
                     + energy_j_per_m2 / local_heat_capacity(cell.water_level, cell.groundwater);
 
-                let remaining = total_veg - burned_cover;
                 next_cells[i].fire_intensity = if remaining < params.extinguish_fuel_min || wet {
                     0.0
                 } else {
@@ -212,7 +219,7 @@ pub(crate) fn step_fire(
             } else {
                 let root_water = cell.groundwater + cell.water_level;
                 let dry = dryness(cell.temperature, root_water, params);
-                let cell_fuel = fuel(total_veg, cell.stand_age, params);
+                let cell_fuel = fuel(cover, cell.stand_age, params);
                 if !wet && cell_fuel > 1e-3 && dry > 0.0 {
                     let p_ign = params.ignition_rate * cell_fuel * dry;
                     if hash01(seed, day, coord.q, coord.r, 1) < p_ign {
@@ -236,14 +243,13 @@ pub(crate) fn step_fire(
             }
             let nb_coord = coords[nb];
             let ncell = &cur[nb];
-            if ncell.fire_intensity > 1e-3 || ncell.snow_level > 1e-3 {
+            if ncell.fire_intensity > 1e-3 || ncell.frozen_surface() > 1e-3 {
                 continue; // already burning (source) or snow-covered.
             }
             if next.cells_slice()[nb].fire_intensity > 1e-3 {
                 continue; // already ignited this tick (lightning or another neighbor).
             }
-            let total_veg: f32 = ncell.vegetation.iter().sum();
-            let nb_fuel = fuel(total_veg, ncell.stand_age, params);
+            let nb_fuel = fuel(canopy_cover(ncell), ncell.stand_age, params);
             let dry = dryness(
                 ncell.temperature,
                 ncell.groundwater + ncell.water_level,
@@ -275,14 +281,32 @@ pub(crate) fn step_fire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::CellProperties;
     use crate::coord::HexCoord;
+    use crate::species::{SPECIES_COUNT, SpeciesId, species_index};
+    use crate::vegetation::{VegetationParams, stratum_cover};
+
+    /// Old dense forest in three layers, each stratum within its budget
+    /// (`k_total`): oak + pine canopy, boxwood understory, meadow.
+    fn layered_forest() -> [f32; SPECIES_COUNT] {
+        let mut v = [0.0; SPECIES_COUNT];
+        for (id, b) in [
+            (SpeciesId::OakPubescent, 0.6),
+            (SpeciesId::Pine, 0.3),
+            (SpeciesId::Boxwood, 0.4),
+            (SpeciesId::Meadow, 0.5),
+        ] {
+            v[species_index(id)] = b;
+        }
+        v
+    }
 
     fn grid_one_burning() -> (HexGrid, HexGrid) {
         let mut g = HexGrid::from_radius(2);
         // Everyone: old dense forest, dry, hot.
         for coord in g.coords().copied().collect::<Vec<_>>() {
             let c = g.get_mut(coord).unwrap();
-            c.vegetation = [0.2; SPECIES_COUNT];
+            c.vegetation = layered_forest();
             c.stand_age = 100.0;
             c.temperature = 35.0;
             c.groundwater = 0.0;
@@ -302,7 +326,10 @@ mod tests {
         // next identical to current (center stays at 1.0, nothing happens).
         for (a, b) in cur.cells_slice().iter().zip(next.cells_slice()) {
             assert!((a.fire_intensity - b.fire_intensity).abs() < 1e-9);
-            assert!((a.vegetation[0] - b.vegetation[0]).abs() < 1e-9);
+            assert_eq!(
+                a.vegetation.map(f32::to_bits),
+                b.vegetation.map(f32::to_bits)
+            );
         }
     }
 
@@ -315,16 +342,17 @@ mod tests {
         };
         step_fire(&cur, &mut next, &p, 42, 100);
         let c = next.get(HexCoord::new(0, 0)).unwrap();
-        let cur_total: f32 = cur
-            .get(HexCoord::new(0, 0))
-            .unwrap()
-            .vegetation
-            .iter()
-            .sum();
-        let new_total: f32 = c.vegetation.iter().sum();
-        assert!(new_total < cur_total, "fire must consume fuel");
+        let before = cur.get(HexCoord::new(0, 0)).unwrap();
         assert!(
-            c.temperature > cur.get(HexCoord::new(0, 0)).unwrap().temperature,
+            canopy_cover(c) < canopy_cover(before),
+            "fire must consume fuel"
+        );
+        // Every stratum burns, not only the canopy.
+        for (&v0, &v1) in before.vegetation.iter().zip(c.vegetation.iter()) {
+            assert!(v0 <= 0.0 || v1 < v0, "every species must burn: {v0} → {v1}");
+        }
+        assert!(
+            c.temperature > before.temperature,
             "combustion must produce heat"
         );
     }
@@ -407,7 +435,7 @@ mod tests {
         }
         // Only the center carries fuel, and it burns.
         let c = grid.get_mut(center).unwrap();
-        c.vegetation = [0.2; SPECIES_COUNT];
+        c.vegetation = layered_forest();
         c.stand_age = 100.0;
         c.fire_intensity = 1.0;
 
@@ -417,8 +445,9 @@ mod tests {
             ..Default::default()
         };
         let mut next = grid.clone();
-        // 90-day margin: combustion (~total/day) exhausts 0.2×5 of
-        // cover and drops below extinguish_fuel_min well before that.
+        // 90-day margin: combustion (85 %/day of every stratum) exhausts
+        // the ~0.97 canopy cover of the layered forest and drops below
+        // extinguish_fuel_min well before that.
         let mut extinguished_on = None;
         for day in 0..90 {
             step_fire(&grid, &mut next, &params, 42, day);
@@ -438,5 +467,60 @@ mod tests {
                 "re-ignition without external ignition at day {d} (the stock must reach true zero)"
             );
         }
+    }
+
+    #[test]
+    fn phys_understory_adds_fuel_only_through_the_canopy_gaps() {
+        // #161: the fuel cover is the cover seen from above. A full
+        // understory (boxwood 0.9 + meadow 0.95) adds fuel only through the
+        // gaps of the canopy: at most the 5 % gap of a closed oak canopy
+        // (0.95), most of the 80 % gap of an open one (0.2). The fuel never
+        // exceeds the flammability (cover ≤ 1): the plain sum of biomasses
+        // (2.8 here) would push the spread probability far past its
+        // sub-critical calibration.
+        let p = FireParams::default();
+        let age = 100.0;
+        let with_ids = |seed: &[(SpeciesId, f32)]| {
+            let mut c = CellProperties::default();
+            for &(id, v) in seed {
+                c.vegetation[species_index(id)] = v;
+            }
+            c
+        };
+        let (closed_oak, open_oak) = (0.95, 0.2);
+        let understory = [(SpeciesId::Boxwood, 0.9), (SpeciesId::Meadow, 0.95)];
+        let closed = with_ids(&[(SpeciesId::OakPubescent, closed_oak)]);
+        let closed_layered = with_ids(&[
+            (SpeciesId::OakPubescent, closed_oak),
+            understory[0],
+            understory[1],
+        ]);
+        let open = with_ids(&[(SpeciesId::OakPubescent, open_oak)]);
+        let open_layered = with_ids(&[
+            (SpeciesId::OakPubescent, open_oak),
+            understory[0],
+            understory[1],
+        ]);
+        let k_total = VegetationParams::default().k_total;
+        for s in crate::species::STRATA {
+            assert!(stratum_cover(&closed_layered, s) <= k_total);
+        }
+        let fuel_of = |c: &CellProperties| fuel(canopy_cover(c), age, &p);
+        let flam = flammability(age, &p);
+        let closed_gain = fuel_of(&closed_layered) - fuel_of(&closed);
+        let open_gain = fuel_of(&open_layered) - fuel_of(&open);
+        assert!(
+            fuel_of(&closed_layered) <= flam,
+            "fuel {} over the flammability {flam}",
+            fuel_of(&closed_layered)
+        );
+        assert!(
+            closed_gain <= (1.0 - closed_oak) * flam + 1e-6,
+            "an understory under a closed canopy adds at most its gaps, got {closed_gain}"
+        );
+        assert!(
+            open_gain <= (1.0 - open_oak) * flam + 1e-6 && open_gain > 10.0 * closed_gain,
+            "under an open canopy the understory should be most of the fuel: open {open_gain}, closed {closed_gain}"
+        );
     }
 }

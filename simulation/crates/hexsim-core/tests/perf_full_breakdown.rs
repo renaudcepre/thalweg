@@ -1,6 +1,6 @@
 //! Per-phase breakdown of the REAL tick (`Simulation::step_hour`), measured
-//! by the embedded instrumentation (`phase_timing`), not a mirror of the
-//! tick like `perf_phase_breakdown`: all Tier 1 AND Tier 3 phases
+//! by the embedded instrumentation (`phase_timing`), never a mirror of the
+//! tick (the former `perf_phase_breakdown` drifted twice): all Tier 1 AND Tier 3 phases
 //! (vegetation, fire, lakes, EMA, normals, history) are covered, at
 //! production cadences.
 //!
@@ -85,6 +85,30 @@ fn print_window(label: &str, sim: &Simulation, wall_s: f64) {
         1000.0 * total / hours_f,
         1000.0 * total / (hours_f / 24.0)
     );
+    eprintln!("  -- atmosphere sub-phases (% of the atmosphere row above) --");
+    for (name, s) in t.atmo_rows() {
+        let pct = if t.atmosphere > 0.0 {
+            100.0 * s / t.atmosphere
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {name:<27} {:>8.3} ms/h-tick  ({pct:>5.1} %)",
+            1000.0 * s / hours_f
+        );
+    }
+    eprintln!("  -- hydro sub-phases (% of the hydro row above) --");
+    for (name, s) in t.hydro_rows() {
+        let pct = if t.hydro > 0.0 {
+            100.0 * s / t.hydro
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {name:<27} {:>8.3} ms/h-tick  ({pct:>5.1} %)",
+            1000.0 * s / hours_f
+        );
+    }
     let days = hours_f / 24.0;
     eprintln!(
         "  wall {wall_s:.2} s for {days:.0} d -> {:.1} simulated days/s (glue {:.1} %)",

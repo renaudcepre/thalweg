@@ -31,7 +31,15 @@ fn single_dry_cell() -> Simulation {
     Simulation::new(
         grid,
         HydroParams::default(),
-        AtmosphereParams::default(),
+        // #63/#146: pins the THERMAL diurnal wave, not the weather
+        // regime. A wet episode returns sky water uniformly to every
+        // cell regardless of local sources, which seeds cloud where this
+        // fixture wants none and shifts the radiative night-time trough
+        // — needs the regime (on by default since 2026-09-06) off.
+        AtmosphereParams {
+            regime_enabled: 0.0,
+            ..AtmosphereParams::default()
+        },
         GroundwaterParams::default(),
         SnowParams::default(),
         TemperatureParams::default(),

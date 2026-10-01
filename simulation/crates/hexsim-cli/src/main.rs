@@ -169,11 +169,18 @@ async fn main() -> anyhow::Result<()> {
         "grille generee"
     );
 
+    let dem_loaded = boot.dem_override_path.is_some();
     if let Some(path) = &boot.dem_override_path {
         load_dem_override(path, &mut grid, &terrain_params)?;
     }
 
-    let world = World::from_grid(grid, boot.radius, terrain_params, build_info());
+    let mut world = World::from_grid(grid, boot.radius, terrain_params, build_info());
+    // A DEM survey is not something the procedural generator can
+    // regenerate at another size: `reset` must refuse to change the
+    // radius of a world loaded this way (#L6).
+    if dem_loaded {
+        world.lock_to_dem();
+    }
     let (tx, _) = broadcast::channel(16);
 
     let state = Arc::new(AppState {
@@ -445,7 +452,9 @@ async fn handle_command(
 /// `set_param`.
 fn log_started(client_id: u64, cmd: &Command) {
     match cmd {
-        Command::Reset { seed } => info!(client_id, seed = ?seed, "reset"),
+        Command::Reset { seed, radius } => {
+            info!(client_id, seed = ?seed, radius = ?radius, "reset");
+        }
         Command::Step { n, hourly } => {
             if *hourly {
                 info!(client_id, n, "step_hour");

@@ -15,6 +15,9 @@ impl Simulation {
         if key.starts_with("erosion.") {
             return self.set_erosion_param(key, value);
         }
+        if key.starts_with("groundwater.") {
+            return self.set_groundwater_param(key, value);
+        }
         match key {
             // Hydrology
             "hydro.flow_rate" => self.hydro_params.flow_rate = value,
@@ -23,16 +26,6 @@ impl Simulation {
             // Lake leveling (#106)
             "lake.enabled" => self.lake_params.enabled = value != 0.0,
             "lake.min_surplus_mm" => self.lake_params.min_surplus_mm = value,
-            // Groundwater
-            "groundwater.infiltration_rate" => {
-                self.groundwater_params.infiltration_rate = value;
-            }
-            "groundwater.diffusion_rate" => self.groundwater_params.diffusion_rate = value,
-            "groundwater.max_capacity" => self.groundwater_params.max_capacity = value,
-            "groundwater.baseflow_coef" => self.groundwater_params.baseflow_coef = value,
-            "groundwater.field_capacity_frac" => {
-                self.groundwater_params.field_capacity_frac = value;
-            }
             // Snow
             "snow.snow_albedo_dry" => self.snow_params.snow_albedo_dry = value,
             "snow.snow_albedo_melt" => self.snow_params.snow_albedo_melt = value,
@@ -119,6 +112,31 @@ impl Simulation {
         true
     }
 
+    /// `groundwater.*` keys of [`Self::update_param`]: root zone and deep
+    /// aquifer (#107).
+    fn set_groundwater_param(&mut self, key: &str, value: f32) -> bool {
+        let params = &mut self.groundwater_params;
+        match key {
+            "groundwater.saturated_conductivity_mm_per_day" => {
+                params.saturated_conductivity_mm_per_day = value;
+            }
+            "groundwater.diffusion_rate" => params.diffusion_rate = value,
+            "groundwater.max_capacity" => params.max_capacity = value,
+            "groundwater.baseflow_coef" => params.baseflow_coef = value,
+            "groundwater.field_capacity_frac" => {
+                params.field_capacity_frac = value;
+            }
+            "groundwater.percolation_rate" => params.percolation_rate = value,
+            "groundwater.aquifer_thickness_m" => params.aquifer_thickness_m = value,
+            "groundwater.specific_yield" => params.specific_yield = value,
+            "groundwater.aquifer_conductivity_m_per_day" => {
+                params.aquifer_conductivity_m_per_day = value;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Applies an `erosion.*` parameter (#105). Extracted from `update_param`
     /// to keep it readable (like `set_atmosphere_param`).
     fn set_erosion_param(&mut self, key: &str, value: f32) -> bool {
@@ -146,12 +164,10 @@ impl Simulation {
             "atmosphere.condensation_rate" => {
                 self.atmosphere_params.condensation_rate = value;
             }
-            "atmosphere.cloud_evap_hr_threshold" => {
-                self.atmosphere_params.cloud_evap_hr_threshold = value;
-            }
-            "atmosphere.cloud_evap_rate" => {
-                self.atmosphere_params.cloud_evap_rate = value;
-            }
+            // #63 L2b: `atmosphere.cloud_evap_hr_threshold` and
+            // `atmosphere.cloud_evap_rate` are gone with the params they
+            // set; setting either now returns the usual unknown-key
+            // error rather than silently doing nothing.
             "atmosphere.kk2000_droplet_count" => {
                 self.atmosphere_params.kk2000_droplet_count = value;
             }
@@ -160,6 +176,9 @@ impl Simulation {
             }
             "atmosphere.precip_neighbor_share" => {
                 self.atmosphere_params.precip_neighbor_share = value;
+            }
+            "atmosphere.precip_spread_radius" => {
+                self.atmosphere_params.precip_spread_radius = value;
             }
             "atmosphere.max_precip_per_tick" => {
                 self.atmosphere_params.max_precip_per_tick = value;
@@ -186,6 +205,25 @@ impl Simulation {
             }
             "atmosphere.orographic_lift_coef" => {
                 self.atmosphere_params.orographic_lift_coef = value;
+            }
+            // Imposed weather regime (#63). All hot-tunable: the pass
+            // reads them fresh every hour and the chain every midnight,
+            // nothing is frozen at init.
+            "atmosphere.regime_enabled" => self.atmosphere_params.regime_enabled = value,
+            "atmosphere.regime_dry_mean_days" => {
+                self.atmosphere_params.regime_dry_mean_days = value;
+            }
+            "atmosphere.regime_wet_mean_days" => {
+                self.atmosphere_params.regime_wet_mean_days = value;
+            }
+            "atmosphere.regime_dry_rh_target" => {
+                self.atmosphere_params.regime_dry_rh_target = value;
+            }
+            "atmosphere.regime_export_hours" => {
+                self.atmosphere_params.regime_export_hours = value;
+            }
+            "atmosphere.regime_return_hours" => {
+                self.atmosphere_params.regime_return_hours = value;
             }
             _ => return false,
         }

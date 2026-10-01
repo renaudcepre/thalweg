@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use common::build_prod_sim;
 use hexsim_core::coord::HexCoord;
 use hexsim_core::hydro::total_water;
-use hexsim_core::snow::total_snow;
+use hexsim_core::snow::total_frozen;
 
 const RADIUS: i32 = 30;
 const YEAR: u64 = 365;
@@ -89,7 +89,7 @@ fn run_drift(seed: u32) -> DriftReport {
     for _ in 0..WARMUP_TICKS {
         sim.step();
     }
-    let snow_total_after_warmup = total_snow(sim.grid());
+    let snow_total_after_warmup = total_frozen(sim.grid());
     let surface_water_after_warmup = total_water(sim.grid());
 
     // Cells still above the "perennial snow" threshold on ALL daily
@@ -114,7 +114,7 @@ fn run_drift(seed: u32) -> DriftReport {
         }
     }
 
-    let snow_total_end = total_snow(sim.grid());
+    let snow_total_end = total_frozen(sim.grid());
     let surface_water_end = total_water(sim.grid());
     let max_snow_mm = sim
         .grid()

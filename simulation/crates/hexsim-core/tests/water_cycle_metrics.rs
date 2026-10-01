@@ -1,6 +1,6 @@
 use hexsim_core::atmosphere::{
-    AtmoForcing, AtmosphereParams, smooth_upper_air_mean_t, step_atmosphere, surface_means,
-    total_humidity,
+    AtmoForcing, AtmoState, AtmosphereParams, smooth_upper_air_mean_t, step_atmosphere,
+    surface_means, total_humidity,
 };
 use hexsim_core::grid::HexGrid;
 use hexsim_core::groundwater::{GroundwaterParams, step_groundwater, total_groundwater};
@@ -17,7 +17,7 @@ fn water_cycle_conservation() {
 
     let atmo = AtmosphereParams::default();
     let temp = TemperatureParams::default();
-    let mut precip_gate_open = false;
+    let mut atmo_state = AtmoState::default();
     let gw = GroundwaterParams::default();
     // Defaults : terrarium strictement ferme (conservation stricte garantie).
     let hydro = HydroParams::default();
@@ -50,10 +50,15 @@ fn water_cycle_conservation() {
                 wind_params: &wp,
                 wind_field: &wf,
                 wind_mag: &wind_mag,
+                transpiration_cover: None,
+                synoptic_wind: None,
                 hour_tick: tick,
                 upper_air_mean_t,
+                mean_elevation: surface_means(&current).1,
+                moist_coarse: false,
+                track_cloud_transfer: false,
             },
-            &mut precip_gate_open,
+            &mut atmo_state,
         );
         std::mem::swap(&mut current, &mut next);
 

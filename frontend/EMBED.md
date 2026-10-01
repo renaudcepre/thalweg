@@ -204,7 +204,7 @@ await idb.put("hexsim", buf);          // IndexedDB: localStorage is too small
 const stocke = await idb.get("hexsim");
 if (stocke) {
   try { await sim.load(stocke); }
-  catch { /* incompatible: keep the shipped world */ }
+  catch { /* incompatible: keep the fresh world */ }
 }
 ```
 
@@ -226,7 +226,7 @@ an integer format version, and the version of the engine that wrote it.
 `load` checks the first two and **cleanly rejects** a format version that
 isn't its own: no migration, no inconsistent world. The host therefore has
 nothing to compare before calling: it stores, it retries on return, it
-falls back to the shipped world if that's rejected. It's the simplest of
+falls back to the starting world if that's rejected. It's the simplest of
 the three behaviors considered, and it's the one that's implemented.
 
 A rejected `load` leaves the current world **intact**: the simulation
@@ -255,10 +255,11 @@ there's nothing to gain doing it on the wasm side.
 controlled by the host, which already knows them; the checkpoint carries
 none of it.
 
-**A host that restores its own state** can open the iframe on
-`?world=neuf`: the shipped 1.9 MB world is then not downloaded just to be
-overwritten right away. It's only an optimization: without this parameter,
-a `load()` from the host still wins last, regardless of arrival order.
+**A host that restores its own state** has nothing to add since v0.14.0:
+no shipped world is downloaded by default. `?world=neuf`, the parameter
+that used to skip it, is still accepted and changes nothing. A stored
+world keeps its own radius: a visitor saved under v0.13.0 gets their
+radius-45 world back, which is the point of restoring it.
 
 ### Startup
 
@@ -273,11 +274,16 @@ where a `play()` passed through the queue was lost (#143).
 
 ### The starting world
 
-An embed doesn't start on a fresh world. It loads `worlds/aged.ckptz`,
-a **42-year** world shipped in the archive: forests established, lakes
-filled, forty-year-old trees. A fresh world is a bare board, and the three
-minutes of computation it takes to grow out of that, nobody waits for that
-on a page.
+**Since v0.14.0, an embed starts on a fresh world, radius 70** (~14 900
+cells, seed 42, or a random seed under `chrome=minimal`). A fresh world is
+no longer a bare board: it opens on its climatological state, lakes in the
+hollows, snow on the heights, forests seeded at equilibrium with trees of
+every age. Nothing is downloaded besides the engine, and the first `tick`
+is the world's real state.
+
+Up to v0.13.0 the embed loaded `worlds/aged.ckptz`, a 42-year world at
+radius 45 written by engine v0.10.0. The file is still in the archive and
+`?world=aged` loads it, with the behavior below.
 
 The file weighs 1.9 MB (50 MB decompressed). It's loaded after the
 connection, so the scene shows the fresh world before switching over:
@@ -302,9 +308,9 @@ this: static servers that guess encoding do it based on `.gz`, and none
 know `.ckptz`. If you still see that `TypeError`, this is the lead to
 follow, and the page spells it out right below the error.
 
-`?world=neuf` doesn't import any shipped world. `?world=<nom>` loads
-`worlds/<nom>.ckptz` instead, if you ship others of your own: also
-gzipped, and named with the same extension for the same reason.
+`?world=<nom>` loads `worlds/<nom>.ckptz`, `aged` or others of your own:
+also gzipped, and named with the same extension for the same reason.
+`?world=neuf` imports nothing, which is the default since v0.14.0.
 
 `neuf` means "import nothing", not "reset": for an embed, which simulates
 inside the tab, that amounts to the same thing, since it does start from

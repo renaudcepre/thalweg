@@ -35,21 +35,35 @@ pub struct AtmosphereParams {
     /// Hysteresis: opens at `gate`, closes at `gate × 0.75`.
     /// At 0, disabled (each cell precipitates on its own saturation).
     pub global_precip_gate: f32,
-    /// Floor applied to `humidity_upper` at simulation startup: each cell
-    /// starts with at least this amount of altitude vapour.
-    /// Closed terrarium = no external input, so the cycle must be primed.
-    /// 0.15 = median value matching the old `boundary_humidity`
-    /// (0.30 with a 0.25 seasonal amplitude).
+    /// Relative humidity floor applied to `humidity_upper` at simulation
+    /// startup: each cell starts with at least this fraction of the upper
+    /// layer's saturation at its own upper-air temperature
+    /// (`saturation_upper(upper_air_temperature(..))`, the January profile
+    /// of a fresh world). Closed terrarium = no external input, so the
+    /// cycle must be primed; a profile by altitude and season instead of
+    /// the former uniform 10 mm (#152), which was a summer plain's vapour
+    /// over every winter summit. 0.6 = the free troposphere's mean
+    /// relative humidity over temperate land (Peixoto & Oort 1996, J.
+    /// Climate 9: 50-70 % in the lower troposphere). 0 disables the floor.
     pub initial_humidity_floor: f32,
-    /// Fraction per metre of positive elevation gain of the `Surface`
-    /// advection flow diverted to `humidity_upper` of the destination cell.
-    /// Physical model: humid air pushed by wind against relief is forced
-    /// to rise, and the vapour condenses at the relief's altitude. Without
-    /// this, thermal breezes in a closed terrarium push vapour from the
-    /// summits toward the plains (thermal convection), producing a
-    /// permanent rain shadow over relief. Cap of 0.80 conversion per cell.
-    /// Example: coef=0.005, `delta_elev=100m` → 50% of the flow goes to
-    /// upper.
+    /// Per metre of positive elevation gain, per day (divided by
+    /// `TICKS_PER_DAY` by `scale_atmosphere_for_hourly_tick` before use).
+    /// Read by the two orographic paths, which share the physics "vapour
+    /// forced up a slope reaches the upper layer" but not the geometry:
+    ///
+    /// - the wind-driven one, `advection::fill_lift_outflow`: fraction of
+    ///   the `Surface` advection flow diverted to `humidity_upper` of the
+    ///   destination cell, `clamp(coef × Δz, 0.0, 0.80)`;
+    /// - the isotropic pump, `uplift::oro_pump_rate` (#156): inverse
+    ///   lifting timescale per metre of convergent relief,
+    ///   `rate = 1 − exp(−coef × Σ Δz⁺)`. Read its doc for the unit
+    ///   breakdown — the coefficient is the group `U_slope·dt/(H·L)` and
+    ///   the shipped default matches an upslope venting speed of about
+    ///   0.11 m/s.
+    ///
+    /// Without either, thermal breezes in a closed terrarium push vapour
+    /// from the summits toward the plains, producing a permanent rain
+    /// shadow over relief.
     pub orographic_lift_coef: f32,
 
     // Phase 6 (#29): `saturation_at_zero` and `saturation_doubling_celsius`
@@ -64,12 +78,13 @@ pub struct AtmosphereParams {
     /// Anchored to Clausius-Clapeyron (#63 P4E3): condensation kicks in
     /// at saturation, with no intermediate dimensionless RH threshold.
     pub condensation_rate: f32,
-    /// RH below which droplets evaporate back into vapour.
-    pub cloud_evap_hr_threshold: f32,
-    /// Fraction of `cloud_water` that evaporates back to `humidity_upper`
-    /// per tick when RH < `cloud_evap_hr_threshold`. Slower than
-    /// condensation (clouds persist), analogous to cloud half-life times.
-    pub cloud_evap_rate: f32,
+    // #63 L2b: `cloud_evap_hr_threshold` (0.4) and `cloud_evap_rate`
+    // (0.10/day) removed. The reverse transition is a saturation
+    // adjustment bounded by the layer's own deficit, so it has no
+    // parameter left to carry — see
+    // `condensation::saturation_adjustment_transfer`. Old checkpoints and
+    // params files still carrying the two keys load fine: this struct
+    // does not `deny_unknown_fields`, serde drops them.
     /// Cloud droplet concentration `N_c` (cm^-3) for the Khairoutdinov &
     /// Kogan 2000 autoconversion model. Negative exponent (-1.79): the
     /// more droplets there are, the smaller they are, the longer they
@@ -104,13 +119,69 @@ pub struct AtmosphereParams {
     /// physics (Courant ≫ 1 at 1 km/hourly tick); parity is a first brick,
     /// not the ceiling.
     pub cloud_advection_rate: f32,
-    /// Fraction of precipitation that falls on neighbouring cells rather
-    /// than the source cell. Models the spread of rain by turbulent air:
-    /// a drop falls beneath the cloud but the lateral offset is on the
-    /// order of the hex size (~1 km). At 0: rain falls right under the
-    /// cloud. At 1: all rain goes to neighbours (absurd). 0.2-0.4:
-    /// realistic spread that breaks the "checkerboard" look of rain.
+    /// Fraction of precipitation that leaves the source cell, spread with
+    /// a gradient decreasing over `precip_spread_radius` hexes rather
+    /// than landing entirely under the cloud. Models the lateral drift of
+    /// falling drops in turbulent, wind-carried air.
+    ///
+    /// **Units and derivation (2026-09-06, floor not physics):** a
+    /// raindrop's terminal velocity is 4-9 m/s (Gunn & Kinzer 1949;
+    /// drizzle ~0.5 mm: ~2 m/s; snow: ~1 m/s). Falling from
+    /// `upper_layer_altitude_m` = 1500 m takes 3-6 minutes (snow: ~25
+    /// min), during which the upper-level wind (2-8 m/s here) carries the
+    /// drop 0.4-3 km sideways; a shower cell itself spans 1-10 km (Byers
+    /// & Braham 1949). At the map's 130 m hex spacing (fixed 2026-07-09)
+    /// that is a footprint 3 to 25 hexes in radius — `precip_spread_radius`
+    /// below picks a point in that range, not the physics itself. This
+    /// doc used to read "the lateral offset is on the order of the hex
+    /// size (~1 km)": stale since the spacing dropped from ~1 km to
+    /// 130 m, corrected here.
+    ///
+    /// At 0: rain falls right under the cloud regardless of
+    /// `precip_spread_radius`. At 1: all rain leaves the source (absurd:
+    /// nothing rains under the cloud that formed it). 0.2-0.4: realistic
+    /// spread that breaks the "checkerboard" look of rain. Orthogonal to
+    /// the radius below: this is *what fraction* leaves the source,
+    /// `precip_spread_radius` is *how far* it is allowed to travel before
+    /// landing.
     pub precip_neighbor_share: f32,
+    /// Radius (hexes) of the footprint a cloud rains onto: `1 −
+    /// precip_neighbor_share` stays at the source, the rest spreads with
+    /// a gradient decreasing with hex distance out to this many rings,
+    /// instead of landing entirely on the source and its 6 immediate
+    /// neighbours (the historical, and still the `= 1`, footprint).
+    /// Rounded to the nearest integer number of diffusion passes by
+    /// `precipitation::step_precipitation_into` (`precip_spread_passes`);
+    /// `1` reproduces the legacy single-ring footprint bit for bit (see
+    /// `precipitation::tests::radius_one_is_bit_identical_to_legacy`).
+    ///
+    /// See `precip_neighbor_share` above for the physical derivation of
+    /// the 3-25 hex range; `3` (390 m) is the cheap, conservative end of
+    /// it, sized to fix the "salt and pepper" rain pattern the owner
+    /// measured on a live r120 world in July: ~140 rained-on islets per
+    /// hour, the biggest averaging 19 cells, 47% of them 1-2 cells
+    /// (`just rain-pattern`, threshold 0.1 mm/h) — the owner's
+    /// screenshots show the same thing, isolated 1-7 hex clusters. Each
+    /// additional ring costs one more full diffusion pass over the grid
+    /// (the `atmo_precipitation` perf bucket): measured cost is in
+    /// the project journal's entry for this change, gated at at most ×2 of the
+    /// pre-change bucket by `just perf-phases`.
+    ///
+    /// Not physically the same column as the source: KK2000 and the
+    /// rain/snow phase test both still run once, at the source cell, as
+    /// before — a cell 3 rings downhill or in a different microclimate
+    /// receives the source's phase and amount, not its own. Left as a
+    /// simplification (documented here, not changed by this radius).
+    ///
+    /// `#[serde(default = "default_precip_spread_radius_legacy")]`
+    /// (`1.0`), not the new `3.0`, for the same reason as
+    /// `regime_enabled`'s bare `#[serde(default)]` above: a checkpoint or
+    /// params file predating this radius has no opinion on it and must
+    /// not wake up with a wider footprint it never asked for. Only a
+    /// freshly generated world (`AtmosphereParams::default()` below) gets
+    /// `3.0`.
+    #[serde(default = "default_precip_spread_radius_legacy")]
+    pub precip_spread_radius: f32,
     /// Maximum precipitation per tick (units): physical limit of drop
     /// microphysics, fall speed plus max density.
     /// A cell heavily loaded with `cloud_water` cannot dump it all in one
@@ -156,10 +227,52 @@ pub struct AtmosphereParams {
     /// anticyclone anchors on the cold massif), hence the `v·∇z` term.
     /// Terrarium orders of magnitude: `H·conv` ~ ±0.3 m/s (conv ±2e-4 s⁻¹ ×
     /// H 1500 m), `v·∇z` ~ 1 m/s (5 m/s × 0.2 slope).
-    /// **0.0 = trigger inactive** (precip unchanged); default activation
-    /// awaits Phase 4 calibration. Requires synoptic wind (param
-    /// `synoptic.enabled`, hardcoded ON by default) for coherent
-    /// convergence zones (disproved on noise-wind, #69: smear).
+    /// **0.0 = trigger inactive** (precip unchanged), and inactive is
+    /// where it stays. Requires synoptic wind (param `synoptic.enabled`,
+    /// hardcoded ON by default) for coherent convergence zones (disproved
+    /// on noise-wind, #69: smear).
+    ///
+    /// # Why it is off, and what it would take to turn it on (#110)
+    ///
+    /// Not "awaiting calibration", which this doc claimed until
+    /// 2026-09-07: measured broken on 2026-07-15 by `diag_updraft_field`
+    /// and ruled unsalvageable *by re-calibration*, which is a different
+    /// verdict. The numbers: `w` spans −225 to +314 m/s (p99 +143,
+    /// std 47.6) where the design above reasons about ±1 m/s, so the
+    /// implementation overshoots its own target by 50-300×; and its
+    /// altitude signature is inverted, plains at +10.1 (factor saturated
+    /// to 1, so plain drizzle is untouchable) against −82.6 over the
+    /// summits, which is subsidence where orographic lift belongs. On top
+    /// of that it is structurally redundant: the rain-weighted mean factor
+    /// holds near 0.9 whatever `w_ref` does, because the cells that rain
+    /// are already the cells where `w > 0` — the cloud encodes that the
+    /// air rose. No value of this parameter fixes that.
+    ///
+    /// Root cause: `−∇·v` by finite differences over ~130 m cells, fed a
+    /// wind noisy at the cell scale (deflection, breeze), measures grid
+    /// noise rather than synoptic convergence; × `h_column` = 1500 m gives
+    /// the absurd magnitudes.
+    ///
+    /// # The estimator is repaired (2026-09-30), the trigger stays off
+    ///
+    /// `fill_updraft_into` now derives the **ambient** wind, the synoptic
+    /// base interpolated from the coarse mesh (`AtmoForcing::synoptic_wind`,
+    /// smooth at `L_d`), for the convergence AND the barrier lift, never
+    /// the deflected composite. Measured by `diag_updraft_field` (r30,
+    /// seed 42, 2 years sampled), before → after, same day, same base:
+    /// `w` −118 / +147 m/s → **−3.6 / +3.2 m/s**, std 23.5 → **1.10**,
+    /// mean −1.3 → 0.003; band means +5.6 m/s over the plains and −38
+    /// over the summits → **−0.015 over the plains, +0.117 over the
+    /// summits**, the right way up. The ±0.3-1 m/s orders of magnitude
+    /// above are the ones the field now has. Same result as the orphaned
+    /// July branch `fix/synoptic-zero-fronts` (±3.6, std 1.10), redone on
+    /// the current structure rather than merged.
+    ///
+    /// Still `0.0` by default: a sane `w` is the prerequisite, not the
+    /// verdict. What the trigger does to the climate and to cloud travel
+    /// is measured (`diag_cloud_travel`, the r30 bench) and written in
+    /// the JOURNAL of 2026-09-30 and on #110; the flip is the owner's
+    /// call on those numbers.
     pub updraft_ref_ms: f32,
     /// Floor `[0,1]` of the precip factor in subsidence zones (ascent
     /// trigger): fraction of efficiency retained with no ascent.
@@ -174,6 +287,145 @@ pub struct AtmosphereParams {
     /// complement to the spatial convergence trigger for the traveling
     /// storage phase.
     pub precip_crit_mm: f32,
+
+    // --- Imposed weather regime (#63), boundary condition, ON by default ---
+    /// Master switch of the imposed synoptic weather regime
+    /// (`atmosphere::regime`), dimensionless: `0` = off (the pass is
+    /// skipped entirely and the build is bit-identical to one without
+    /// it), anything else = on. Same "0 disables" shape as
+    /// `updraft_ref_ms` above rather than a `bool`, so the whole struct
+    /// stays f32 and the runtime key `atmosphere.regime_enabled` behaves
+    /// like every other one.
+    ///
+    /// The regime is a boundary condition, not a phenomenon internal to a
+    /// cell: the synoptic scale (the weather systems that decide whether a
+    /// region is under a dry high or a moist frontal passage) lives at
+    /// hundreds of kilometres, well outside the ~16 km box the map covers,
+    /// exactly like the sun's position is a forcing the map cannot compute
+    /// from its own cells. Without it, every cell resolves its own
+    /// saturation locally and the map never runs dry all at once, because
+    /// nothing sub-synoptic desaturates every column together. A dry spell
+    /// is large-scale subsidence: descending, adiabatically warmed air that
+    /// suppresses convection over the whole box for days, not a local
+    /// depletion any cell-level rule can produce on its own.
+    ///
+    /// **Default 1.0 (flipped 2026-09-06, #63/#146).** Measured on 3 seeds
+    /// (r30, 730 days, combined with the L2b saturation-adjustment cloud
+    /// evaporation it now ships alongside): with the regime ON, 131 / 90 /
+    /// 239 fully rain-free days per 2 years (0 with it off), the wettest
+    /// cell drops from ~355 to 169-240 rain days/year, and
+    /// `summer/winter`, lapse rate and water-budget drift all hold or
+    /// improve. With the regime off, the new evaporation alone
+    /// concentrates rain on relief and dries the plains instead (56 → 26
+    /// rain days/yr), so the coherent package is evaporation *and* regime
+    /// together, not evaporation alone. Get the old always-saturating,
+    /// stationary atmosphere back with `just param
+    /// "atmosphere.regime_enabled" 0`.
+    ///
+    /// `#[serde(default)]` stays bare (`f32::default()` = 0.0), not the
+    /// new 1.0: a checkpoint or params file predating the regime (no
+    /// `regime_enabled` key at all) is data from before the mechanism
+    /// existed and should not wake up under it uninvited. Only a freshly
+    /// generated world (`AtmosphereParams::default()` below) gets the new
+    /// default; anything old that already carries the key keeps whatever
+    /// value it was saved with.
+    #[serde(default)]
+    pub regime_enabled: f32,
+    /// Mean length (days) of a dry episode of the two-state Markov chain,
+    /// i.e. `p(dry→wet) = 1 / regime_dry_mean_days` evaluated once per
+    /// simulated day. With `regime_wet_mean_days` below, the stationary
+    /// wet fraction is `(1/dry) / (1/dry + 1/wet)` = 0.31, i.e. ≈112
+    /// days a year with a moist air mass over the box.
+    ///
+    /// 4.5 d is chosen to land that wet fraction on the ~80-110 rainy
+    /// days a year of a lowland Rhône-valley climate (the Drôme the map
+    /// is calibrated on). **Not verified against the published
+    /// Météo-France 1991-2020 normals in this session** — the figure is
+    /// an order of magnitude taken from the design note (JOURNAL
+    /// 2026-09-03), not a sourced constant. Re-anchor it on the real
+    /// normals before the lever is ever turned on by default.
+    #[serde(default = "default_regime_dry_mean_days")]
+    pub regime_dry_mean_days: f32,
+    /// Mean length (days) of a wet episode, `p(wet→dry) = 1 /
+    /// regime_wet_mean_days`. 2.0 d = the passage of one frontal system,
+    /// same caveat on the source as `regime_dry_mean_days`.
+    #[serde(default = "default_regime_wet_mean_days")]
+    pub regime_wet_mean_days: f32,
+    /// Relative humidity (dimensionless, 0-1) the upper layer relaxes
+    /// toward during a dry episode. A physical statement about the air a
+    /// large-scale subsidence brings down: free-tropospheric air that has
+    /// descended is dry, RH 0.3-0.6 is its usual range (Sherwood et al.
+    /// 2010, *Tropospheric water vapor, convection and climate*, Rev.
+    /// Geophys. 48, on subsidence drying). 0.5 = the middle of it. Kept
+    /// at 0.5 by #63 L2b: the ablation that produced rain-free days used
+    /// 0.25, and free-tropospheric subsidence really is drier than 0.5
+    /// on the dry branches, but no radiosonde climatology could be
+    /// sourced offline in that session to justify a specific number, and
+    /// the value that makes the bench prettiest is not a source.
+    ///
+    /// The coupling with the vapour ↔ droplet transition inverted at
+    /// L2b. It used to be inert: 0.5 sat above the old
+    /// `cloud_evap_hr_threshold` (0.4), so the export left the droplets
+    /// alone and they had to rain out or travel. With the saturation
+    /// adjustment that replaced that threshold, an export down to
+    /// `0.5 × sat` opens a deficit of the same `0.5 × sat`, and the
+    /// transition pass that runs immediately after evaporates droplets
+    /// straight into it. Lowering this target now dissolves clouds
+    /// faster as well as drying the vapour — one number, two effects,
+    /// which is a reason to source it rather than tune it.
+    #[serde(default = "default_regime_dry_rh_target")]
+    pub regime_dry_rh_target: f32,
+    /// Time constant τ (hours) of the first-order export of the vapour
+    /// surplus toward the sky reservoir during a dry episode: one hourly
+    /// step moves `excess × (1 − exp(−1 h / τ))`. 6 h = the order of
+    /// magnitude of a subsidence drying out a 1500 m column at the
+    /// ~1 cm/s typical of large-scale descent.
+    #[serde(default = "default_regime_export_hours")]
+    pub regime_export_hours: f32,
+    /// Time constant τ (hours) of the return of the sky reservoir to the
+    /// map during a wet episode, same first-order form. 12 h = a moist
+    /// air mass takes about half a day to fill the box it advects into.
+    #[serde(default = "default_regime_return_hours")]
+    pub regime_return_hours: f32,
+}
+
+/// `serde(default)` value for [`AtmosphereParams::regime_dry_mean_days`]:
+/// a checkpoint or a params file predating the weather regime loads the
+/// shipped default rather than being refused (same precedent as
+/// `TemperatureParams::terrain_insolation_factor`). Harmless whatever the
+/// value: a file that old is also missing `regime_enabled`, which keeps
+/// its own bare `#[serde(default)]` of 0 (off) for exactly that reason.
+fn default_regime_dry_mean_days() -> f32 {
+    4.5
+}
+
+/// See [`default_regime_dry_mean_days`].
+fn default_regime_wet_mean_days() -> f32 {
+    2.0
+}
+
+/// See [`default_regime_dry_mean_days`].
+fn default_regime_dry_rh_target() -> f32 {
+    0.5
+}
+
+/// See [`default_regime_dry_mean_days`].
+fn default_regime_export_hours() -> f32 {
+    6.0
+}
+
+/// See [`default_regime_dry_mean_days`].
+fn default_regime_return_hours() -> f32 {
+    12.0
+}
+
+/// `serde(default)` value for
+/// [`AtmosphereParams::precip_spread_radius`]: the pre-existing single-ring
+/// footprint (`1` = today's behavior, see `precip_spread_radius`'s doc), so
+/// a params file or checkpoint predating this radius keeps the footprint
+/// it always had rather than jumping to the new default of `3`.
+fn default_precip_spread_radius_legacy() -> f32 {
+    1.0
 }
 
 impl Default for AtmosphereParams {
@@ -207,17 +459,26 @@ impl Default for AtmosphereParams {
             // global gate created artificially long rain/dry cycles
             // (3 months of continuous rain).
             global_precip_gate: 0.0,
-            // Phase 6 (#29): recalibrated 30 → 10 mm. With the new Tetens
-            // curve, PW_sat(15°C) ≈ 19 mm. Starting at 10 mm gives an
-            // initial RH ≈ 0.5, consistent with the old ratio
-            // (RH_init ≈ 0.6).
-            initial_humidity_floor: 10.0,
-            // 0.05: 80% cap reached over 16 m of elevation gain. Very
-            // strong by design: isolated summits (>1000m) are far from
-            // humidity sources (lowland lakes) and cascading propagation
-            // must cross several neighbour levels before arriving.
-            // Lower it (0.005-0.02) if rainfall becomes too concentrated
-            // on relief.
+            // A relative humidity since #152 (it was 10 mm, i.e. RH ≈ 0.5
+            // at 15 °C and ×2 saturation over a winter summit): 0.6 of the
+            // layer's saturation at its own temperature, ~1 mm per cell in
+            // a January world, the order the engine holds by itself by its
+            // sixth January (0.6-1.1 mm per cell, 2026-10-01).
+            initial_humidity_floor: 0.6,
+            // 0.05 /m/day, i.e. 0.00208 /m per hourly tick. Strong by
+            // design: isolated summits (>1000 m) are far from humidity
+            // sources (lowland lakes) and cascading propagation must
+            // cross several neighbour levels before arriving. Its two
+            // consumers read it differently, see the field's doc.
+            // For the isotropic pump it is `U_slope·dt/(H·L)`, an upslope
+            // venting speed of ~0.11 m/s at H = 1500 m and L = 130 m; on
+            // the median hillside of a radius-30 map (Σ Δz⁺ ≈ 190 m) the
+            // pump exports ~33 % of the surface layer per hour.
+            // Sensitivity re-measured at x3 and /3 on 3 seeds when the
+            // 0.30 cap was removed (#156): mountain rain days move
+            // monotonically, 66 -> 92 -> 107 -> 264 days/year above
+            // 1500 m on seed 42. Lower it (0.005-0.02) if rainfall
+            // becomes too concentrated on relief.
             orographic_lift_coef: 0.05,
             // Phase 6 (#29): `saturation_at_zero` + `saturation_doubling_celsius`
             // removed. Saturation now comes from physical Tetens,
@@ -247,11 +508,6 @@ impl Default for AtmosphereParams {
             // is mandatory, anchored this time to cloud microphysics
             // rather than empirical behaviour.
             condensation_rate: 24.0,
-            // Slower cloud evaporation: a cloud persists several ticks
-            // even after the surrounding air has dried. Half-life ~7
-            // ticks at rate 0.10 (1 - 0.9^7 ≈ 0.52).
-            cloud_evap_hr_threshold: 0.4,
-            cloud_evap_rate: 0.10,
             // KK2000: N_c = 50 cm^-3, semi-continental regime (real range
             // 30-1000 cm^-3). Phase 4 (bursts): raised from 30 (near-
             // pristine maritime, ex-default) to 50 for temporal
@@ -278,12 +534,18 @@ impl Default for AtmosphereParams {
             // approximation. Lets clouds move across the map instead of
             // staying camped on the condensation zone.
             cloud_advection_rate: 3.0,
-            // 35% of rain falls on neighbours, 65% on the source cell.
-            // Makes showers spatially coherent (a patch of 3-6 rained-on
-            // cells, not an isolated tile). Physically realistic: a real
-            // storm is 5-20 km wide, so it covers several hex cells
-            // (~1 km² each).
+            // 35% of rain leaves the source, spread over
+            // `precip_spread_radius` rings below. Physically realistic: a
+            // real storm is 5-20 km wide (Byers & Braham 1949), so it
+            // covers several hex cells at the map's 130 m spacing.
             precip_neighbor_share: 0.35,
+            // 3 rings (390 m): the cheap, conservative end of the 3-25
+            // hex physical range derived in `precip_neighbor_share`'s
+            // doc. Fixes the "salt and pepper" rain pattern measured on a
+            // live r120 world (2026-09-06): a footprint of ~140 rained-on
+            // islets/hour averaging 19 cells, 47% just 1-2 cells. `1`
+            // reverts to the historical single-ring footprint.
+            precip_spread_radius: 3.0,
             // Phase 3 (#32): rescaled ×200. 4 mm/tick = microphysical cap
             // (equivalent to the old 0.02 * 200). With 1 tick = 1 day,
             // gives a max of 4 mm/day: far more conservative than the
@@ -332,8 +594,19 @@ impl Default for AtmosphereParams {
             // The ascent trigger (`updraft_ref_ms`, ex-design C #69)
             // stays OFF: diagnosed as broken (aberrant `w` field) and
             // redundant; `precip_crit_mm` is the only drizzle→shower
-            // texture lever.
+            // texture lever. The measurement, the root cause and what
+            // turning it on would take are on `updraft_ref_ms` itself.
             precip_crit_mm: 0.15,
+            // Imposed weather regime (#63): ON by default since 2026-09-06
+            // (#146), shipped together with the L2b saturation-adjustment
+            // cloud evaporation. See `regime_enabled` for the measurement
+            // and the one-line way back to the old stationary atmosphere.
+            regime_enabled: 1.0,
+            regime_dry_mean_days: default_regime_dry_mean_days(),
+            regime_wet_mean_days: default_regime_wet_mean_days(),
+            regime_dry_rh_target: default_regime_dry_rh_target(),
+            regime_export_hours: default_regime_export_hours(),
+            regime_return_hours: default_regime_return_hours(),
         }
     }
 }

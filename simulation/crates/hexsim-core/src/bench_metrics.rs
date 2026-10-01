@@ -37,8 +37,10 @@ use crate::groundwater::GroundwaterParams;
 use crate::hydro::HydroParams;
 use crate::simulation::Simulation;
 use crate::snow::SnowParams;
+use crate::species::{SPECIES, SPECIES_COUNT, STRATA, STRATUM_COUNT, SpeciesId, species_index};
 use crate::temperature::TemperatureParams;
 use crate::terrain::{TerrainParams, generate_terrain};
+use crate::vegetation::{canopy_cover, dominant_species, is_open_water, stratum_cover};
 use crate::wind::WindParams;
 
 // ====================================================================
@@ -67,18 +69,30 @@ pub struct AtmosphereParamsOverride {
     pub initial_humidity_floor: Option<f32>,
     pub orographic_lift_coef: Option<f32>,
     pub condensation_rate: Option<f32>,
-    pub cloud_evap_hr_threshold: Option<f32>,
-    pub cloud_evap_rate: Option<f32>,
     pub cloud_diffusion_rate: Option<f32>,
     pub cloud_advection_rate: Option<f32>,
     pub kk2000_droplet_count: Option<f32>,
     pub precip_neighbor_share: Option<f32>,
+    /// Footprint radius (hexes, 2026-09-06 rain-regime work). Engine
+    /// default 3.0 (an empty override benches the shipped physics); `1.0`
+    /// benches the legacy single-ring footprint for an A/B comparison.
+    pub precip_spread_radius: Option<f32>,
     pub max_precip_per_tick: Option<f32>,
     pub fog_condensation_threshold: Option<f32>,
     pub fog_condensation_rate: Option<f32>,
     pub updraft_ref_ms: Option<f32>,
     pub updraft_floor: Option<f32>,
     pub precip_crit_mm: Option<f32>,
+    /// Imposed weather regime (#63), ON by default in the engine since
+    /// 2026-09-06 (#146): an empty override therefore benches the shipped
+    /// physics, and `{"regime_enabled": 0}` benches the old stationary
+    /// atmosphere.
+    pub regime_enabled: Option<f32>,
+    pub regime_dry_mean_days: Option<f32>,
+    pub regime_wet_mean_days: Option<f32>,
+    pub regime_dry_rh_target: Option<f32>,
+    pub regime_export_hours: Option<f32>,
+    pub regime_return_hours: Option<f32>,
 }
 
 impl AtmosphereParamsOverride {
@@ -95,18 +109,23 @@ impl AtmosphereParamsOverride {
             initial_humidity_floor,
             orographic_lift_coef,
             condensation_rate,
-            cloud_evap_hr_threshold,
-            cloud_evap_rate,
             cloud_diffusion_rate,
             cloud_advection_rate,
             kk2000_droplet_count,
             precip_neighbor_share,
+            precip_spread_radius,
             max_precip_per_tick,
             fog_condensation_threshold,
             fog_condensation_rate,
             updraft_ref_ms,
             updraft_floor,
             precip_crit_mm,
+            regime_enabled,
+            regime_dry_mean_days,
+            regime_wet_mean_days,
+            regime_dry_rh_target,
+            regime_export_hours,
+            regime_return_hours,
         );
     }
 }
@@ -200,14 +219,20 @@ impl WindParamsOverride {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroundwaterParamsOverride {
-    pub infiltration_rate: Option<f32>,
+    pub saturated_conductivity_mm_per_day: Option<f32>,
     pub diffusion_rate: Option<f32>,
     pub max_capacity: Option<f32>,
 }
 
 impl GroundwaterParamsOverride {
     pub fn apply(&self, base: &mut GroundwaterParams) {
-        apply_opt!(self, base, infiltration_rate, diffusion_rate, max_capacity);
+        apply_opt!(
+            self,
+            base,
+            saturated_conductivity_mm_per_day,
+            diffusion_rate,
+            max_capacity
+        );
     }
 }
 
@@ -313,21 +338,23 @@ pub fn build_bench_sim(
     radius: i32,
     overrides: &BenchParams,
 ) -> (Simulation, EffectiveParams) {
-    let mut grid = HexGrid::from_radius(radius);
-    generate_terrain(
-        &mut grid,
-        &TerrainParams {
-            seed,
-            ..TerrainParams::default()
-        },
-    );
-
     let mut atmosphere = AtmosphereParams::default();
     overrides.atmosphere.apply(&mut atmosphere);
     let mut hydro = HydroParams::default();
     overrides.hydro.apply(&mut hydro);
     let mut temperature = TemperatureParams::default();
     overrides.temperature.apply(&mut temperature);
+    // One climate target (#152): the world is generated for the
+    // temperature parameters the run uses, overrides included.
+    let mut grid = HexGrid::from_radius(radius);
+    generate_terrain(
+        &mut grid,
+        &TerrainParams {
+            seed,
+            temperature: temperature.clone(),
+            ..TerrainParams::default()
+        },
+    );
     let mut wind = WindParams {
         seed,
         ..WindParams::default()
@@ -515,6 +542,35 @@ pub struct Metrics {
     /// detect thermal inversions or the gradient being flattened by
     /// advection.
     pub effective_lapse_rate_c_per_km: f32,
+    /// Fraction of measured days the imposed weather regime (#63) spent
+    /// in its wet phase. 0 when the regime is off; when on, it is the
+    /// stationary wet fraction of the chain
+    /// (`(1/dry) / (1/dry + 1/wet)`), and reading it back is how one
+    /// tells "the lever did nothing" from "the lever never ran".
+    pub regime_wet_days_frac: f32,
+    /// Largest share of the terrarium's water the sky reservoir held at
+    /// any measured day, as a fraction of the initial total budget. 0
+    /// when the regime is off; the amplitude of the lever when it is on.
+    pub sky_water_peak_frac: f32,
+    /// Share of the land cells (not open water, `vegetation::is_open_water`)
+    /// with no dominant species (`vegetation::dominant_species` is `None`)
+    /// on the final grid: the bare-soil guard of #151 / #161. NaN on a
+    /// world without land.
+    pub bare_frac: f32,
+    /// Mean cover seen from the sky (`vegetation::canopy_cover`, in
+    /// [0, 1]) over the land cells of the final grid. NaN without land.
+    pub canopy_cover_mean: f32,
+    /// Mean cover per stratum (`vegetation::stratum_cover`) over the land
+    /// cells of the final grid, in `species::STRATA` order [herb, shrub,
+    /// tree]. Each stratum has its own space budget, so the three can all
+    /// approach `k_total` at once: that is the understory living under the
+    /// canopy (#161 step 2). NaN without land.
+    pub cover_by_stratum_mean: [f32; STRATUM_COUNT],
+    /// Share of the land cells per dominant species (seen from the sky),
+    /// descending, zero shares left out; ties keep the `species::SPECIES`
+    /// order. Sums to `1 − bare_frac`. Serialized as
+    /// `[["oak_pubescent", 0.31], ...]`.
+    pub dominant_share: Vec<(SpeciesId, f32)>,
     /// Perf: average time per measurement tick (excluding warmup).
     pub ms_per_tick: f32,
     /// Number of cells in the grid (sanity check).
@@ -548,6 +604,10 @@ pub struct MetricsAccumulator {
     // Days where NO cell receives rain (alpine snow tolerated), the true
     // indicator of a high-pressure phase, de-confounded from snow.
     fully_rain_free_ticks: u64,
+    // Imposed weather regime (#63): days spent in the wet phase, and the
+    // high-water mark of the sky reservoir.
+    regime_wet_ticks: u64,
+    sky_water_peak: f32,
     // Conservation
     initial_water: f32,
     // Detection of a NaN/Inf in the main stocks
@@ -580,6 +640,8 @@ impl MetricsAccumulator {
             precip_per_tick: Vec::with_capacity(measure_ticks as usize),
             fully_dry_ticks: 0,
             fully_rain_free_ticks: 0,
+            regime_wet_ticks: 0,
+            sky_water_peak: 0.0,
             initial_water: total_water_budget(sim),
             nan_inf_seen: false,
             ticks_observed: 0,
@@ -610,6 +672,9 @@ impl MetricsAccumulator {
                 || !cell.humidity_upper.is_finite()
                 || !cell.cloud_water.is_finite()
                 || !cell.snow_level.is_finite()
+                || !cell.ice_level.is_finite()
+                || !cell.groundwater.is_finite()
+                || !cell.aquifer.is_finite()
             {
                 self.nan_inf_seen = true;
             }
@@ -682,6 +747,14 @@ impl MetricsAccumulator {
         if !any_rain_only_this_tick {
             self.fully_rain_free_ticks += 1;
         }
+        // Weather regime state of the day just simulated: the phase is
+        // drawn at hour 0 and holds for the day, so reading it after
+        // `step()` names that day (source of truth, never re-derived from
+        // the rain, anti-pattern #2).
+        if sim.weather_regime_is_wet() {
+            self.regime_wet_ticks += 1;
+        }
+        self.sky_water_peak = self.sky_water_peak.max(sim.sky_water_total());
         self.precip_per_tick.push(precip_this_tick);
         self.snow_total_per_tick.push(snow_total);
         self.ticks_observed += 1;
@@ -875,6 +948,16 @@ impl MetricsAccumulator {
         let effective_lapse_rate_c_per_km =
             crate::diagnostics::effective_lapse_rate_c_per_km(sim.grid());
 
+        let observed = self.ticks_observed.max(1) as f32;
+        let regime_wet_days_frac = self.regime_wet_ticks as f32 / observed;
+        let sky_water_peak_frac = if self.initial_water.abs() > 1e-6 {
+            self.sky_water_peak / self.initial_water
+        } else {
+            0.0
+        };
+
+        let veg = VegetationMetrics::of(sim.grid());
+
         let metrics = Metrics {
             water_drift_pct,
             rain_days_max_per_cell,
@@ -891,6 +974,12 @@ impl MetricsAccumulator {
             snow_ratio_winter_max_summer_min,
             cloud_cover_mountain_pct,
             effective_lapse_rate_c_per_km,
+            regime_wet_days_frac,
+            sky_water_peak_frac,
+            bare_frac: veg.bare_frac,
+            canopy_cover_mean: veg.canopy_cover_mean,
+            cover_by_stratum_mean: veg.cover_by_stratum_mean,
+            dominant_share: veg.dominant_share,
             ms_per_tick,
             cell_count: self.cell_count,
         };
@@ -904,11 +993,74 @@ impl MetricsAccumulator {
     }
 }
 
+/// Vegetation state of a grid, the four vegetation fields of `Metrics`.
+/// A snapshot of the final grid, not a time average: the vegetation step
+/// runs once a day and its landscape moves over years, so the end of the
+/// run is the landscape the parameters produced. Every per-cell quantity
+/// is read from `vegetation` (anti-pattern #2: the bench never re-derives
+/// the cover or the dominant); only the averaging over land lives here.
+#[derive(Debug, Clone, PartialEq)]
+struct VegetationMetrics {
+    bare_frac: f32,
+    canopy_cover_mean: f32,
+    cover_by_stratum_mean: [f32; STRATUM_COUNT],
+    dominant_share: Vec<(SpeciesId, f32)>,
+}
+
+impl VegetationMetrics {
+    fn of(grid: &HexGrid) -> Self {
+        let mut land = 0_u32;
+        let mut bare = 0_u32;
+        let mut canopy = 0.0_f64;
+        let mut strata = [0.0_f64; STRATUM_COUNT];
+        let mut dominant = [0_u32; SPECIES_COUNT];
+        for cell in grid.cells_slice() {
+            // Open water carries no terrestrial vegetation: counting it
+            // would make a wetter world look barer.
+            if is_open_water(cell) {
+                continue;
+            }
+            land += 1;
+            canopy += f64::from(canopy_cover(cell));
+            for (acc, &s) in strata.iter_mut().zip(STRATA.iter()) {
+                *acc += f64::from(stratum_cover(cell, s));
+            }
+            match dominant_species(cell) {
+                Some(id) => dominant[species_index(id)] += 1,
+                None => bare += 1,
+            }
+        }
+        // Mean over land; NaN on a world without land, like the empty
+        // bands of the rain metrics (no signal, not a zero).
+        let n = f64::from(land);
+        let mean = |sum: f64| if land > 0 { (sum / n) as f32 } else { f32::NAN };
+        let mut dominant_share: Vec<(SpeciesId, f32)> = SPECIES
+            .iter()
+            .zip(dominant)
+            .filter(|&(_, count)| count > 0)
+            .map(|(s, count)| (s.id, mean(f64::from(count))))
+            .collect();
+        // Stable sort: equal shares keep the table order (deterministic).
+        dominant_share.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Self {
+            bare_frac: mean(f64::from(bare)),
+            canopy_cover_mean: mean(canopy),
+            cover_by_stratum_mean: strata.map(mean),
+            dominant_share,
+        }
+    }
+}
+
+/// The terrarium's whole water stock, the quantity `water_drift_pct`
+/// measures: `Simulation::water_budget_total`, read and never
+/// re-assembled here (anti-pattern 2). It includes the sky
+/// reservoir of the imposed weather regime (#63) — that water left the
+/// cells but not the world — and it counts the upper layer through its
+/// coarse reference stock, not through the fine views (coarse upper
+/// layer, step 2: the views are a non-conservative interpolation, see
+/// `Simulation::upper_water_total`).
 fn total_water_budget(sim: &Simulation) -> f32 {
-    sim.grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum()
+    sim.water_budget_total()
 }
 
 fn band_index(elev: f32) -> usize {
@@ -996,5 +1148,53 @@ mod tests {
         let (metrics, status) = acc.finalize(&sim, std::time::Duration::from_millis(100));
         assert_eq!(status, RunStatus::Ok);
         assert!(metrics.ms_per_tick > 0.0);
+        // Vegetation metrics: shares of the land cells, consistent with
+        // each other whatever grew in 60 days.
+        assert!((0.0..=1.0).contains(&metrics.bare_frac));
+        let dominant_total: f32 = metrics.dominant_share.iter().map(|&(_, f)| f).sum();
+        assert!((dominant_total + metrics.bare_frac - 1.0).abs() < 1e-4);
+    }
+
+    /// Three cells: a lake, a bare land cell, and an oak canopy over a
+    /// meadow. The lake is out of every mean, the bare cell counts in
+    /// `bare_frac`, the vegetated one counts as oak (the canopy seen from
+    /// the sky) while its meadow still shows in the herb cover.
+    #[test]
+    fn vegetation_metrics_average_over_land_and_see_the_canopy() {
+        let mut grid = HexGrid::from_radius(1);
+        let coords: Vec<_> = grid.coords().copied().collect();
+        for (k, coord) in coords.iter().enumerate() {
+            let c = grid.get_mut(*coord).expect("cell exists");
+            // Every cell a lake except two land cells.
+            c.water_level = c.water_capacity + 100.0;
+            if k == 1 {
+                c.water_level = 0.0;
+            }
+            if k == 2 {
+                c.water_level = 0.0;
+                c.vegetation[species_index(SpeciesId::OakPubescent)] = 0.8;
+                c.vegetation[species_index(SpeciesId::Meadow)] = 0.9;
+            }
+        }
+        let m = VegetationMetrics::of(&grid);
+        assert!(
+            (m.bare_frac - 0.5).abs() < 1e-6,
+            "bare_frac={}",
+            m.bare_frac
+        );
+        assert_eq!(m.dominant_share.len(), 1);
+        assert_eq!(m.dominant_share[0].0, SpeciesId::OakPubescent);
+        assert!((m.dominant_share[0].1 - 0.5).abs() < 1e-6);
+        let [herb, shrub, tree] = m.cover_by_stratum_mean;
+        assert!((herb - 0.45).abs() < 1e-6, "herb={herb}");
+        assert!(shrub.abs() < 1e-6, "shrub={shrub}");
+        assert!((tree - 0.4).abs() < 1e-6, "tree={tree}");
+        // Canopy cover 1 − (1 − 0.9)(1 − 0.8) = 0.98 on the vegetated
+        // cell, 0 on the bare one.
+        assert!(
+            (m.canopy_cover_mean - 0.49).abs() < 1e-5,
+            "canopy={}",
+            m.canopy_cover_mean
+        );
     }
 }

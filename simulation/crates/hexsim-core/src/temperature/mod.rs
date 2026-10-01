@@ -32,6 +32,9 @@ mod solar;
 pub use balance::{
     TemperatureForcing, absorbed_solar_flux, cloud_cover_fraction, local_t_ref, step_temperature,
 };
+// Crate-internal only: the climate sweep of `climatology::terrain_climate`
+// applies the same offset `step_temperature` does, after its own sweep.
+pub(crate) use balance::calibration_offset;
 pub use illumination::{
     DIFFUSE_SKY_FRACTION, IllumCache, compute_illumination, compute_illumination_cached,
     terrain_annual_mean_insolation_factor,
@@ -39,6 +42,8 @@ pub use illumination::{
 // Crate-internal only: consumed by `ablation::Ablation::defaults` to build
 // the compiled-in default without duplicating the constant.
 pub(crate) use illumination::ILLUM_KO_DEFAULT;
+// Crate-internal only: the climate sweep walks the same sampled days.
+pub(crate) use illumination::terrain_insolation_sample_stride_days;
 // Crate-internal only: consumed by `balance::calibration_offset`, never
 // part of the public API.
 pub(crate) use solar::cached_annual_mean_insolation_factor;

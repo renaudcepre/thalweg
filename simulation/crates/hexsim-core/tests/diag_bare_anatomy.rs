@@ -7,6 +7,13 @@
 //! drought) excludes each species, or, when no species is excluded, which
 //! response term (thermal, water, light) starves the best one.
 //!
+//! The limits and the responses are the core's (`Species::lethal_cause`,
+//! `Species::responses`, `Species::suitability`), never re-derived here
+//! (anti-pattern #2: a local copy had drifted, it missed the `> 0.0`
+//! drought guard and the light compensation point). Each species reads
+//! the light of its own stratum, `insolation_mean ×
+//! light_transmittance_below` (#161 step 2), as the vegetation step does.
+//!
 //! Eval style: `#[ignore]`, `eprintln!`, no assert. Env `HEXSIM_DIAG_SEED`.
 //!
 //! ```text
@@ -14,19 +21,23 @@
 //!     -E 'binary(diag_bare_anatomy)' --no-capture
 //! ```
 
+mod common;
+
 use std::fmt::Write as _;
 
+use common::species_label;
 use hexsim_core::atmosphere::AtmosphereParams;
-use hexsim_core::climate_normals::CellClimateNormals;
 use hexsim_core::grid::HexGrid;
 use hexsim_core::groundwater::GroundwaterParams;
 use hexsim_core::hydro::HydroParams;
 use hexsim_core::simulation::Simulation;
 use hexsim_core::snow::SnowParams;
-use hexsim_core::species::{SPECIES, SPECIES_COUNT};
+use hexsim_core::species::{LethalCause, SPECIES, SPECIES_COUNT};
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::terrain::{TerrainParams, generate_terrain};
-use hexsim_core::vegetation::{cell_total_vegetation, dominant_species, is_open_water};
+use hexsim_core::vegetation::{
+    canopy_cover, dominant_species, is_open_water, light_transmittance_below,
+};
 use hexsim_core::wind::WindParams;
 
 const RADIUS: i32 = 30;
@@ -72,8 +83,11 @@ struct BandStats {
     gw: f64,
     wl: f64,
     cap: f64,
+    /// Sum of `canopy_cover` (cover seen from the sky, in [0, 1]).
     cover: f64,
     all_lethal: u32,
+    /// Per species, bare cells whose FIRST lethal limit crossed
+    /// (`Species::lethal_cause`, order frost, heat, drought) is this one.
     frost: [u32; SPECIES_COUNT],
     heat: [u32; SPECIES_COUNT],
     drought: [u32; SPECIES_COUNT],
@@ -82,14 +96,6 @@ struct BandStats {
     best_f_water: f64,
     best_f_sun: f64,
     non_lethal_bare: u32,
-}
-
-fn responses(s: &hexsim_core::species::Species, n: &CellClimateNormals) -> (f32, f32, f32) {
-    let z = (n.t_mean - s.temp_opt) / s.temp_width;
-    let f_temp = (-(z * z)).exp();
-    let f_water = n.moisture_mean / (n.moisture_mean + s.moisture_half).max(1e-6);
-    let f_sun = n.insolation_mean / (n.insolation_mean + s.sun_half).max(1e-6);
-    (f_temp, f_water, f_sun)
 }
 
 /// Terrain whose horizontal wavelengths are `k` times longer than the
@@ -120,15 +126,15 @@ fn run_sim(seed: u32) -> Simulation {
         ..HydroParams::default()
     };
     let gw = GroundwaterParams {
-        infiltration_rate: env_f32("HEXSIM_DIAG_INFILTRATION")
-            .unwrap_or(GroundwaterParams::default().infiltration_rate),
+        saturated_conductivity_mm_per_day: env_f32("HEXSIM_DIAG_INFILTRATION")
+            .unwrap_or(GroundwaterParams::default().saturated_conductivity_mm_per_day),
         diffusion_rate: env_f32("HEXSIM_DIAG_GW_DIFF")
             .unwrap_or(GroundwaterParams::default().diffusion_rate),
         ..GroundwaterParams::default()
     };
     eprintln!(
-        "params: slope_full_mobility={} infiltration_rate={} gw_diffusion={}",
-        hydro.slope_full_mobility, gw.infiltration_rate, gw.diffusion_rate
+        "params: slope_full_mobility={} saturated_conductivity_mm_per_day={} gw_diffusion={}",
+        hydro.slope_full_mobility, gw.saturated_conductivity_mm_per_day, gw.diffusion_rate
     );
     let mut sim = Simulation::new(
         grid,
@@ -167,7 +173,7 @@ fn collect(sim: &Simulation) -> Vec<BandStats> {
         b.gw += f64::from(cell.groundwater);
         b.wl += f64::from(cell.water_level);
         b.cap += f64::from(cell.water_capacity);
-        b.cover += f64::from(cell_total_vegetation(cell));
+        b.cover += f64::from(canopy_cover(cell));
         if dominant_species(cell).is_some() {
             continue;
         }
@@ -175,27 +181,21 @@ fn collect(sim: &Simulation) -> Vec<BandStats> {
         let mut any_alive = false;
         let mut best: Option<(f32, f32, f32, f32)> = None;
         for (i, s) in SPECIES.iter().enumerate() {
-            let mut lethal = false;
-            if n.t_min < s.temp_lethal_min {
-                b.frost[i] += 1;
-                lethal = true;
-            }
-            if n.t_max > s.temp_lethal_max {
-                b.heat[i] += 1;
-                lethal = true;
-            }
-            if n.moisture_min < s.moisture_lethal_min {
-                b.drought[i] += 1;
-                lethal = true;
-            }
-            if lethal {
-                continue;
-            }
-            any_alive = true;
-            let (ft, fw, fs) = responses(s, n);
-            let suit = ft * fw * fs;
-            if best.is_none_or(|(bs, _, _, _)| suit > bs) {
-                best = Some((suit, ft, fw, fs));
+            match s.lethal_cause(n) {
+                Some(LethalCause::Frost) => b.frost[i] += 1,
+                Some(LethalCause::Heat) => b.heat[i] += 1,
+                Some(LethalCause::Drought) => b.drought[i] += 1,
+                None => {
+                    any_alive = true;
+                    // The light this species' stratum receives under the
+                    // layers above it, as `step_vegetation` reads it.
+                    let light = n.insolation_mean * light_transmittance_below(cell, s.stratum);
+                    let r = s.responses(n, light);
+                    let suit = s.suitability(n, light);
+                    if best.is_none_or(|(bs, _, _, _)| suit > bs) {
+                        best = Some((suit, r.temp, r.water, r.sun));
+                    }
+                }
             }
         }
         if !any_alive {
@@ -283,8 +283,11 @@ fn diag_bare_anatomy() {
         );
     }
     eprintln!();
-    eprintln!("== Among BARE cells: % excluded per species by frost / heat / drought ==");
-    let labels = ["oak", "pine", "beech", "fir", "grass"];
+    eprintln!(
+        "== Among BARE cells: % excluded per species by frost / heat / drought \
+         (first limit crossed, in that order) =="
+    );
+    let labels = SPECIES.map(|s| species_label(s.id));
     for (&(name, _, _), b) in BANDS.iter().zip(stats.iter()) {
         if b.bare == 0 {
             continue;

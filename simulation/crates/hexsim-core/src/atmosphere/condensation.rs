@@ -1,4 +1,6 @@
+use crate::cell::CellProperties;
 use crate::grid::HexGrid;
+use crate::par::{for_each_chunk_mut, reduce_blocks};
 use crate::physics::tetens_saturation_vapor_pressure;
 use crate::temperature::{SECONDS_PER_HOUR, TemperatureParams};
 
@@ -54,19 +56,50 @@ pub fn saturation_surface(t_surface: f32) -> f32 {
 /// Horizontal means of the surface state that anchor the upper-air
 /// temperature: `(mean surface temperature °C, mean elevation m)`.
 /// Empty grid: `(0, 0)`.
+///
+/// A deterministic block reduction (`par::reduce_blocks`, r250 perf
+/// effort): per-block f32 sums computed in parallel over fixed blocks of
+/// `REDUCE_BLOCK_CELLS` cells, folded in block order, divided by the
+/// exact cell count. Same bits whatever the thread count; not the bits
+/// of the serial running mean (Welford) it replaces, which streamed the
+/// whole grid on one core twice per tick (a third time before
+/// `AtmoForcing::mean_elevation`) at r250, ~1 ms each at 4 threads on the
+/// 4-vCPU VM. The block sums are also the tighter estimate: 4 096 terms
+/// per f32 accumulator and 46 partials, against 188 251 sequential
+/// `mean += (x − mean) / count` updates.
 #[must_use]
 pub fn surface_means(grid: &HexGrid) -> (f32, f32) {
-    // Running means (Welford): no integer→float cast, the count is an
-    // exact f32 up to 2^24 cells.
-    let mut count = 0.0_f32;
-    let mut mean_t = 0.0_f32;
-    let mut mean_z = 0.0_f32;
-    for c in grid.cells_slice() {
-        count += 1.0;
-        mean_t += (c.temperature - mean_t) / count;
-        mean_z += (c.elevation - mean_z) / count;
+    let cells = grid.cells_slice();
+    if cells.is_empty() {
+        return (0.0, 0.0);
     }
-    (mean_t, mean_z)
+    let mut partials: Vec<(f32, f32)> = Vec::new();
+    reduce_blocks(cells.len(), &mut partials, |range| {
+        let mut sum_t = 0.0_f32;
+        let mut sum_z = 0.0_f32;
+        for c in &cells[range] {
+            sum_t += c.temperature;
+            sum_z += c.elevation;
+        }
+        (sum_t, sum_z)
+    });
+    let (sum_t, sum_z) = partials
+        .iter()
+        .fold((0.0_f32, 0.0_f32), |(t, z), &(pt, pz)| (t + pt, z + pz));
+    let count = exact_cell_count(cells.len());
+    (sum_t / count, sum_z / count)
+}
+
+/// `n` as an f32, exact below 2^24 cells (16.7 M, two orders of magnitude
+/// above r250): assembled from the two 16-bit halves through lossless
+/// `From` conversions, so no `as` cast and no precision-loss lint to
+/// silence.
+fn exact_cell_count(n: usize) -> f32 {
+    let n = u32::try_from(n).expect("cell count fits in u32");
+    debug_assert!(n < 1 << 24, "cell count beyond exact f32 integers");
+    let high = u16::try_from(n >> 16).expect("high half of a u32 fits in u16");
+    let low = u16::try_from(n & 0xFFFF).expect("low half of a u32 fits in u16");
+    f32::from(high) * 65_536.0 + f32::from(low)
 }
 
 /// Time constant (s) of the diurnal smoothing applied to the map-mean
@@ -140,46 +173,137 @@ pub fn upper_air_temperature(
     mean_surface_t - temp_params.lapse_rate * height_above_mean_ground / 1000.0
 }
 
-/// Cloud dynamics: vapor ↔ droplets.
+/// Cloud dynamics for one cell: vapor ↔ droplets.
 ///
 /// - Condensation (#63 Phase 4 Step 3): anchored to Clausius-Clapeyron via
 ///   Tetens. When `humidity_upper > saturation_upper(T)`, the
-///   thermodynamic surplus drains into droplets at rate
-///   `condensation_rate`. Natural asymptote at RH=1 (saturation), not an
-///   arbitrary dimensionless RH threshold.
-/// - Cloud evaporation: if RH < `cloud_evap_hr_threshold`, a fraction of
-///   `cloud_water` returns to `humidity_upper`.
-/// - Dead zone between saturation and `cloud_evap_hr_threshold`:
-///   hysteresis that avoids pulsing.
+///   thermodynamic surplus drains into droplets at `condensation_rate`
+///   (pre-clamped to `[0, 1]` by the caller, a per-tick constant —
+///   hoisted out so a full-grid sweep doesn't redo the `.min(1.0)` per
+///   cell). Natural asymptote at RH=1 (saturation), not an arbitrary
+///   dimensionless RH threshold.
+/// - Cloud evaporation (saturation adjustment, #63 L2b): below
+///   saturation the droplets go straight back to vapour, bounded by the
+///   layer's own deficit — `min(cloud_water, sat − humidity_upper)`. No
+///   rate, no RH threshold, no dead zone. See
+///   [`saturation_adjustment_transfer`] for the physics.
 ///
-/// `t_upper` = upper-air temperature per cell (`AtmoScratch::t_upper`,
+/// `t_up` = this cell's upper-air temperature (`AtmoScratch::t_upper[i]`,
 /// filled by `fill_upper_air` from [`upper_air_temperature`]).
-pub(crate) fn step_cloud_dynamics(next: &mut HexGrid, params: &AtmosphereParams, t_upper: &[f32]) {
-    let rate = params.condensation_rate.min(1.0);
-    for (nc, &t_up) in next.cells_slice_mut().iter_mut().zip(t_upper) {
-        let sat = saturation_upper(t_up, params);
+///
+/// Extracted to a per-cell function, no full-grid sweep of its own (r250
+/// perf effort, chunk B2): the only caller left is
+/// `atmosphere::apply_temperature_advection_then_cloud_and_condensation`,
+/// which fuses it with temperature advection's apply and
+/// `surface_condensation_for_cell` into one sweep — see that function's
+/// doc for the dependency argument. Also exercised directly by this
+/// module's own unit tests, on a single cell, no grid needed.
+///
+/// Returns what [`cloud_dynamics`] returns: the vapour → droplet transfer
+/// of this cell for this hour (mm, negative when the layer is
+/// subsaturated and droplets go back to vapour). The fused sweep uses its
+/// sign to count the cells that condensed, which is the saturated cloud
+/// fraction the coarse torus needs (`atmosphere::coarse`).
+pub(crate) fn cloud_dynamics_for_cell(
+    nc: &mut CellProperties,
+    t_up: f32,
+    params: &AtmosphereParams,
+    condensation_rate: f32,
+) -> f32 {
+    cloud_dynamics(
+        &mut nc.humidity_upper,
+        &mut nc.cloud_water,
+        saturation_upper(t_up, params),
+        condensation_rate,
+    )
+}
 
-        let surplus_mm = nc.humidity_upper - sat;
-        if surplus_mm > 0.0 {
-            // CC drain: (humidity_upper - sat) × rate. At steady state
-            // with input X mm/tick, hu_eq = sat + X/rate → RH = 1 +
-            // X/(rate·sat). With rate=1.0/h and input bounded by the LCL
-            // bound on the orographic pump (cf
-            // step_orographic_convection), RH plateaus at ~1 + ε.
-            let transfer = surplus_mm * rate;
-            nc.humidity_upper -= transfer;
-            nc.cloud_water += transfer;
-        } else if sat > 0.0
-            && (nc.humidity_upper / sat) < params.cloud_evap_hr_threshold
-            && nc.cloud_water > 0.0
-        {
-            // Droplet evaporation: depends only on the cloud_water stock
-            // and the rate (no amplifying "deficit").
-            let transfer = nc.cloud_water * params.cloud_evap_rate;
-            nc.cloud_water -= transfer;
-            nc.humidity_upper += transfer;
-        }
+/// The vapour ↔ droplet transition itself, on the two stocks of one
+/// column and the saturation that column sees — no `CellProperties`, no
+/// grid, no `AtmosphereParams`.
+///
+/// Split out of [`cloud_dynamics_for_cell`] (coarse upper layer, step 2)
+/// so the fine grid and the ~1 km coarse torus run **the same code** on
+/// their own stocks rather than two hand-kept twins (one system, not
+/// case by case). The seam is `sat` because that is
+/// exactly where the two paths differ: a fine cell derives it from its own
+/// `T_upper` (`saturation_upper(t_up, params)`, just above), a coarse cell
+/// takes the **mean of its fine cells' `sat_upper`** — not `sat_upper` of
+/// the mean, Tetens being convex (design note §9 risk 1: the mean is the
+/// one that is right for a mass budget).
+///
+/// Returns the **signed vapour → droplet transfer** (mm): `> 0` when the
+/// column was supersaturated and condensed, `< 0` when it was
+/// subsaturated and gave droplets back to vapour, `0` when nothing moved.
+/// A return value rather than a second out-parameter because the caller
+/// that needs it (the fused sweep, for the coarse torus's cloud fraction)
+/// only needs its sign, and because a function that moves mass between
+/// two stocks should be able to say how much.
+pub(crate) fn cloud_dynamics(
+    humidity_upper: &mut f32,
+    cloud_water: &mut f32,
+    sat: f32,
+    condensation_rate: f32,
+) -> f32 {
+    let surplus_mm = *humidity_upper - sat;
+    if surplus_mm > 0.0 {
+        // CC drain: (humidity_upper - sat) × rate. At steady state
+        // with input X mm/tick, hu_eq = sat + X/rate → RH = 1 +
+        // X/(rate·sat). With rate=1.0/h and input bounded by the LCL
+        // bound on the orographic pump (cf
+        // step_orographic_convection), RH plateaus at ~1 + ε.
+        let transfer = surplus_mm * condensation_rate;
+        *humidity_upper -= transfer;
+        *cloud_water += transfer;
+        transfer
+    } else if *cloud_water > 0.0 {
+        // Saturation adjustment, the exact mirror of the branch above:
+        // the deficit is `-surplus_mm`, and it is the only bound.
+        let transfer = saturation_adjustment_transfer(-surplus_mm, *cloud_water);
+        *cloud_water -= transfer;
+        *humidity_upper += transfer;
+        -transfer
+    } else {
+        0.0
     }
+}
+
+/// Droplets returned to vapour in one hour by a subsaturated layer:
+/// `min(cloud_water, deficit_mm)`, with `deficit_mm = sat −
+/// humidity_upper ≥ 0`. Saturation adjustment (Sundqvist 1978, *Mon.
+/// Wea. Rev.* 106, §2; Tiedtke 1993, *Mon. Wea. Rev.* 121, the
+/// large-scale evaporation term of the prognostic cloud scheme).
+///
+/// The physics is a timescale argument, not a coefficient. A droplet in
+/// subsaturated air evaporates with the phase relaxation time
+/// `τ = 1/(4π·D_v·N·r̄)` (Rogers & Yau 1989, *A Short Course in Cloud
+/// Physics*, 3rd ed., ch. 7): with `D_v ≈ 2.5e-5 m²/s`, `N = 1e8 m⁻³`
+/// (100 cm⁻³) and `r̄ = 10 µm`, τ ≈ 3 s. Against a 3600 s tick,
+/// `1 − exp(−Δt/τ)` is 1.0 to every digit an f32 carries: over one hour
+/// in a well-mixed 1500 m column, a cloud in subsaturated air is gone —
+/// unless it saturates the layer first, which is what the `min` says.
+/// The two outcomes are exhaustive and both are physical: the cloud is
+/// wholly evaporated, or the layer is back at RH 1 with droplets left.
+///
+/// Same asymmetry as the condensation branch above: the latent heat of
+/// the phase change is not fed back into `T_upper`, so `sat` is held
+/// fixed over the adjustment. A real saturation adjustment iterates on
+/// `(T, q)` together; here the upper-air temperature is diagnosed from
+/// the map mean (`upper_air_temperature`), not prognostic, so there is
+/// no reservoir to release the heat into. The bound is therefore an
+/// upper bound on the true one (evaporative cooling would lower `sat`,
+/// hence the deficit): it errs toward evaporating slightly *more* than
+/// a fully coupled scheme, never less.
+///
+/// Replaces `cloud_evap_rate` (0.10/day) and `cloud_evap_hr_threshold`
+/// (0.4), two dimensionless coefficients from the April 2026 random
+/// search. That pair gave a cloud a ~7-day half-life against dry
+/// episodes of ~4.5 days, so a drizzle always survived the episode and
+/// `fully_rain_free_days_total` was 0 by construction (JOURNAL
+/// 2026-09-06).
+#[must_use]
+fn saturation_adjustment_transfer(deficit_mm: f32, cloud_water: f32) -> f32 {
+    cloud_water.min(deficit_mm)
 }
 
 /// Isotropic diffusion of `cloud_water` to neighbors: each cell exports a
@@ -190,11 +314,21 @@ pub(crate) fn step_cloud_dynamics(next: &mut HexGrid, params: &AtmosphereParams,
 /// behaviors (precipitates vs. nothing), hence the checkerboard pattern.
 /// With diffusion, mass is shared locally and clouds become continuous
 /// regions.
+///
+/// Two-phase scatter -> gather (r250 perf effort), simpler than the
+/// wind-driven advections: the share is the SAME toward all 6 neighbors
+/// (`outgoing / 6`), so no per-direction storage is needed — a single
+/// flat `share` buffer suffices, and the gather doesn't need
+/// `coord::opposite_direction` either: "k is my neighbor" is symmetric
+/// on the toric lattice, so `Σ_{k ∈ neighbors(j)} share[k]` already sums
+/// exactly what `j`'s neighbors sent it, self-loss included in the same
+/// pass (`share[j]` itself, since `j` is also its own neighbors'
+/// neighbor).
 pub(crate) fn step_cloud_diffusion(
     current: &HexGrid,
     next: &mut HexGrid,
     params: &AtmosphereParams,
-    snap: &mut Vec<f32>,
+    share: &mut Vec<f32>,
     deltas: &mut Vec<f32>,
 ) {
     let rate = params.cloud_diffusion_rate;
@@ -203,33 +337,39 @@ pub(crate) fn step_cloud_diffusion(
     }
     let next_cells = next.cells_slice_mut();
     let n = next_cells.len();
-    snap.resize(n, 0.0);
+    share.resize(n, 0.0);
     for (i, c) in next_cells.iter().enumerate() {
-        snap[i] = c.cloud_water;
-    }
-    deltas.resize(n, 0.0);
-    deltas.fill(0.0);
-    for i in 0..n {
-        let src = snap[i];
-        if src <= 0.0 {
-            continue;
-        }
-        let neighbors = current.neighbor_indices_toric(i);
-        let outgoing = src * rate;
-        deltas[i] -= outgoing;
         // Distribution over 6 toric neighbors (self-fallback via wrap
         // impossible → conservative: the share returns to itself,
         // equivalent to zero loss).
-        let share = outgoing / 6.0;
-        for &ni in &neighbors {
-            deltas[ni] += share;
-        }
+        share[i] = c.cloud_water.max(0.0) * rate / 6.0;
     }
-    for (i, cell) in next_cells.iter_mut().enumerate() {
-        if deltas[i] != 0.0 {
-            cell.cloud_water = (cell.cloud_water + deltas[i]).max(0.0);
-        }
+    deltas.resize(n, 0.0);
+    {
+        let share_ref: &Vec<f32> = share;
+        for_each_chunk_mut(deltas, |start, chunk| {
+            for (local, d) in chunk.iter_mut().enumerate() {
+                let j = start + local;
+                let outgoing = share_ref[j] * 6.0;
+                let neighbors = current.neighbor_indices_toric(j);
+                let mut gathered = 0.0_f32;
+                for &k in &neighbors {
+                    gathered += share_ref[k];
+                }
+                *d = gathered - outgoing;
+            }
+        });
     }
+    // Apply pass: reads only `deltas[i]`, writes only `next_cells[i]` — a
+    // pure per-cell map, parallelizable (`par::for_each_chunk_mut`).
+    for_each_chunk_mut(next_cells, |start, chunk| {
+        for (local, cell) in chunk.iter_mut().enumerate() {
+            let d = deltas[start + local];
+            if d != 0.0 {
+                cell.cloud_water = (cell.cloud_water + d).max(0.0);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -239,6 +379,80 @@ mod tests {
     use crate::atmosphere::test_support::default_temp_params;
     use crate::coord::HexCoord;
     use crate::grid::HexGrid;
+    use proptest::prelude::*;
+
+    /// **The sub-grid condensation trigger (coarse upper layer, step 2b).**
+    /// Two fine columns of one coarse cell, one saturated and one dry, the
+    /// same `humidity_upper` (the broadcast view makes it uniform by
+    /// construction): condensing per column and pooling the result is NOT
+    /// the same as condensing on the column means, and Jensen says which
+    /// way — `x ↦ (hu − x)⁺` is convex, so the pooled sum is the larger.
+    ///
+    /// This is the term step 2 lost by running the transition on the
+    /// coarse torus, and step 2b gave back by running it on the views.
+    /// Pinned numbers: `sat = 4` and `14` mm, `hu = 12` mm, rate 1/h.
+    /// Pooled `8 + 0 = 8`; coarse-mean trigger `2 × (12 − 9)⁺ = 6`; ratio
+    /// 4/3. It is a lower bound on the real gap, not a typical one — push
+    /// `hu` to 9 and the coarse trigger is exactly 0 while the fine sum is
+    /// still 5.
+    #[test]
+    fn pooling_per_column_condensation_beats_the_column_mean_trigger() {
+        let rate = 1.0_f32;
+        let sat = [4.0_f32, 14.0];
+        let hu0 = 12.0_f32;
+
+        let mut pooled = 0.0_f32;
+        for &s in &sat {
+            let (mut hu, mut cw) = (hu0, 0.0_f32);
+            pooled += cloud_dynamics(&mut hu, &mut cw, s, rate);
+            assert!((cw - pooled_step(hu0, s, rate)).abs() < 1e-6);
+        }
+        assert!((pooled - 8.0).abs() < 1e-5, "pooled condensation {pooled}");
+
+        // The coarse cell as step 2 saw it: one column carrying the means.
+        let mean_sat = (sat[0] + sat[1]) / 2.0;
+        let (mut hu, mut cw) = (hu0, 0.0_f32);
+        cloud_dynamics(&mut hu, &mut cw, mean_sat, rate);
+        let on_the_means = cw * 2.0; // per fine cell -> the cell's mass
+        assert!(
+            (on_the_means - 6.0).abs() < 1e-5,
+            "column-mean condensation {on_the_means}"
+        );
+
+        assert!(
+            pooled > on_the_means,
+            "Jensen: {pooled} must exceed {on_the_means}"
+        );
+        let ratio = pooled / on_the_means;
+        assert!(
+            (ratio - 4.0 / 3.0).abs() < 1e-4,
+            "the measured ratio moved: {ratio}"
+        );
+
+        // And the saturation adjustment pooled the other way round can
+        // never take the coarse stock below zero: what each column gives
+        // back is at most its own view, so the sum is at most `N_c × cw_c`.
+        let cw_c = 0.7_f32;
+        let deficits = [0.1_f32, 5.0, 100.0];
+        let mut returned = 0.0_f32;
+        for &d in &deficits {
+            let (mut hu, mut cw) = (10.0 - d, cw_c);
+            returned += -cloud_dynamics(&mut hu, &mut cw, 10.0, rate);
+            assert!(cw >= 0.0, "a column cannot go negative: {cw}");
+        }
+        let n_c = deficits.len();
+        assert!(
+            returned <= f32::from(u16::try_from(n_c).expect("small")) * cw_c + 1e-6,
+            "pooled adjustment {returned} exceeds the coarse stock"
+        );
+    }
+
+    /// What one column condenses in one step, written out: the reference
+    /// [`pooling_per_column_condensation_beats_the_column_mean_trigger`]
+    /// checks `cloud_dynamics` against.
+    fn pooled_step(hu: f32, sat: f32, rate: f32) -> f32 {
+        (hu - sat).max(0.0) * rate
+    }
 
     /// Base law "warm air holds more water" (Clausius-Clapeyron via
     /// Tetens): `saturation_surface` must grow STRICTLY with temperature,
@@ -318,7 +532,8 @@ mod tests {
             "invalid setup: initial={initial} must be >> sat={sat}"
         );
 
-        step_cloud_dynamics(&mut grid, &params_hourly, &[t_upper]);
+        let rate = params_hourly.condensation_rate.min(1.0);
+        cloud_dynamics_for_cell(grid.get_mut(c0).unwrap(), t_upper, &params_hourly, rate);
 
         let after = grid.get(c0).unwrap();
         let transfer = initial - after.humidity_upper;
@@ -345,6 +560,67 @@ mod tests {
             (hr_final - 1.0).abs() < 0.01,
             "rate=1.0/h must bring RH to saturation in 1 tick: final RH={hr_final}"
         );
+    }
+
+    #[test]
+    fn surface_means_are_the_plain_averages() {
+        let mut grid = HexGrid::from_radius(2);
+        let n = grid.len();
+        let coords: Vec<HexCoord> = grid.coords().copied().collect();
+        for (k, c) in coords.iter().enumerate() {
+            let cell = grid.get_mut(*c).unwrap();
+            cell.temperature = f32::from(u8::try_from(k).unwrap()) - 5.0;
+            cell.elevation = 100.0 * f32::from(u8::try_from(k).unwrap());
+        }
+        let (mean_t, mean_z) = surface_means(&grid);
+        let k_mean = f32::from(u8::try_from(n - 1).unwrap()) / 2.0;
+        assert!((mean_t - (k_mean - 5.0)).abs() < 1e-4, "mean_t={mean_t}");
+        assert!((mean_z - 100.0 * k_mean).abs() < 1e-2, "mean_z={mean_z}");
+        assert_eq!(surface_means(&HexGrid::new()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn exact_cell_count_is_lossless_across_the_u16_boundary() {
+        for n in [0_usize, 1, 65_535, 65_536, 188_251, (1 << 24) - 1] {
+            let got = exact_cell_count(n);
+            let expected = f64::from(u32::try_from(n).unwrap());
+            assert!((f64::from(got) - expected).abs() < 0.5, "n={n} got {got}");
+        }
+    }
+
+    /// The block reduction gives the same bits on one worker, on four, and
+    /// outside any pool: a grid above `par::PAR_MIN_CELLS` so the pooled
+    /// calls really split, temperatures noisy enough that a different
+    /// association of the terms would show in f32.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn surface_means_are_bit_identical_across_thread_counts() {
+        let mut grid = HexGrid::from_radius(130);
+        let mut state = 0x2545_F491_u32;
+        for c in grid.cells_slice_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = f32::from(u16::try_from(state >> 16).unwrap()) / 65_535.0;
+            c.temperature = unit * 40.0 - 20.0;
+            c.elevation = unit * 3000.0;
+        }
+        let reference = surface_means(&grid);
+        for threads in [1, 4] {
+            let pooled = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("build pool")
+                .install(|| surface_means(&grid));
+            assert_eq!(
+                pooled.0.to_bits(),
+                reference.0.to_bits(),
+                "{threads} threads: mean_t"
+            );
+            assert_eq!(
+                pooled.1.to_bits(),
+                reference.1.to_bits(),
+                "{threads} threads: mean_z"
+            );
+        }
     }
 
     /// The upper air is horizontally mixed: two cells at the same
@@ -472,6 +748,173 @@ mod tests {
         assert!(
             (m - to).abs() < 1e-3,
             "after 11τ the anchor must have converged to the step: {m} vs {to}"
+        );
+    }
+
+    /// #63 L2b, the shape of the saturation adjustment: after one step in
+    /// subsaturated air the cell is in one of exactly two states, no cloud
+    /// left or a saturated layer. Swept across the whole range of
+    /// cloud/deficit ratios so both outcomes and the exact crossover are
+    /// covered.
+    #[test]
+    fn subsaturated_air_leaves_either_no_cloud_or_a_saturated_layer() {
+        let params = AtmosphereParams::default();
+        let t_up = 5.0;
+        let sat = saturation_upper(t_up, &params);
+        // sat ≈ 9.3 mm at 5 °C over 1500 m; RH 0.3 leaves a ~6.5 mm
+        // deficit, so clouds on both sides of it are exercised.
+        for rh in [0.0_f32, 0.3, 0.7, 0.999] {
+            for cloud in [1e-6_f32, 0.2, 5.0, 50.0] {
+                let mut cell = CellProperties {
+                    humidity_upper: rh * sat,
+                    cloud_water: cloud,
+                    ..CellProperties::default()
+                };
+                cloud_dynamics_for_cell(&mut cell, t_up, &params, 1.0);
+                let cleared = cell.cloud_water == 0.0;
+                let saturated = (cell.humidity_upper - sat).abs() <= 1e-4 * sat.max(1.0);
+                assert!(
+                    cleared || saturated,
+                    "rh={rh} cloud={cloud}: neither cleared nor saturated \
+                     (cloud={}, hu={}, sat={sat})",
+                    cell.cloud_water,
+                    cell.humidity_upper
+                );
+                assert!(
+                    cell.humidity_upper <= sat + 1e-4 * sat.max(1.0),
+                    "rh={rh} cloud={cloud}: the adjustment oversaturated the layer, \
+                     hu={} > sat={sat}",
+                    cell.humidity_upper
+                );
+            }
+        }
+    }
+
+    /// A tiny cloud in very dry air reaches a TRUE zero, no residue and no
+    /// floor: with `cloud_evap_rate` the stock decayed geometrically and
+    /// never got there, which is exactly how a 0.2-0.5 mm drizzle survived
+    /// a 4.5-day dry episode (JOURNAL 2026-09-06). One step is enough now.
+    #[test]
+    fn a_tiny_cloud_in_dry_air_reaches_a_true_zero() {
+        let params = AtmosphereParams::default();
+        let t_up = -10.0;
+        let mut cell = CellProperties {
+            humidity_upper: 0.0,
+            cloud_water: 1e-7,
+            ..CellProperties::default()
+        };
+        cloud_dynamics_for_cell(&mut cell, t_up, &params, 1.0);
+        assert_eq!(
+            cell.cloud_water.to_bits(),
+            0.0_f32.to_bits(),
+            "the cloud must reach exactly 0.0, got {}",
+            cell.cloud_water
+        );
+    }
+
+    /// At or above saturation the reverse branch never fires: droplets are
+    /// only ever created there (condensation), never returned. Checked at
+    /// exact saturation too, the boundary the `else` sits on.
+    #[test]
+    fn at_or_above_saturation_the_reverse_branch_is_a_no_op() {
+        let params = AtmosphereParams::default();
+        let t_up = 12.0;
+        let sat = saturation_upper(t_up, &params);
+        for hu in [sat, sat * 1.5, sat * 10.0] {
+            let mut cell = CellProperties {
+                humidity_upper: hu,
+                cloud_water: 3.0,
+                ..CellProperties::default()
+            };
+            // condensation_rate = 0 isolates the reverse branch: any
+            // change to the stocks here can only come from it.
+            cloud_dynamics_for_cell(&mut cell, t_up, &params, 0.0);
+            assert_eq!(
+                cell.cloud_water.to_bits(),
+                3.0_f32.to_bits(),
+                "hu={hu} (sat={sat}): droplets moved, got {}",
+                cell.cloud_water
+            );
+            assert_eq!(
+                cell.humidity_upper.to_bits(),
+                hu.to_bits(),
+                "hu={hu} (sat={sat}): vapour moved, got {}",
+                cell.humidity_upper
+            );
+        }
+    }
+
+    proptest! {
+        /// The transition is a transfer, in both directions and at any
+        /// temperature: `humidity_upper + cloud_water` comes out of the
+        /// step as it went in, and neither stock goes negative. This is
+        /// the terrarium invariant at the scale of one cell.
+        #[test]
+        fn prop_cloud_dynamics_conserves_upper_water(
+            hu in 0.0_f32..80.0,
+            cloud in 0.0_f32..40.0,
+            t_up in -40.0_f32..40.0,
+            rate in 0.0_f32..1.0,
+        ) {
+            let params = AtmosphereParams::default();
+            let mut cell = CellProperties {
+                humidity_upper: hu,
+                cloud_water: cloud,
+                ..CellProperties::default()
+            };
+            let before = hu + cloud;
+            cloud_dynamics_for_cell(&mut cell, t_up, &params, rate);
+            let after = cell.humidity_upper + cell.cloud_water;
+            // f32 relative tolerance: the transfer is one add and one
+            // subtract on stocks up to 120 mm.
+            prop_assert!(
+                (after - before).abs() <= 1e-5 * before.max(1.0),
+                "before={before} after={after} (hu={} cloud={})",
+                cell.humidity_upper, cell.cloud_water
+            );
+            prop_assert!(cell.cloud_water >= 0.0, "negative cloud {}", cell.cloud_water);
+            prop_assert!(cell.humidity_upper >= 0.0, "negative vapour {}", cell.humidity_upper);
+        }
+    }
+
+    /// r250 perf effort: mass conservation of `step_cloud_diffusion`'s
+    /// scatter -> gather split, radius-2, and the isotropic split lands
+    /// equally on all 6 neighbors (no `coord::opposite_direction` bias:
+    /// the uniform-share simplification only holds if every neighbor of
+    /// the loaded center gets exactly the same amount back).
+    #[test]
+    fn cloud_diffusion_conserves_total_and_splits_equally_among_neighbors() {
+        let mut grid = HexGrid::from_radius(2);
+        grid.get_mut(HexCoord::new(0, 0)).unwrap().cloud_water = 6.0;
+        let params = AtmosphereParams {
+            cloud_diffusion_rate: 0.3,
+            ..AtmosphereParams::default()
+        };
+        let before: f32 = grid.iter().map(|(_, c)| c.cloud_water).sum();
+
+        let mut next = grid.clone();
+        let mut share = Vec::new();
+        let mut deltas = Vec::new();
+        step_cloud_diffusion(&grid, &mut next, &params, &mut share, &mut deltas);
+
+        let after: f32 = next.iter().map(|(_, c)| c.cloud_water).sum();
+        assert!(
+            (before - after).abs() < 1e-4,
+            "conservation violated: before={before}, after={after}"
+        );
+        let center = HexCoord::new(0, 0);
+        let expected_each = 6.0 * 0.3 / 6.0;
+        for n in center.neighbors() {
+            let got = next.get(n).unwrap().cloud_water;
+            assert!(
+                (got - expected_each).abs() < 1e-5,
+                "neighbor {n:?}: got {got}, expected {expected_each} (equal split)"
+            );
+        }
+        let center_after = next.get(center).unwrap().cloud_water;
+        assert!(
+            (center_after - 6.0 * 0.7).abs() < 1e-5,
+            "center must keep exactly (1 - rate) of its cloud water, got {center_after}"
         );
     }
 }

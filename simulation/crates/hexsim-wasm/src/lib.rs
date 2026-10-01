@@ -360,6 +360,22 @@ mod tests {
         assert_eq!(decoded["hour_tick"], before + 1);
     }
 
+    /// #L6: the embedded engine rebuilds its world at a different radius
+    /// through the exact same JSON command as the server, over the JS
+    /// boundary (`command`, not `world.apply` directly) — proof the wasm
+    /// shell doesn't need a bespoke reset path.
+    #[test]
+    fn reset_with_radius_resizes_the_embedded_world() {
+        let mut sim = tiny(); // radius 2, 19 cells
+        assert_eq!(sim.radius(), 2);
+        let out = sim.command(r#"{"cmd":"reset","radius":5}"#);
+        assert_eq!(kind(&out), "snapshot");
+        assert_eq!(sim.radius(), 5);
+        let bytes = sim.snapshot().expect("snapshot encode");
+        let snap: Value = rmp_serde::from_slice(&bytes).expect("snapshot msgpack");
+        assert_eq!(snap["cell_count"], 3 * 5 * (5 + 1) + 1);
+    }
+
     /// `advance` doesn't produce a snapshot: this is what lets the JS pay
     /// for one only per batch instead of per tick.
     #[test]

@@ -35,7 +35,7 @@ use hexsim_core::simulation::Simulation;
 use hexsim_core::snow::SnowParams;
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::terrain::{TerrainParams, generate_terrain};
-use hexsim_core::vegetation::{cell_total_vegetation, is_open_water};
+use hexsim_core::vegetation::{canopy_cover, is_open_water};
 use hexsim_core::wind::WindParams;
 
 const RADIUS: i32 = 30;
@@ -78,7 +78,8 @@ fn diag_water_cycle_baseline() {
     }
     let total_after_warmup = sim.diagnostics().water_budget.total;
 
-    // Annual biomass peak over the last year (biome definition).
+    // Annual peak of the canopy cover (cover seen from the sky, in [0, 1])
+    // over the last year (biome definition).
     let n = sim.grid().len();
     let mut peak = vec![0.0_f32; n];
     for y in 0..MEASURE_YEARS {
@@ -87,7 +88,7 @@ fn diag_water_cycle_baseline() {
             sim.step();
             if last_year {
                 for (p, c) in peak.iter_mut().zip(sim.grid().cells_slice()) {
-                    *p = p.max(cell_total_vegetation(c));
+                    *p = p.max(canopy_cover(c));
                 }
             }
         }
@@ -170,5 +171,5 @@ fn diag_water_cycle_baseline() {
         pct(sparse),
         pct(dense)
     );
-    println!("  total peak biomass={peak_total:.0}");
+    println!("  peak canopy cover summed over cells={peak_total:.0}");
 }

@@ -96,11 +96,16 @@ fn build_sim(seed: u32) -> Simulation {
     )
 }
 
+/// The terrarium's whole water stock: `Simulation::water_budget_total`,
+/// read and never re-assembled here (anti-pattern 2). Surface
+/// stocks per cell, the moist upper layer through its coarse REFERENCE
+/// stock (coarse upper layer, step 2: the fine `humidity_upper`/
+/// `cloud_water` are views rewritten by a non-conservative interpolation
+/// every hour, so summing them is not the mass), and the sky reservoir of
+/// the imposed weather regime (#63), which left the cells but not the
+/// world.
 fn total_water(sim: &Simulation) -> f32 {
-    sim.grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum()
+    sim.water_budget_total()
 }
 
 fn accumulate_measuring_tick(sim: &Simulation, stats: &mut SeedStats) {
@@ -214,13 +219,14 @@ fn run_one_seed(seed: u32, timer: &mut PerfTimer) -> SeedStats {
         let grid = sim.grid();
 
         for (coord, cell) in grid.iter() {
-            let props: [(&str, f32); 6] = [
+            let props: [(&str, f32); 7] = [
                 ("elevation", cell.elevation),
                 ("temperature", cell.temperature),
                 ("water_level", cell.water_level),
                 ("humidity", cell.humidity_total()),
                 ("groundwater", cell.groundwater),
                 ("snow_level", cell.snow_level),
+                ("ice_level", cell.ice_level),
             ];
             for (name, v) in props {
                 if !v.is_finite() && stats.nan_inf_events.len() < 5 {

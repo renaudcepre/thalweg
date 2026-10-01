@@ -256,6 +256,12 @@
         <button id="btn-random-seed" title="Random seed" class="pb-icon">⚄</button>
         <button id="btn-reset" title="Reset world" class="pb-danger">RESET</button>
       </div>
+      <div class="pb-row pb-row-radius">
+        <label class="pb-field">
+          <span>RADIUS</span>
+          <input id="radius-input" type="number" min="5" max="300" placeholder="?" title="Grid radius for the next reset. Empty = keep the current radius. Small radii (e.g. 30) run much faster, useful for quick tests.">
+        </label>
+      </div>
       <div class="pb-row pb-row-persist">
         <button id="btn-save" title="Export the full world state (.ckpt)">⤓ SAVE</button>
         <button id="btn-load" title="Import an exported state (.ckpt)">⤒ LOAD</button>
@@ -308,6 +314,10 @@
         <div class="stat-row mode-ws"><span class="stat-key">CPU</span><span id="stat-cpu" class="stat-val">-</span></div>
         <div class="stat-row"><span class="stat-key">RAM</span><span id="stat-ram" class="stat-val">-</span></div>
         <div class="stat-row"><span class="stat-key">Tick</span><span id="stat-tick-us" class="stat-val">-</span></div>
+        <!-- Radius/cell count come straight from the core's `meta` response
+             (anti-pattern #2, never recomputed here): refreshed on connect
+             and again right after every reset. -->
+        <div class="stat-row"><span class="stat-key">World</span><span id="stat-world" class="stat-val">-</span></div>
       </div>
     </section>
 

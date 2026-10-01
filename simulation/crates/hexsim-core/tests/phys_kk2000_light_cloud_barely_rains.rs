@@ -27,6 +27,8 @@ use hexsim_core::snow::SnowParams;
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::WindParams;
 
+mod common;
+
 #[test]
 fn light_cloud_barely_rains() {
     let mut grid = HexGrid::from_radius(2);
@@ -52,11 +54,18 @@ fn light_cloud_barely_rains() {
     // 0.37 → 3.0, which dispersed the pulse and conflated precip with
     // transport). Wind stays active for the convergence updraft that
     // gates precipitation.
-    let atmo = AtmosphereParams {
-        initial_humidity_floor: 0.0,
+    // #63 L2b: the fixture used to be `initial_humidity_floor = 0` plus
+    // the old `cloud_evap_rate`, i.e. a cloud sitting in air at RH 0 that
+    // the 0.10/day coefficient kept alive for days. Under the saturation
+    // adjustment that replaced it, the same cloud is gone within the hour
+    // and this test measured nothing. `freeze_phase_transition` pins both
+    // directions of the transition instead, which is the isolation this
+    // test wanted in the first place.
+    let mut atmo = AtmosphereParams {
         cloud_advection_rate: 0.0,
         ..AtmosphereParams::default()
     };
+    common::freeze_phase_transition(&mut atmo);
     let mut sim = Simulation::new(
         grid,
         HydroParams::default(),

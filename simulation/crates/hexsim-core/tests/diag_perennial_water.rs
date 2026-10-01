@@ -16,13 +16,18 @@
 //!    comes from there. If it collapses and never comes back up, no
 //!    perennial river.
 //! 3. **Persistence metric**: cells in water (lake OR river) at ALL the
-//!    monthly samples of a year, then across ALL the years.
+//!    monthly samples of a year, then across ALL the years. Split in two
+//!    columns since the climatological t0 (#152): deep terminal lakes are
+//!    perennial on their own and would mask the rivers. A frozen lake is
+//!    still a lake (#157): the lake mask is the core's water-body
+//!    predicate, liquid surplus plus ice.
 //!
 //! Run: `cargo test -p hexsim-core --release --test diag_perennial_water -- --ignored --nocapture`
 
 mod common;
 
 use common::build_prod_sim;
+use hexsim_core::groundwater::GroundwaterParams;
 use hexsim_core::simulation::Simulation;
 
 /// Discharge threshold that defines a "river cell" (def. front/diag #105).
@@ -51,8 +56,10 @@ struct Snapshot {
     mean_temp: f64,
     surface_total: f32,
     groundwater_total: f32,
+    aquifer_total: f32,
     snow_total: f32,
     river_total: f32,
+    groundwater_fill: f32,
     cells: Vec<CellSample>,
 }
 
@@ -63,21 +70,25 @@ fn snapshot(sim: &Simulation) -> Snapshot {
 
     let mut surface_total = 0.0;
     let mut groundwater_total = 0.0;
+    let mut aquifer_total = 0.0;
     let mut snow_total = 0.0;
     let mut river_total = 0.0;
     let mut temp_sum = 0.0;
+    let mut groundwater_capacity = 0.0;
+    let max_capacity = GroundwaterParams::default().max_capacity;
     let mut cells = Vec::with_capacity(n);
 
     for (i, (_, cell)) in grid.iter().enumerate() {
         surface_total += cell.water_level;
         groundwater_total += cell.groundwater;
+        aquifer_total += cell.aquifer;
         snow_total += cell.snow_level;
+        groundwater_capacity += cell.permeability * max_capacity;
         temp_sum += f64::from(cell.temperature);
         let d = discharge.get(i).copied().unwrap_or(0.0);
         river_total += d;
-        let surplus = cell.water_level - cell.water_capacity;
         cells.push(CellSample {
-            is_lake: surplus > LAKE_SURPLUS_MM,
+            is_lake: cell.is_open_water_at(LAKE_SURPLUS_MM),
             is_river: d > RIVER_THRESHOLD,
         });
     }
@@ -87,21 +98,38 @@ fn snapshot(sim: &Simulation) -> Snapshot {
         mean_temp: temp_sum / f64::from(u32::try_from(n).expect("cell count fits u32")),
         surface_total,
         groundwater_total,
+        aquifer_total,
         snow_total,
         river_total,
+        groundwater_fill: groundwater_total / groundwater_capacity,
         cells,
     }
 }
 
-/// Counts the cells "in water" at ALL the samples in the list.
-fn perennial_count(samples: &[Snapshot]) -> usize {
-    if samples.is_empty() {
-        return 0;
+/// Perennial cells over a window, per kind of water body.
+struct Perennial {
+    water: usize,
+    lake: usize,
+    river: usize,
+    river_off_lake: usize,
+}
+
+/// Counts the cells "in water" at ALL the samples in the list. A river
+/// reach is perennial when it flows at every sample; `river_off_lake`
+/// drops the cells that are also a lake at some sample (lake outlets and
+/// flow across a lake surface), the rivers an agent would build a mill on.
+fn perennial_count(samples: &[Snapshot]) -> Perennial {
+    let n = samples.first().map_or(0, |s| s.cells.len());
+    let always = |i: usize, f: fn(CellSample) -> bool| samples.iter().all(|s| f(s.cells[i]));
+    let never_lake = |i: usize| samples.iter().all(|s| !s.cells[i].is_lake);
+    Perennial {
+        water: (0..n).filter(|&i| always(i, CellSample::is_water)).count(),
+        lake: (0..n).filter(|&i| always(i, |c| c.is_lake)).count(),
+        river: (0..n).filter(|&i| always(i, |c| c.is_river)).count(),
+        river_off_lake: (0..n)
+            .filter(|&i| always(i, |c| c.is_river) && never_lake(i))
+            .count(),
     }
-    let n = samples[0].cells.len();
-    (0..n)
-        .filter(|&i| samples.iter().all(|s| s.cells[i].is_water()))
-        .count()
 }
 
 /// Peak of cells in water (the best instant): upper bound of the potential.
@@ -127,8 +155,8 @@ fn run_seed(seed: u32, radius: i32, warmup_years: u64, measure_years: u64) {
     let mut all_samples: Vec<Snapshot> = Vec::new();
 
     eprintln!(
-        "  {:>5} {:>6} {:>9} {:>8} {:>8} {:>8} {:>7} {:>7}",
-        "day", "T°C", "surface", "table", "snow", "rivers", "lakes", "rivC"
+        "  {:>5} {:>6} {:>9} {:>8} {:>5} {:>8} {:>8} {:>8} {:>7} {:>7}",
+        "day", "T°C", "surface", "table", "fill", "aquifer", "snow", "rivers", "lakes", "rivC"
     );
     for _year in 0..measure_years {
         let mut year_samples: Vec<Snapshot> = Vec::new();
@@ -140,11 +168,13 @@ fn run_seed(seed: u32, radius: i32, warmup_years: u64, measure_years: u64) {
             let lakes = s.cells.iter().filter(|c| c.is_lake).count();
             let rivers = s.cells.iter().filter(|c| c.is_river).count();
             eprintln!(
-                "  {:>5} {:>6.1} {:>9.0} {:>8.0} {:>8.0} {:>8.1} {:>7} {:>7}",
+                "  {:>5} {:>6.1} {:>9.0} {:>8.0} {:>5.3} {:>8.0} {:>8.0} {:>8.1} {:>7} {:>7}",
                 s.day,
                 s.mean_temp,
                 s.surface_total,
                 s.groundwater_total,
+                s.groundwater_fill,
+                s.aquifer_total,
                 s.snow_total,
                 s.river_total,
                 lakes,
@@ -154,13 +184,19 @@ fn run_seed(seed: u32, radius: i32, warmup_years: u64, measure_years: u64) {
         }
         let py = perennial_count(&year_samples);
         let peak = peak_water_cells(&year_samples);
-        eprintln!("    → year: {py} perennial cells / {peak} at peak");
+        eprintln!(
+            "    → year: {} perennial (lake {}, river {}, river off lake {}) / {peak} at peak",
+            py.water, py.lake, py.river, py.river_off_lake
+        );
         all_samples.append(&mut year_samples);
     }
 
     let overall = perennial_count(&all_samples);
     let peak = peak_water_cells(&all_samples);
-    eprintln!("  ===> PERENNIAL over {measure_years} years: {overall} cells (instant peak {peak})");
+    eprintln!(
+        "  ===> PERENNIAL over {measure_years} years: {} cells (lake {}, river {}, river off lake {}, instant peak {peak})",
+        overall.water, overall.lake, overall.river, overall.river_off_lake
+    );
 }
 
 /// Baseline #107: seed 7 r30 (the seed/radius from the issue), short window
@@ -169,6 +205,17 @@ fn run_seed(seed: u32, radius: i32, warmup_years: u64, measure_years: u64) {
 #[ignore = "diagnostic #107, perennial water baseline (seed 7, r30)"]
 fn perennial_baseline_seed7() {
     run_seed(7, 30, 3, 5);
+}
+
+/// Baseline protocol of the 2026-10-01 resumption: the three seeds of the
+/// #152 drift measurement, r30, 3 years of warmup (past the drainage
+/// transient #152 named) + 5 measured years.
+#[test]
+#[ignore = "diagnostic #107, perennial water, three seeds r30"]
+fn perennial_three_seeds_r30() {
+    for seed in [42, 7, 123] {
+        run_seed(seed, 30, 3, 5);
+    }
 }
 
 /// Multi-seed baseline, reduced radius to fit in a fast local CI.

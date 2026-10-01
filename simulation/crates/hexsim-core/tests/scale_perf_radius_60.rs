@@ -10,9 +10,27 @@ use std::time::Instant;
 
 use common::build_prod_sim;
 
-const RADIUS: i32 = 45;
+const DEFAULT_RADIUS: i32 = 45;
 const SEED: u32 = 42;
-const TICKS: u64 = 730;
+const DEFAULT_TICKS: u64 = 730;
+
+/// Grid radius, overridable to measure another scale without an edit:
+/// `HEXSIM_PERF_RADIUS=250 just perf-scale` (#88, r250 question).
+fn radius() -> i32 {
+    std::env::var("HEXSIM_PERF_RADIUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RADIUS)
+}
+
+/// Number of hourly ticks, overridable (`HEXSIM_PERF_TICKS`) so a very
+/// large grid can be measured on fewer ticks.
+fn ticks() -> u64 {
+    std::env::var("HEXSIM_PERF_TICKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TICKS)
+}
 /// I/O: cost of a snapshot + JSON serialization (what goes over the WS
 /// on every frame on the CLI side). Averaged over 50 iterations to smooth.
 const IO_ITERS: u32 = 50;
@@ -22,24 +40,28 @@ const IO_ITERS: u32 = 50;
 #[test]
 #[ignore = "benchmark (2 years, ~11k cells), just perf-scale"]
 fn scale_perf_radius_60() {
+    let radius = radius();
+    let ticks = ticks();
     let setup_start = Instant::now();
-    let mut sim = build_prod_sim(SEED, RADIUS);
+    let mut sim = build_prod_sim(SEED, radius);
     let cells = sim.grid().len();
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("Setup: {cells} cells (radius {RADIUS}) in {setup_ms:.0} ms");
+    eprintln!("Setup: {cells} cells (radius {radius}) in {setup_ms:.0} ms");
 
     let run_start = Instant::now();
-    for _ in 0..TICKS {
+    for _ in 0..ticks {
         sim.step();
     }
     let elapsed = run_start.elapsed().as_secs_f64();
-    let ticks_f = f64::from(u32::try_from(TICKS).unwrap_or(u32::MAX));
+    let ticks_f = f64::from(u32::try_from(ticks).unwrap_or(u32::MAX));
     let ticks_per_sec = ticks_f / elapsed;
     let ms_per_tick = (elapsed * 1000.0) / ticks_f;
+    let us_per_cell_tick =
+        1000.0 * ms_per_tick / f64::from(u32::try_from(cells).unwrap_or(u32::MAX));
 
     eprintln!(
-        "Simulation: {TICKS} ticks in {elapsed:.2} s -> {ticks_per_sec:.1} ticks/s \
-         ({ms_per_tick:.2} ms/tick)"
+        "Simulation: {ticks} ticks in {elapsed:.2} s -> {ticks_per_sec:.1} ticks/s \
+         ({ms_per_tick:.2} ms/tick, {us_per_cell_tick:.3} us/cell/tick)"
     );
 
     let mut snap_total_ms = 0.0_f64;

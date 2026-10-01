@@ -46,6 +46,21 @@ pub(crate) fn default_temp_params() -> TemperatureParams {
     TemperatureParams::default()
 }
 
+/// `AtmosphereParams::default()` with the imposed weather regime (#63)
+/// pinned off. Several conservation micro-tests in `mod.rs` measure
+/// moisture on the grid alone, one `step_atmosphere` call (or a loop that
+/// rebuilds `AtmoState::default()` every tick, discarding the sky
+/// reservoir along the way) at a time — they are checking advection and
+/// phase transitions, not the regime, and the regime's own export/return
+/// to the sky (untracked here) would otherwise read as a mass leak.
+/// #146, regime default flipped to on 2026-09-06.
+pub(crate) fn stationary_atmosphere() -> AtmosphereParams {
+    AtmosphereParams {
+        regime_enabled: 0.0,
+        ..AtmosphereParams::default()
+    }
+}
+
 /// Test harness for the orographic pump micro-tests: flat radius-2
 /// grid (100 m, 15 °C, dry), only the center cell receives
 /// `humidity_surface`. Each test then sculpts the elevation of the

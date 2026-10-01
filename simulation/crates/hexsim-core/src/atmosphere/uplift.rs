@@ -1,10 +1,12 @@
 use serde::Serialize;
 
+use crate::coord::opposite_direction;
 use crate::grid::HexGrid;
+use crate::par::{for_each_chunk_mut, for_each_chunk_mut2, for_each_chunk_mut6, sum_dir_out};
 use crate::physics::meyer_evaporation;
-use crate::species::SPECIES;
 use crate::temperature::{TemperatureParams, local_t_ref};
 use crate::time::TICKS_PER_DAY_F32;
+use crate::vegetation;
 use crate::wind::wind_magnitude_to_meters_per_second;
 
 use super::{AtmoScratch, AtmosphereParams, SOIL_GW_REFERENCE_MM, saturation_upper};
@@ -29,6 +31,52 @@ pub struct EvapStats {
     pub cell_count: usize,
 }
 
+/// Vapour one cell put into `humidity_surface` during one tick, by source
+/// (mm of water). The exact masses `step_evaporation` moved, read by the
+/// water-cycle instruments instead of being recomputed there (anti-pattern
+/// #2): where the box's water leaves the ground, lakes against land.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct VaporSources {
+    /// Free-water evaporation from the open surplus of a water body.
+    pub open_water: f32,
+    /// Plant transpiration, drawn from the root zone.
+    pub transpiration: f32,
+    /// Sublimation of the snowpack and lake ice.
+    pub sublimation: f32,
+}
+
+impl VaporSources {
+    #[must_use]
+    pub fn total(self) -> f32 {
+        self.open_water + self.transpiration + self.sublimation
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.open_water += other.open_water;
+        self.transpiration += other.transpiration;
+        self.sublimation += other.sublimation;
+    }
+}
+
+/// Per-cell output of the parallel pass of [`step_evaporation`]: the
+/// open-water evaporative demand that `EvapStats` reduces (mm/day, a
+/// negative sentinel for a cell not counted as open water), and the
+/// vapour actually moved this tick by source.
+#[derive(Debug, Clone, Copy)]
+pub struct EvapCell {
+    pub demand_mm_day: f32,
+    pub vapor: VaporSources,
+}
+
+impl Default for EvapCell {
+    fn default() -> Self {
+        Self {
+            demand_mm_day: -1.0,
+            vapor: VaporSources::default(),
+        }
+    }
+}
+
 /// Evaporation of liquid water + plant transpiration + snow sublimation.
 /// Feeds `humidity_surface`: freshly evaporated vapor must be lifted by
 /// uplift before it can precipitate. This temporal separation avoids the
@@ -42,94 +90,148 @@ pub struct EvapStats {
 /// and closes the vegetation → atmosphere loop.
 /// Snow sublimation remains phenomenological.
 ///
+/// `transpiration_cover` is the per-cell light-weighted cover
+/// (`vegetation::transpiration_cover`) memoized by the caller at the
+/// cadence of the vegetation (daily); `None` computes it per cell here.
+///
 /// `out` reports open-water evaporation stats (`EvapStats`) for whoever
-/// needs to display them (diagnostics): filled from the same loop, same
+/// needs to display them (diagnostics): filled from the same cells, same
 /// gate (`open_water > 0`, i.e. a real lake, not any puddle under
 /// capacity) and same memoized wind (`wind_mag`) that drive the flux
 /// actually applied below. This is now the sole computation of open-water
 /// evaporation; nothing else may recompute it (anti-pattern #2).
+///
+/// Split in two (r250 perf effort): a parallel per-cell pass (no neighbor
+/// reads, purely `current[i] -> next[i]`) writes each open-water cell's
+/// evaporative demand into `demand` (a negative sentinel for a cell not
+/// counted — dry, under capacity, or frozen), then a serial reduction
+/// over `demand` in index order folds it into `out`, in the exact order
+/// the historical single loop did: bit-identical, not merely within
+/// tolerance.
 pub fn step_evaporation(
     current: &HexGrid,
     next: &mut HexGrid,
     params: &AtmosphereParams,
     wind_mag: &[f32],
+    transpiration_cover: Option<&[f32]>,
+    cells_out: &mut Vec<EvapCell>,
     out: &mut EvapStats,
 ) {
+    let n = current.len();
+    cells_out.resize(n, EvapCell::default());
+    let cur = current.cells_slice();
+
+    // Folds the historical `current → next` full-grid copy (formerly done
+    // by the caller, `step_atmosphere_into`) into this same sweep (r250
+    // perf effort, chunk B2): this is the phase's first per-cell pass,
+    // it reads only `current[i]` and read-only tick inputs, and writes
+    // only `next[i]` — starting each cell from `*next_cell = cell.clone()`
+    // before applying evaporation/transpiration/sublimation is
+    // bit-identical to the separate copy, one fewer 88-byte full-grid
+    // stream per tick.
+    for_each_chunk_mut2(
+        next.cells_slice_mut(),
+        cells_out,
+        |start, next_chunk, out_chunk| {
+            for (local, next_cell) in next_chunk.iter_mut().enumerate() {
+                let i = start + local;
+                let cell = &cur[i];
+                *next_cell = cell.clone();
+                // Reference evaporative demand ET₀ (Dalton/Meyer), in mm/day.
+                // Shared by free-water evaporation and plant transpiration: same
+                // vapor transfer physics, modulated differently downstream.
+                // Magnitude precomputed at the cadence of the wind field (#89):
+                // the field only changes one hour out of N, the per-cell-hour
+                // sqrt was pure recomputation.
+                let wind_ms =
+                    wind_magnitude_to_meters_per_second(wind_mag.get(i).copied().unwrap_or(0.0));
+                let cap = saturation_upper(cell.temperature, params).max(1e-6);
+                let rh = (cell.humidity_surface / cap).clamp(0.0, 1.0);
+                let evap_demand_per_day = if cell.temperature >= 0.0 {
+                    meyer_evaporation(cell.temperature, cell.temperature, rh, wind_ms).0
+                } else {
+                    0.0
+                };
+
+                // Free-water evaporation (lakes): the demand applies to the
+                // open surface, drawn from `water_level`.
+                let open_water = (cell.water_level - cell.water_capacity).max(0.0);
+                let mut record = EvapCell::default();
+                if open_water > 0.0 && cell.temperature >= 0.0 {
+                    let evap = (evap_demand_per_day / TICKS_PER_DAY_F32).min(open_water);
+                    next_cell.water_level -= evap;
+                    next_cell.humidity_surface += evap;
+                    record.demand_mm_day = evap_demand_per_day;
+                    record.vapor.open_water = evap;
+                }
+
+                // Plant transpiration (#77, replaces the `ground_evap_rate`
+                // proxy). FAO-56: `ET = Kc × ET₀ × water_stress`, with
+                // Kc = Kc_max × biomass (biomass [0,1] proxies LAI / cover
+                // fraction) and water stress = groundwater saturation. Water
+                // is drawn *from* `groundwater` and returned to
+                // `humidity_surface`: strict conservation (uptake =
+                // transpiration), no double counting.
+                // Cover weighted by each species' crop coefficient (FAO-56,
+                // #83) and by the light its stratum receives (#161):
+                // Σ crop_coef_i × biomass_i × transmittance(stratum_i). A
+                // forest transpires more than a lawn at equal cover. The
+                // light factor comes from Penman-Monteith: transpiration is
+                // driven by the radiation the leaves absorb, so a layer
+                // under a canopy that intercepts ~90 % of the shortwave
+                // transpires ~10 % of what it would in the open. That keeps
+                // Kc bounded by the light budget of the column, even with
+                // three full strata (Σ biomass up to 3), without any clamp
+                // (anti-pattern #4): each layer below only works with what
+                // the layers above let through (Beer-Lambert, Monsi & Saeki
+                // 1953). The sum lives in `vegetation::transpiration_cover`;
+                // the caller hands it memoized once a day (`Simulation`,
+                // vegetation only changes in the daily tail) or `None` to
+                // have it computed here, identically.
+                let weighted_cover = transpiration_cover
+                    .map_or_else(|| vegetation::transpiration_cover(cell), |memo| memo[i]);
+                if weighted_cover > 0.0
+                    && params.transpiration_coef > 0.0
+                    && cell.temperature >= 0.0
+                {
+                    let gw_capacity = (cell.permeability * SOIL_GW_REFERENCE_MM).max(1e-6);
+                    let water_stress = (cell.groundwater / gw_capacity).clamp(0.0, 1.0);
+                    let kc = params.transpiration_coef * weighted_cover;
+                    let transp_per_day = evap_demand_per_day * kc * water_stress;
+                    let transp = (transp_per_day / TICKS_PER_DAY_F32).min(cell.groundwater);
+                    next_cell.groundwater -= transp;
+                    next_cell.humidity_surface += transp;
+                    record.vapor.transpiration = transp;
+                }
+                if cell.frozen_surface() > 0.0 && cell.temperature < 0.0 {
+                    let cold_factor = (-cell.temperature / 10.0).clamp(0.0, 1.0);
+                    let sublim = (params.sublimation_rate * cold_factor).min(cell.frozen_surface());
+                    // Exact transfer (cf. `snow::step_snow`): credit humidity
+                    // with what ACTUALLY left the frozen stocks (snowpack
+                    // first, then lake ice). On a glacier several meters
+                    // deep, f32 ULP (~0.5 mm at 4 m) means the rounded
+                    // decrement differs from the computed `sublim`; the gap,
+                    // constant and sign-biased, leaked into the strict
+                    // conservation test (#60 Phase 3, diagnosed via knockout).
+                    let departed = next_cell.take_frozen(sublim);
+                    next_cell.humidity_surface += departed;
+                    record.vapor.sublimation = departed;
+                }
+                out_chunk[local] = record;
+            }
+        },
+    );
+
     let mut evap_sum = 0.0_f32;
     let mut evap_min = f32::INFINITY;
     let mut evap_max = 0.0_f32;
     let mut evap_count = 0_usize;
-
-    let cur = current.cells_slice();
-    let next_cells = next.cells_slice_mut();
-    for (i, cell) in cur.iter().enumerate() {
-        // Reference evaporative demand ET₀ (Dalton/Meyer), in mm/day.
-        // Shared by free-water evaporation and plant transpiration: same
-        // vapor transfer physics, modulated differently downstream.
-        // Magnitude precomputed at the cadence of the wind field (#89): the
-        // field only changes one hour out of N, the per-cell-hour sqrt was
-        // pure recomputation.
-        let wind_ms = wind_magnitude_to_meters_per_second(wind_mag.get(i).copied().unwrap_or(0.0));
-        let cap = saturation_upper(cell.temperature, params).max(1e-6);
-        let rh = (cell.humidity_surface / cap).clamp(0.0, 1.0);
-        let evap_demand_per_day = if cell.temperature >= 0.0 {
-            meyer_evaporation(cell.temperature, cell.temperature, rh, wind_ms).0
-        } else {
-            0.0
-        };
-
-        // Free-water evaporation (lakes): the demand applies to the open
-        // surface, drawn from `water_level`.
-        let open_water = (cell.water_level - cell.water_capacity).max(0.0);
-        if open_water > 0.0 && cell.temperature >= 0.0 {
-            let evap = (evap_demand_per_day / TICKS_PER_DAY_F32).min(open_water);
-            next_cells[i].water_level -= evap;
-            next_cells[i].humidity_surface += evap;
-
-            // `out`: same gate, same value, no separate pass over the grid.
-            evap_sum += evap_demand_per_day;
-            evap_min = evap_min.min(evap_demand_per_day);
-            evap_max = evap_max.max(evap_demand_per_day);
+    for d in cells_out.iter().map(|c| c.demand_mm_day) {
+        if d >= 0.0 {
+            evap_sum += d;
+            evap_min = evap_min.min(d);
+            evap_max = evap_max.max(d);
             evap_count += 1;
-        }
-
-        // Plant transpiration (#77, replaces the `ground_evap_rate` proxy).
-        // FAO-56: `ET = Kc × ET₀ × water_stress`, with Kc = Kc_max × biomass
-        // (biomass [0,1] proxies LAI / cover fraction) and water stress =
-        // groundwater saturation. Water is drawn *from* `groundwater` and
-        // returned to `humidity_surface`: strict conservation (uptake =
-        // transpiration), no double counting.
-        // Cover weighted by each species' crop coefficient (FAO-56,
-        // #83): Σ crop_coef_i × biomass_i. A forest transpires more than a
-        // lawn at equal cover.
-        let weighted_cover: f32 = cell
-            .vegetation
-            .iter()
-            .zip(SPECIES.iter())
-            .map(|(&v, s)| v * s.crop_coef)
-            .sum();
-        if weighted_cover > 0.0 && params.transpiration_coef > 0.0 && cell.temperature >= 0.0 {
-            let gw_capacity = (cell.permeability * SOIL_GW_REFERENCE_MM).max(1e-6);
-            let water_stress = (cell.groundwater / gw_capacity).clamp(0.0, 1.0);
-            let kc = params.transpiration_coef * weighted_cover;
-            let transp_per_day = evap_demand_per_day * kc * water_stress;
-            let transp = (transp_per_day / TICKS_PER_DAY_F32).min(cell.groundwater);
-            next_cells[i].groundwater -= transp;
-            next_cells[i].humidity_surface += transp;
-        }
-        if cell.snow_level > 0.0 && cell.temperature < 0.0 {
-            let cold_factor = (-cell.temperature / 10.0).clamp(0.0, 1.0);
-            let sublim = (params.sublimation_rate * cold_factor).min(cell.snow_level);
-            // Exact transfer (cf. `snow::step_snow`): credit humidity with
-            // what ACTUALLY left the snow stock. On a glacier several
-            // meters deep, f32 ULP (~0.5 mm at 4 m) means the rounded
-            // decrement differs from the computed `sublim`; the gap,
-            // constant and sign-biased, leaked into the strict
-            // conservation test (#60 Phase 3, diagnosed via knockout).
-            let new_snow = next_cells[i].snow_level - sublim;
-            let departed = next_cells[i].snow_level - new_snow;
-            next_cells[i].snow_level = new_snow;
-            next_cells[i].humidity_surface += departed;
         }
     }
 
@@ -162,27 +264,32 @@ pub(crate) fn step_uplift(
     sin_elev_pos: f32,
 ) {
     let lat_rad = temp_params.latitude_deg.to_radians();
-    for cell in next.cells_slice_mut().iter_mut() {
-        if cell.humidity_surface <= 0.0 {
-            continue;
+    // Purely local transform of each cell (no neighbor read, no other
+    // input slice): a pure per-cell map, parallelizable
+    // (`par::for_each_chunk_mut`).
+    for_each_chunk_mut(next.cells_slice_mut(), |_start, chunk| {
+        for cell in chunk {
+            if cell.humidity_surface <= 0.0 {
+                continue;
+            }
+            let temp_boost = cell.temperature.max(0.0) * params.uplift_thermal_coef;
+            // Diurnal drive: active only when the sun is above the horizon. At
+            // T_excess=25 K and sin_elev=0.9, contribution ≈ 25 × 0.9 ×
+            // convective_diurnal_coef. No extra cap here; the final clamp to
+            // 0.9 on `rate` guarantees stability.
+            let diurnal_drive = if sin_elev_pos > 0.0 && params.convective_diurnal_coef > 0.0 {
+                let t_ref = local_t_ref(cell.elevation, cell.water_level, temp_params, lat_rad);
+                let t_excess = (cell.temperature - t_ref).max(0.0);
+                t_excess * sin_elev_pos * params.convective_diurnal_coef
+            } else {
+                0.0
+            };
+            let rate = (params.uplift_rate + temp_boost + diurnal_drive).clamp(0.0, 0.9);
+            let transfer = cell.humidity_surface * rate;
+            cell.humidity_surface -= transfer;
+            cell.humidity_upper += transfer;
         }
-        let temp_boost = cell.temperature.max(0.0) * params.uplift_thermal_coef;
-        // Diurnal drive: active only when the sun is above the horizon. At
-        // T_excess=25 K and sin_elev=0.9, contribution ≈ 25 × 0.9 ×
-        // convective_diurnal_coef. No extra cap here; the final clamp to
-        // 0.9 on `rate` guarantees stability.
-        let diurnal_drive = if sin_elev_pos > 0.0 && params.convective_diurnal_coef > 0.0 {
-            let t_ref = local_t_ref(cell.elevation, cell.water_level, temp_params, lat_rad);
-            let t_excess = (cell.temperature - t_ref).max(0.0);
-            t_excess * sin_elev_pos * params.convective_diurnal_coef
-        } else {
-            0.0
-        };
-        let rate = (params.uplift_rate + temp_boost + diurnal_drive).clamp(0.0, 0.9);
-        let transfer = cell.humidity_surface * rate;
-        cell.humidity_surface -= transfer;
-        cell.humidity_upper += transfer;
-    }
+    });
 }
 
 /// Orographic convection: independent of wind, each cell sends a
@@ -193,6 +300,21 @@ pub(crate) fn step_uplift(
 /// terrarium where thermal breezes would otherwise flow down relief
 /// instead of up it. The split between neighbors is proportional to
 /// the positive elevation difference.
+///
+/// Two-phase scatter → gather (r250 perf effort): phase 1 computes, per
+/// SOURCE cell and independent of every other source (the LCL bound only
+/// ever reads the pre-tick snapshots `src_upper`/`sat_upper_offset`,
+/// never another source's contribution), the amount pumped toward each
+/// of its 6 neighbors into `scratch.dir_out` (`for_each_chunk_mut6`,
+/// parallel). Phase 2 gathers it back per DESTINATION cell via
+/// `coord::opposite_direction`, deriving both self-loss terms
+/// (`delta_surface`, `delta_upper`) from `Σ_d dir_out[d][i]` — the total
+/// this cell itself pumped out — split between the surface/upper pools
+/// in the same ratio the pre-scale flux used
+/// (`p_surf = surf / (surf + upper·0.25)`, independent of `scale`, so
+/// exact): no separate self-term buffer is needed. The apply pass is
+/// unchanged.
+///
 pub(crate) fn step_orographic_convection(
     current: &HexGrid,
     next: &mut HexGrid,
@@ -205,11 +327,6 @@ pub(crate) fn step_orographic_convection(
     let n = current.len();
     let next_cells = next.cells_slice_mut();
     let cur_cells = current.cells_slice();
-
-    // Saturation per upper neighbor: precomputed once per tick (#97), read
-    // here by index. The temperature consumed (pre-advection) is the one
-    // this snapshot captured earlier: same value, bit-identical.
-    let sat_upper_offset = &scratch.sat_upper_offset;
 
     // Snapshot of the fields before deltas. Deltas are computed in pure
     // read mode and applied in pass 2: no write contention possible.
@@ -227,120 +344,289 @@ pub(crate) fn step_orographic_convection(
         elev_snap.push(cur_cells[i].elevation);
     }
 
-    let delta_surface = &mut scratch.oro_delta_surface;
-    let delta_upper_out = &mut scratch.oro_delta_upper_out; // upper losses from the source
-    let delta_upper_in = &mut scratch.oro_delta_upper_in; // upper gains for the target
-    delta_surface.clear();
-    delta_surface.resize(n, 0.0);
-    delta_upper_out.clear();
-    delta_upper_out.resize(n, 0.0);
-    delta_upper_in.clear();
-    delta_upper_in.resize(n, 0.0);
+    // Phase 1 (outflow): per source cell, the amount pumped toward each
+    // of its 6 neighbors, 0 for a non-higher direction. Reads only the
+    // pre-tick snapshots above and `sat_upper_offset` (#97): fully
+    // independent per source.
+    for dir in &mut scratch.dir_out {
+        dir.clear();
+        dir.resize(n, 0.0);
+    }
+    fill_oro_outflow(
+        &OroForcing {
+            grid: current,
+            src_surface,
+            src_upper,
+            elev_snap,
+            sat_upper_offset: &scratch.sat_upper_offset,
+            coef: params.orographic_lift_coef,
+        },
+        &mut scratch.dir_out,
+    );
 
-    for i in 0..n {
-        let src_elev = elev_snap[i];
-        let surf = src_surface[i];
-        let upper = src_upper[i];
-        if surf <= 0.0 && upper <= 0.0 {
-            continue;
-        }
-        // Toric neighborhood: orographic uplift also sees the relief on
-        // the other side of the seam (periodic terrain). Without this,
-        // edge cells had a truncated neighborhood → ring bias.
-        let neighbors = current.neighbor_indices_toric(i);
-        let mut total_positive_delta = 0.0_f32;
-        for j in neighbors {
-            let n_elev = elev_snap[j];
-            if n_elev > src_elev {
-                total_positive_delta += n_elev - src_elev;
-            }
-        }
-        if total_positive_delta < 1e-6 {
-            continue;
-        }
-        // Cap 0.30: at most 30% of humidity_surface exported per tick.
-        // At 0.80 (initial value) the pump sucked everything toward the
-        // peaks, creating pathological glaciers that captured ~95% of the
-        // water stock within a few years. 0.30 leaves enough humidity for
-        // the local cycle without enslaving the system.
-        let rate = (params.orographic_lift_coef * total_positive_delta).clamp(0.0, 0.30);
-        // Lift surface -> upper(higher neighbor): main flux, rate `rate`.
-        let lift_surface_brut = surf * rate;
-        // Pump upper -> upper(higher neighbor): 0.25x, secondary suction,
-        // much weaker so as not to dry out `humidity_upper` in the
-        // lowlands.
-        let lift_upper_brut = upper * rate * 0.25;
-        let total_in_brut = lift_surface_brut + lift_upper_brut;
-        if total_in_brut < 1e-9 {
-            continue;
-        }
+    // Phase 2 (gather): per destination cell, the surface/upper deltas.
+    scratch.oro_delta_surface.clear();
+    scratch.oro_delta_surface.resize(n, 0.0);
+    scratch.oro_delta_upper.clear();
+    scratch.oro_delta_upper.resize(n, 0.0);
+    gather_oro_deltas(
+        current,
+        &scratch.dir_out,
+        &scratch.oro_src_surface,
+        &scratch.oro_src_upper,
+        &mut scratch.oro_delta_surface,
+        &mut scratch.oro_delta_upper,
+    );
 
-        // LCL bound (#63 Phase 4 Step 3): orographic transport toward a
-        // higher neighbor cannot exceed the saturation deficit of
-        // `humidity_upper` at the destination. An air parcel rising
-        // adiabatically precipitates locally at the LCL: it cannot carry
-        // more than `sat_upper - hu_dest`. Without this bound the pump
-        // injected HR_upper p99 = 16-288 onto the peaks (cf JOURNAL pivot
-        // #63 Phase 4 Step 3).
-        //
-        // Conservative algorithm: find the attenuation factor `scale ≤ 1`
-        // such that for EACH higher neighbor j, `total_in × share_j ≤
-        // deficit_j`. The surplus stays at the source in humidity_surface
-        // AND humidity_upper proportionally (the physical mechanism =
-        // compensating downdraft).
-        let mut max_total_in_allowed = f32::INFINITY;
-        for j in neighbors {
-            let n_elev = elev_snap[j];
-            if n_elev <= src_elev {
+    // Apply pass: reads only `oro_delta_*[i]` (fully computed by the
+    // gather phase above), writes only `next_cells[i]` — a pure per-cell
+    // map, parallelizable (`par::for_each_chunk_mut`).
+    let delta_surface = &scratch.oro_delta_surface;
+    let delta_upper = &scratch.oro_delta_upper;
+    for_each_chunk_mut(next_cells, |start, chunk| {
+        for (local, cell) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            let ds = delta_surface[i];
+            let du = delta_upper[i];
+            if ds == 0.0 && du == 0.0 {
                 continue;
             }
-            let share_j = (n_elev - src_elev) / total_positive_delta;
-            if share_j < 1e-9 {
+            cell.humidity_surface = (cell.humidity_surface + ds).max(0.0);
+            cell.humidity_upper = (cell.humidity_upper + du).max(0.0);
+        }
+    });
+}
+
+/// Fraction of a source cell's moisture the orographic pump exports in one
+/// tick, given the relief that surrounds it.
+///
+/// # The law (#156)
+///
+/// Orographic ascent velocity, Smith (1979) linear mountain-wave theory,
+/// reviewed by Roe (2005), *Orographic precipitation*, Annu. Rev. Earth
+/// Planet. Sci. **33**, §2.1:
+///
+/// ```text
+/// w_oro = U_slope · s⁺                         [m/s]
+/// ```
+///
+/// with `s⁺ = Σ_j max(z_j − z_i, 0) / L` the dimensionless convergent
+/// upslope gradient around the source (`L` = `dynamics::CELL_SPACING_M`)
+/// and `U_slope` the horizontal speed feeding the slope.
+///
+/// Venting a moist layer of depth `H` at that velocity is a first-order
+/// drain, `dq/dt = −q · w_oro / H`, whose closed form over a tick of `dt`
+/// is
+///
+/// ```text
+/// rate = 1 − exp(−dt/τ),   τ = H / w_oro       [s]
+/// x = dt/τ = U_slope·dt/(H·L) · Σ Δz⁺          [-]
+/// ```
+///
+/// `orographic_lift_coef`, already divided by `TICKS_PER_DAY` by
+/// `scale_atmosphere_for_hourly_tick` when it gets here, IS that group
+/// `U_slope·dt/(H·L)`, in **per metre of relief and per tick**. At the
+/// shipped default (0.05 /day/m, `H` = `upper_layer_altitude_m` = 1500 m,
+/// `L` = 130 m, `dt` = 3600 s) the implied `U_slope ≈ 0.11 m/s`, inside
+/// the 1-10 cm/s range measured for thermally driven export of
+/// boundary-layer air to the free troposphere over the Alps (Henne et al.
+/// 2004, *Atmos. Chem. Phys.* **4**, 497-509, "Quantification of
+/// topographic venting of boundary layer air to the free troposphere").
+/// Pinned by `orographic_coef_implies_a_measured_venting_speed`.
+///
+/// # Why an exponential and not a cap
+///
+/// `1 − exp(−x)` is in `[0, 1]` **by construction**, so the only bound
+/// left on the pump is the conservation one — a cell cannot export more
+/// than the stock it holds — plus the LCL bound at the destination
+/// (see [`fill_oro_outflow`]). No `clamp` is reachable in normal regime.
+/// In `f32` the value rounds to exactly `1.0` past `x ≈ 16.6` (`exp(−x)`
+/// drops below the ulp of 1); that is still the conservation bound and not
+/// an overflow — [`fill_oro_outflow`]'s split gives a surface loss of
+/// `total_out × surf/(surf + 0.25·upper) ≤ surf`, so the source empties
+/// and never goes negative.
+/// It is also the exact integral of the drain above, the same treatment
+/// `condensation`/`regime` already give their relaxations, and it keeps
+/// `d(rate)/d(coef) ≈ dt/τ` at small `x`: the coefficient still means
+/// something on a gentle slope.
+///
+/// The law it replaces, `(coef · Σ Δz⁺).clamp(0.0, 0.30)`, was a stability
+/// guard that had become the physics. Since `CELL_SPACING_M` went to 130 m
+/// (d6be105) the cap binds at `Σ Δz⁺ = 144 m`, about two ordinary 30°
+/// neighbours, so 64-78 % of the pumping cell-passes above 300 m ran at
+/// exactly 0.30 whatever `orographic_lift_coef` was — anti-pattern 4,
+/// measured JOURNAL 2026-09-05, quantified by `diag_oro_pump_saturation`,
+/// tracked as issue #156. It was kept reachable bit for bit as an A/B
+/// lever (`HEXSIM_ORO_LEGACY_CLAMP`) until this law had been green and
+/// merged long enough (since 2026-09-05) to retire it, 2026-09-07.
+#[must_use]
+fn oro_pump_rate(coef: f32, total_positive_delta_m: f32) -> f32 {
+    let x = coef * total_positive_delta_m;
+    1.0 - (-x).exp()
+}
+
+/// Read-only tick inputs of [`fill_oro_outflow`], grouped per convention
+/// #61: the pass already sat at the 7-argument ceiling.
+struct OroForcing<'a> {
+    grid: &'a HexGrid,
+    src_surface: &'a [f32],
+    src_upper: &'a [f32],
+    elev_snap: &'a [f32],
+    sat_upper_offset: &'a [f32],
+    /// `orographic_lift_coef`, already scaled to the tick.
+    coef: f32,
+}
+
+/// Phase 1 of [`step_orographic_convection`]: per source cell, the
+/// amount pumped toward each of its 6 neighbors (0 for a non-higher
+/// direction). Reads only the pre-tick snapshots and `sat_upper_offset`
+/// (#97): fully independent per source, parallelizable
+/// (`par::for_each_chunk_mut6`).
+fn fill_oro_outflow(forcing: &OroForcing, dir_out: &mut [Vec<f32>; 6]) {
+    let &OroForcing {
+        grid,
+        src_surface,
+        src_upper,
+        elev_snap,
+        sat_upper_offset,
+        coef,
+    } = forcing;
+    for_each_chunk_mut6(dir_out, |start, chunks| {
+        for local in 0..chunks[0].len() {
+            let i = start + local;
+            for chunk in chunks.iter_mut() {
+                chunk[local] = 0.0;
+            }
+            let src_elev = elev_snap[i];
+            let surf = src_surface[i];
+            let upper = src_upper[i];
+            if surf <= 0.0 && upper <= 0.0 {
                 continue;
             }
-            let sat_j = sat_upper_offset[j];
-            let deficit_j = (sat_j - src_upper[j]).max(0.0);
-            let limit = deficit_j / share_j;
-            if limit < max_total_in_allowed {
-                max_total_in_allowed = limit;
+            // Toric neighborhood: orographic uplift also sees the relief
+            // on the other side of the seam (periodic terrain). Without
+            // this, edge cells had a truncated neighborhood → ring bias.
+            let neighbors = grid.neighbor_indices_toric(i);
+            let mut total_positive_delta = 0.0_f32;
+            for j in neighbors {
+                let n_elev = elev_snap[j];
+                if n_elev > src_elev {
+                    total_positive_delta += n_elev - src_elev;
+                }
+            }
+            if total_positive_delta < 1e-6 {
+                continue;
+            }
+            // Exported fraction of the surface layer, see
+            // [`oro_pump_rate`]: `1 − exp(−coef · Σ Δz⁺)`, in [0, 1] by
+            // construction. The only bounds on this pump are conservation
+            // (here) and the LCL deficit at the destination (below).
+            let rate = oro_pump_rate(coef, total_positive_delta);
+            // Lift surface -> upper(higher neighbor): main flux.
+            let lift_surface_brut = surf * rate;
+            // Pump upper -> upper(higher neighbor): 0.25x, secondary
+            // suction, much weaker so as not to dry out `humidity_upper`
+            // in the lowlands.
+            let lift_upper_brut = upper * rate * 0.25;
+            let total_in_brut = lift_surface_brut + lift_upper_brut;
+            if total_in_brut < 1e-9 {
+                continue;
+            }
+
+            // LCL bound (#63 Phase 4 Step 3): orographic transport
+            // toward a higher neighbor cannot exceed the saturation
+            // deficit of `humidity_upper` at the destination. An air
+            // parcel rising adiabatically precipitates locally at the
+            // LCL: it cannot carry more than `sat_upper - hu_dest`.
+            // Without this bound the pump injected HR_upper p99 =
+            // 16-288 onto the peaks (cf JOURNAL pivot #63 Phase 4
+            // Step 3).
+            //
+            // Conservative algorithm: find the attenuation factor
+            // `scale ≤ 1` such that for EACH higher neighbor j,
+            // `total_in × share_j ≤ deficit_j`. The surplus stays at the
+            // source (the physical mechanism = compensating downdraft).
+            let mut max_total_in_allowed = f32::INFINITY;
+            for j in neighbors {
+                let n_elev = elev_snap[j];
+                if n_elev <= src_elev {
+                    continue;
+                }
+                let share_j = (n_elev - src_elev) / total_positive_delta;
+                if share_j < 1e-9 {
+                    continue;
+                }
+                let sat_j = sat_upper_offset[j];
+                let deficit_j = (sat_j - src_upper[j]).max(0.0);
+                let limit = deficit_j / share_j;
+                if limit < max_total_in_allowed {
+                    max_total_in_allowed = limit;
+                }
+            }
+            let scale = (max_total_in_allowed / total_in_brut).clamp(0.0, 1.0);
+            let total_in = total_in_brut * scale;
+
+            for (d, &j) in neighbors.iter().enumerate() {
+                let n_elev = elev_snap[j];
+                if n_elev > src_elev {
+                    let share = (n_elev - src_elev) / total_positive_delta;
+                    chunks[d][local] = total_in * share;
+                }
             }
         }
-        let scale = (max_total_in_allowed / total_in_brut).clamp(0.0, 1.0);
+    });
+}
 
-        let lift_surface = lift_surface_brut * scale;
-        let lift_upper = lift_upper_brut * scale;
-        let total_in = lift_surface + lift_upper;
+/// Phase 2 of [`step_orographic_convection`]: per destination cell, the
+/// surface/upper deltas. `Σ_d dir_out[d][j]` is exactly what `j` itself
+/// pumped out in phase 1 (whatever it lost to distribute among ITS
+/// higher neighbors); splitting it back into a surface share and an
+/// upper share uses the same ratio the pre-scale flux used
+/// (`lift_surface_brut : lift_upper_brut`, independent of `scale` since
+/// both are scaled identically), so this is exact, not an approximation.
+fn gather_oro_deltas(
+    current: &HexGrid,
+    dir_out: &[Vec<f32>; 6],
+    src_surface: &[f32],
+    src_upper: &[f32],
+    delta_surface: &mut [f32],
+    delta_upper: &mut [f32],
+) {
+    for_each_chunk_mut2(delta_surface, delta_upper, |start, ds_chunk, du_chunk| {
+        for local in 0..ds_chunk.len() {
+            let j = start + local;
+            let total_out = sum_dir_out(dir_out, j);
+            let denom = src_surface[j] + src_upper[j] * 0.25;
+            let p_surf = if denom > 0.0 {
+                src_surface[j] / denom
+            } else {
+                0.0
+            };
+            let self_surface_loss = total_out * p_surf;
+            let self_upper_loss = total_out - self_surface_loss;
 
-        delta_surface[i] -= lift_surface;
-        delta_upper_out[i] -= lift_upper;
-        for j in neighbors {
-            let n_elev = elev_snap[j];
-            if n_elev > src_elev {
-                let share = (n_elev - src_elev) / total_positive_delta;
-                delta_upper_in[j] += total_in * share;
+            let neighbors = current.neighbor_indices_toric(j);
+            let mut gathered_in = 0.0_f32;
+            for (d, &k) in neighbors.iter().enumerate() {
+                gathered_in += dir_out[opposite_direction(d)][k];
             }
-        }
-    }
 
-    for (i, cell) in next_cells.iter_mut().enumerate() {
-        let ds = delta_surface[i];
-        let du = delta_upper_out[i] + delta_upper_in[i];
-        if ds == 0.0 && du == 0.0 {
-            continue;
+            ds_chunk[local] = -self_surface_loss;
+            du_chunk[local] = gathered_in - self_upper_loss;
         }
-        cell.humidity_surface = (cell.humidity_surface + ds).max(0.0);
-        cell.humidity_upper = (cell.humidity_upper + du).max(0.0);
-    }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atmosphere::scaling::scale_atmosphere_for_hourly_tick;
+    use crate::atmosphere::scaling::{oro_boosted_params, scale_atmosphere_for_hourly_tick};
     use crate::atmosphere::test_support::{assert_lcl_slack, default_temp_params, oro_pump_world};
     use crate::atmosphere::{surface_means, total_humidity, upper_air_temperature};
     use crate::coord::DIRECTIONS;
     use crate::coord::HexCoord;
+    use crate::dynamics::CELL_SPACING_M;
+    use crate::temperature::SECONDS_PER_HOUR;
     use crate::units::MetersPerSecond;
 
     #[test]
@@ -381,9 +667,18 @@ mod tests {
         let mut next = current.clone();
         let params = AtmosphereParams::default();
         let wind_mag = vec![0.0_f32; current.len()];
+        let mut demand = Vec::new();
         let mut stats = EvapStats::default();
 
-        step_evaporation(&current, &mut next, &params, &wind_mag, &mut stats);
+        step_evaporation(
+            &current,
+            &mut next,
+            &params,
+            &wind_mag,
+            None,
+            &mut demand,
+            &mut stats,
+        );
 
         assert_eq!(
             stats.cell_count, 1,
@@ -414,14 +709,165 @@ mod tests {
         let mut next = current.clone();
         let params = AtmosphereParams::default();
         let wind_mag = vec![0.0_f32; current.len()];
+        let mut demand = Vec::new();
         let mut stats = EvapStats::default();
 
-        step_evaporation(&current, &mut next, &params, &wind_mag, &mut stats);
+        step_evaporation(
+            &current,
+            &mut next,
+            &params,
+            &wind_mag,
+            None,
+            &mut demand,
+            &mut stats,
+        );
 
         assert_eq!(stats.cell_count, 0);
         assert!(stats.mean_mm_day.abs() < 1e-6);
         assert!(stats.min_mm_day.abs() < 1e-6);
         assert!(stats.max_mm_day.abs() < 1e-6);
+    }
+
+    /// Hourly transpiration (mm drawn from the water table) of each cell of
+    /// a radius-1 grid holding `stands` (by id), under the same weather:
+    /// 20 °C, dry air, calm, water table at twice its capacity (no water
+    /// stress, no availability cap). Evaporation is cell-local, so each
+    /// cell is an independent sample.
+    fn transpiration_of(stands: &[&[(crate::species::SpeciesId, f32)]]) -> Vec<f32> {
+        let mut current = HexGrid::from_radius(1);
+        let coords: Vec<HexCoord> = current.coords().copied().collect();
+        assert!(stands.len() <= coords.len());
+        for (coord, stand) in coords.iter().zip(stands.iter()) {
+            let c = current.get_mut(*coord).unwrap();
+            c.water_capacity = 10.0;
+            c.water_level = 0.0;
+            c.temperature = 20.0;
+            c.humidity_surface = 2.0;
+            c.permeability = 0.5;
+            c.groundwater = 2.0 * 0.5 * SOIL_GW_REFERENCE_MM;
+            for &(id, v) in *stand {
+                c.vegetation[crate::species::species_index(id)] = v;
+            }
+        }
+        let mut next = current.clone();
+        let params = AtmosphereParams::default();
+        let wind_mag = vec![0.0_f32; current.len()];
+        let mut demand = Vec::new();
+        let mut stats = EvapStats::default();
+        step_evaporation(
+            &current,
+            &mut next,
+            &params,
+            &wind_mag,
+            None,
+            &mut demand,
+            &mut stats,
+        );
+        coords
+            .iter()
+            .take(stands.len())
+            .map(|c| current.get(*c).unwrap().groundwater - next.get(*c).unwrap().groundwater)
+            .collect()
+    }
+
+    /// The vapour reported per source is the exact mass each stock lost:
+    /// the lake's surplus for open water, the root zone for transpiration,
+    /// the snowpack for sublimation, and nothing for a dry bare cell.
+    /// Cell-local, no transport (radius 1 only to hold four samples).
+    #[test]
+    fn vapor_sources_are_the_masses_moved() {
+        let mut current = HexGrid::from_radius(1);
+        let coords: Vec<HexCoord> = current.coords().copied().collect();
+        let (lake, forest, snowfield, bare) = (coords[0], coords[1], coords[2], coords[3]);
+        for c in current.cells_slice_mut() {
+            c.water_capacity = 1.0;
+            c.temperature = 20.0;
+            c.humidity_surface = 2.0;
+            c.permeability = 0.5;
+        }
+        current.get_mut(lake).unwrap().water_level = 50.0;
+        let f = current.get_mut(forest).unwrap();
+        f.groundwater = 30.0;
+        f.vegetation[crate::species::species_index(crate::species::SpeciesId::Beech)] = 0.9;
+        let s = current.get_mut(snowfield).unwrap();
+        s.temperature = -8.0;
+        s.snow_level = 40.0;
+
+        let mut next = current.clone();
+        let params = AtmosphereParams::default();
+        let wind_mag = vec![3.0_f32; current.len()];
+        let mut cells = Vec::new();
+        let mut stats = EvapStats::default();
+        step_evaporation(
+            &current, &mut next, &params, &wind_mag, None, &mut cells, &mut stats,
+        );
+
+        let index = |c: HexCoord| current.cell_index(c).unwrap();
+        let before = |c: HexCoord| current.get(c).unwrap().clone();
+        let after = |c: HexCoord| next.get(c).unwrap().clone();
+
+        let v = cells[index(lake)].vapor;
+        assert!(v.open_water > 0.0, "a warm lake evaporates");
+        assert!((v.open_water - (before(lake).water_level - after(lake).water_level)).abs() < 1e-6);
+
+        let v = cells[index(forest)].vapor;
+        assert!(v.transpiration > 0.0, "a watered forest transpires");
+        assert!(
+            (v.transpiration - (before(forest).groundwater - after(forest).groundwater)).abs()
+                < 1e-6
+        );
+
+        let v = cells[index(snowfield)].vapor;
+        assert!(v.sublimation > 0.0, "a cold snowpack sublimates");
+        assert!(
+            (v.sublimation - (before(snowfield).snow_level - after(snowfield).snow_level)).abs()
+                < 1e-6
+        );
+
+        assert!(
+            cells[index(bare)].vapor.total().abs() < 1e-12,
+            "a dry bare cell emits nothing"
+        );
+        for i in [lake, forest, snowfield, bare] {
+            let gained = after(i).humidity_surface - before(i).humidity_surface;
+            assert!(
+                (gained - cells[index(i)].vapor.total()).abs() < 1e-6,
+                "the sources add up to the vapour the cell gained"
+            );
+        }
+    }
+
+    #[test]
+    fn phys_shaded_understory_transpires_less_than_in_the_open() {
+        // #161: at equal herb cover, the meadow's own transpiration under a
+        // closed beech canopy (0.95, LAI 4.75) is the Beer-Lambert share of
+        // the light it receives, exp(−0.5 × 4.75) ≈ 9 %, of what it
+        // transpires in the open (Penman-Monteith: transpiration follows
+        // absorbed radiation). The herb contribution is read as a
+        // difference, canopy + meadow − canopy alone.
+        use crate::species::{SpeciesId, Stratum};
+        use crate::vegetation::light_transmittance_below;
+        let meadow = (SpeciesId::Meadow, 0.8);
+        let beech = (SpeciesId::Beech, 0.95);
+        let t = transpiration_of(&[&[], &[meadow], &[beech], &[beech, meadow]]);
+        let (bare, open_meadow, canopy, canopy_meadow) = (t[0], t[1], t[2], t[3]);
+        assert!(bare.abs() < 1e-9, "bare soil transpires nothing: {bare}");
+        assert!(open_meadow > 0.0 && canopy > 0.0);
+        let herb_open = open_meadow - bare;
+        let herb_shaded = canopy_meadow - canopy;
+        assert!(
+            herb_shaded < herb_open,
+            "shaded meadow {herb_shaded} mm should transpire less than in the open {herb_open} mm"
+        );
+        // The ratio is the light transmitted to the herb stratum.
+        let mut shaded_cell = crate::cell::CellProperties::default();
+        shaded_cell.vegetation[crate::species::species_index(beech.0)] = beech.1;
+        let expected = light_transmittance_below(&shaded_cell, Stratum::Herb);
+        let ratio = herb_shaded / herb_open;
+        assert!(
+            (ratio - expected).abs() < 0.01,
+            "shaded/open = {ratio:.4}, Beer-Lambert transmittance {expected:.4}"
+        );
     }
 
     #[test]
@@ -510,7 +956,7 @@ mod tests {
         // Orographic convection consumes the precomputed `sat_upper_offset`
         // (#97); on a direct call outside `step_atmosphere_into`, fill it
         // here.
-        scratch.fill_upper_air(&current, mean_t, &params, &temp_params);
+        scratch.fill_upper_air(&current, mean_t, mean_z, &params, &temp_params);
         step_orographic_convection(&current, &mut next, &params, &mut scratch);
 
         // LCL invariant: no high neighbor should be oversaturated.
@@ -547,15 +993,30 @@ mod tests {
 
     /// Harness for the orographic pump micro-tests: builds the world via
     /// `oro_pump_world` (`test_support`) then runs
-    /// `step_orographic_convection` in isolation.
-    fn run_oro_pump(current: &HexGrid) -> HexGrid {
-        let params = AtmosphereParams::default();
+    /// `step_orographic_convection` in isolation, with
+    /// `orographic_lift_coef` multiplied by `coef_factor` (1.0 = defaults).
+    fn run_oro_pump_with(current: &HexGrid, coef_factor: f32) -> HexGrid {
+        let base = AtmosphereParams::default();
+        let params = AtmosphereParams {
+            orographic_lift_coef: base.orographic_lift_coef * coef_factor,
+            ..base
+        };
+        run_oro_pump_params(current, &params)
+    }
+
+    fn run_oro_pump_params(current: &HexGrid, params: &AtmosphereParams) -> HexGrid {
         let temp_params = default_temp_params();
         let mut next = current.clone();
         let mut scratch = AtmoScratch::new(current.len());
-        scratch.fill_upper_air(current, surface_means(current).0, &params, &temp_params);
-        step_orographic_convection(current, &mut next, &params, &mut scratch);
+        let (mean_t, mean_z) = surface_means(current);
+        scratch.fill_upper_air(current, mean_t, mean_z, params, &temp_params);
+        step_orographic_convection(current, &mut next, params, &mut scratch);
         next
+    }
+
+    /// Shorthand for the shipped law at the shipped coefficient.
+    fn run_oro_pump(current: &HexGrid) -> HexGrid {
+        run_oro_pump_with(current, 1.0)
     }
 
     /// The orographic pump is an elevator, not a diffuser: surface vapor
@@ -566,13 +1027,21 @@ mod tests {
     /// conservation, not the direction of transport).
     #[test]
     fn orographic_pump_lifts_only_toward_higher_neighbors() {
-        let (mut grid, coords) = oro_pump_world(10.0);
+        // 3 mm, not the 10 mm this test used to hold: on a +400 m step the
+        // #156 law exports essentially the whole stock in one tick
+        // (`1 − exp(−0.05 × 400) ≈ 1`) instead of the old capped 30 %, and
+        // 10 mm would sit above the upper layer's own saturation
+        // (~10.4 mm at 15 °C / 1500 m) — the LCL bound would then bite and
+        // this test would stop measuring the direction of transport. Setup
+        // adjusted, assertions untouched, cf `assert_lcl_slack`'s doc.
+        const CENTER_HUMIDITY_MM: f32 = 3.0;
+        let (mut grid, coords) = oro_pump_world(CENTER_HUMIDITY_MM);
         let center = HexCoord::new(0, 0);
         let uphill = center + DIRECTIONS[0];
         let downhill = center + DIRECTIONS[3];
         grid.get_mut(uphill).unwrap().elevation = 500.0;
         grid.get_mut(downhill).unwrap().elevation = 0.0;
-        assert_lcl_slack(10.0 * 0.30); // rate capped at 30%/tick
+        assert_lcl_slack(CENTER_HUMIDITY_MM);
 
         let next = run_oro_pump(&grid);
 
@@ -599,7 +1068,7 @@ mod tests {
                 cell.humidity_upper
             );
         }
-        let lost = 10.0 - next.get(center).unwrap().humidity_surface;
+        let lost = CENTER_HUMIDITY_MM - next.get(center).unwrap().humidity_surface;
         assert!(
             (lost - up.humidity_upper).abs() < 1e-4,
             "the center must lose exactly what the peak gains: \
@@ -615,13 +1084,19 @@ mod tests {
     /// ratio is exact.
     #[test]
     fn orographic_pump_share_scales_with_elevation_gap() {
-        let (mut grid, _coords) = oro_pump_world(10.0);
+        // 3 mm for the same reason as
+        // `orographic_pump_lifts_only_toward_higher_neighbors`: under the
+        // #156 law a 500 m total gap exports the whole stock, and the LCL
+        // bound would clip the tall neighbour first, destroying the very
+        // ratio this test measures.
+        const CENTER_HUMIDITY_MM: f32 = 3.0;
+        let (mut grid, _coords) = oro_pump_world(CENTER_HUMIDITY_MM);
         let center = HexCoord::new(0, 0);
         let tall = center + DIRECTIONS[0];
         let short = center + DIRECTIONS[2];
         grid.get_mut(tall).unwrap().elevation = 500.0; // +400 m
         grid.get_mut(short).unwrap().elevation = 200.0; // +100 m
-        assert_lcl_slack(10.0 * 0.30);
+        assert_lcl_slack(CENTER_HUMIDITY_MM);
 
         let next = run_oro_pump(&grid);
 
@@ -635,6 +1110,89 @@ mod tests {
         assert!(
             (ratio - 4.0).abs() < 1e-3,
             "share ∝ elevation gap: ratio measured {ratio}, expected 4.0 (400 m / 100 m)"
+        );
+    }
+
+    /// r250 perf effort: mass conservation of the scatter -> gather split
+    /// (`step_orographic_convection`'s phase 1 writes `dir_out`, phase 2
+    /// derives both self-loss terms from it and gathers the inflow via
+    /// `coord::opposite_direction`). Several neighbors at different
+    /// elevations on a radius-2 grid, so more than one direction of
+    /// `dir_out` is non-zero per source: total humidity (surface + upper)
+    /// over the whole grid must be unchanged within f32 rounding.
+    #[test]
+    fn orographic_pump_gather_conserves_total_humidity() {
+        let (mut grid, coords) = oro_pump_world(10.0);
+        for (k, &c) in coords.iter().enumerate() {
+            if c != HexCoord::new(0, 0) {
+                let bucket = f32::from(u16::try_from(k % 6).unwrap());
+                grid.get_mut(c).unwrap().elevation = 100.0 + 20.0 * bucket;
+            }
+        }
+        let before: f32 = coords
+            .iter()
+            .map(|&c| {
+                let cell = grid.get(c).unwrap();
+                cell.humidity_surface + cell.humidity_upper
+            })
+            .sum();
+        let next = run_oro_pump(&grid);
+        let after: f32 = coords
+            .iter()
+            .map(|&c| {
+                let cell = next.get(c).unwrap();
+                cell.humidity_surface + cell.humidity_upper
+            })
+            .sum();
+        let drift = (after - before).abs() / before.max(1.0);
+        assert!(
+            drift < 1e-4,
+            "gather not conservative: before={before} after={after} drift={drift}"
+        );
+    }
+
+    /// Ablation #oro (subsampled cadence): a boosted pass (`sub = 3`,
+    /// `orographic_lift_coef` tripled via `oro_boosted_params`) must stay
+    /// exactly as conservative as the plain hourly pass above — the
+    /// gather step derives both self-loss terms from `dir_out`,
+    /// independent of the coefficient's magnitude. Same world/elevation
+    /// layout as `orographic_pump_gather_conserves_total_humidity`.
+    #[test]
+    fn orographic_pump_conserves_total_humidity_boosted_x3() {
+        let (mut grid, coords) = oro_pump_world(10.0);
+        for (k, &c) in coords.iter().enumerate() {
+            if c != HexCoord::new(0, 0) {
+                let bucket = f32::from(u16::try_from(k % 6).unwrap());
+                grid.get_mut(c).unwrap().elevation = 100.0 + 20.0 * bucket;
+            }
+        }
+        let before: f32 = coords
+            .iter()
+            .map(|&c| {
+                let cell = grid.get(c).unwrap();
+                cell.humidity_surface + cell.humidity_upper
+            })
+            .sum();
+
+        let params = oro_boosted_params(&AtmosphereParams::default(), 3);
+        let temp_params = default_temp_params();
+        let mut next = grid.clone();
+        let mut scratch = AtmoScratch::new(grid.len());
+        let (mean_t, mean_z) = surface_means(&grid);
+        scratch.fill_upper_air(&grid, mean_t, mean_z, &params, &temp_params);
+        step_orographic_convection(&grid, &mut next, &params, &mut scratch);
+
+        let after: f32 = coords
+            .iter()
+            .map(|&c| {
+                let cell = next.get(c).unwrap();
+                cell.humidity_surface + cell.humidity_upper
+            })
+            .sum();
+        let drift = (after - before).abs() / before.max(1.0);
+        assert!(
+            drift < 1e-4,
+            "gather not conservative at sub=3: before={before} after={after} drift={drift}"
         );
     }
 
@@ -661,6 +1219,83 @@ mod tests {
                 after.humidity_upper
             );
         }
+    }
+
+    // ================================================================
+    // #156: the pump rate law
+    // ================================================================
+
+    /// The rate law itself, on the numbers rather than through the grid.
+    /// Monotone in the relief, never above 1 whatever the relief (the
+    /// conservation bound, held by construction and without a clamp), and
+    /// tangent to its own small-`x` linear approximation `x = coef ×
+    /// Σ Δz⁺` — the pre-#156 law before its cap ever bound, `x.clamp(0.0,
+    /// 0.30)`, retired 2026-09-07 once this law had been green and merged
+    /// long enough (since 2026-09-05).
+    ///
+    /// The bound is `≤ 1`, not `< 1`: in `f32`, `1 − exp(−x)` rounds to
+    /// exactly `1.0` past `x ≈ 16.6`. That is still "the cell exports its
+    /// whole surface stock and nothing more", cf [`oro_pump_rate`]'s doc.
+    #[test]
+    fn oro_pump_rate_is_monotone_bounded_and_linear_at_small_x() {
+        let coef = AtmosphereParams::default().orographic_lift_coef / TICKS_PER_DAY_F32;
+        let mut previous = 0.0_f32;
+        for rise_m in [1.0_f32, 10.0, 72.0, 216.0, 500.0, 5_000.0, 100_000.0] {
+            let rate = oro_pump_rate(coef, rise_m);
+            assert!(
+                rate >= previous,
+                "rate must grow with relief: {rise_m} m gave {rate} after {previous}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&rate),
+                "conservation bound: a cell cannot export more than it \
+                 holds, {rise_m} m gave {rate}"
+            );
+            previous = rate;
+        }
+        // Strictly increasing over the band the engine actually visits
+        // (relief up to the map's own maximum, a few hundred metres of
+        // summed positive gap): no plateau where the coefficient is
+        // supposed to be readable.
+        for pair in [(10.0_f32, 72.0), (72.0, 216.0), (216.0, 500.0)] {
+            let (lo, hi) = pair;
+            assert!(
+                oro_pump_rate(coef, hi) > oro_pump_rate(coef, lo) * 1.05,
+                "no plateau expected between {lo} m and {hi} m of relief"
+            );
+        }
+        // Gentle slope: the exponential agrees with its own Taylor
+        // expansion `1 − exp(−x) ≈ x` to better than 1 % — the law is not
+        // a recalibration, it only changes what happens at large `x`,
+        // where the pre-#156 cap used to bind instead.
+        let x = coef * 5.0;
+        let gentle = oro_pump_rate(coef, 5.0);
+        assert!(
+            (gentle - x).abs() / x < 0.01,
+            "small-x tangency: exponential={gentle}, linear approximation={x}"
+        );
+    }
+
+    /// Units check (SI rule): `orographic_lift_coef` is the
+    /// group `U_slope · dt / (H · L)` of [`oro_pump_rate`], so the shipped
+    /// default has to correspond to a physically real upslope venting
+    /// speed. 1-10 cm/s is what Henne et al. (2004) measure for
+    /// thermally driven export of Alpine boundary-layer air to the free
+    /// troposphere; anything outside ~0.03-0.5 m/s would mean the
+    /// coefficient has stopped being a velocity in disguise.
+    #[test]
+    fn orographic_coef_implies_a_measured_venting_speed() {
+        let params = AtmosphereParams::default();
+        // The engine consumes the per-tick value, cf
+        // `scale_atmosphere_for_hourly_tick`.
+        let coef_per_tick = params.orographic_lift_coef / TICKS_PER_DAY_F32;
+        let u_slope_m_per_s =
+            coef_per_tick * params.upper_layer_altitude_m * CELL_SPACING_M / SECONDS_PER_HOUR;
+        assert!(
+            (0.03..0.5).contains(&u_slope_m_per_s),
+            "implied upslope venting speed {u_slope_m_per_s} m/s is outside \
+             the 1-10 cm/s band measured for topographic venting"
+        );
     }
 
     #[test]

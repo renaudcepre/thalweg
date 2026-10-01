@@ -14,14 +14,16 @@
 //   3. nothing: WebSocket.
 //
 // `?radius=` and `?seed=` only apply to WASM mode: without a server, there
-// is no `hexsim.toml` to supply them. The default is radius 45 (~6200
-// cells, 3.1 ms/tick) rather than the local config file's 120: a web page
-// opens onto a world that's running right away.
+// is no `hexsim.toml` to supply them. The default is radius 70 (~14 900
+// cells, ~2.4× the 3.1 ms/tick measured at 45) rather than the local config
+// file's 120: big enough to read as a landscape, light enough for a
+// single-threaded wasm on a laptop. Raised from 45 when the embed stopped
+// booting on the r45 shipped world (#152 t0).
 
 import { WsTransport } from "./ws.js";
 import { WasmTransport } from "./wasm.js";
 
-const DEFAULT_WASM_RADIUS = 45;
+const DEFAULT_WASM_RADIUS = 70;
 const DEFAULT_WASM_SEED = 42;
 
 // Randomly drawn seed, within the bounds of the `u32` the engine expects.

@@ -2,10 +2,14 @@ use noise::{Fbm, MultiFractal, NoiseFn, Perlin, RidgedMulti};
 use serde::Deserialize;
 
 use crate::cell::CellProperties;
+use crate::climatology::{self, ReliefBasins};
 use crate::coord::{HexCoord, torus_lattice_vectors};
 use crate::erosion::{ErosionParams, erode_terrain};
 use crate::grid::HexGrid;
+use crate::groundwater::DEFAULT_FIELD_CAPACITY_FRAC;
 use crate::lithology::{self, LithologyId};
+use crate::temperature::TemperatureParams;
+use crate::vegetation::VegetationParams;
 
 // Terrain generation parameters.
 //
@@ -26,11 +30,80 @@ use crate::lithology::{self, LithologyId};
 pub struct TerrainParams {
     pub seed: u32,
     pub elevation_scale: f32,
-    pub base_temperature: f32,
-    pub lapse_rate: f32,
+    /// The climate the world is generated for (#152): the climatological
+    /// initial state (January temperature field, snow above the frost
+    /// line, analytic climate normals and the vegetation seeded from them)
+    /// is the engine's own radiative balance evaluated with these
+    /// parameters on the relief. One climate target, not a second copy of
+    /// `base_temp` and `lapse_rate` here: a world is generated for the
+    /// same `TemperatureParams` its simulation then runs with
+    /// (`World::reset` syncs them from the live simulation, the bench from
+    /// its overrides).
+    pub temperature: TemperatureParams,
+    /// Surface water seeded at worldgen, in mm per cell map-wide, as a
+    /// **runoff sheet routed into the closed depressions** of the relief
+    /// (`climatology::fill_basins_with_runoff`): lakes at the bottom of
+    /// the basins on the first image, dry slopes everywhere else, the
+    /// state the daily hydrology reaches on its own (measured 2026-10-01
+    /// on r30 × 3 seeds: land `water_level` settles at 0.00 mm, 85 % of
+    /// the box's water in the terminal basins). It used to be a uniform
+    /// 1 mm puddle in every cell's retention bucket.
+    ///
+    /// Default 80 mm (2026-10-01, #107): ~120 mm per cell in the box with
+    /// the water table at field capacity (~31 mm) and the January vapour
+    /// (~1 mm). Since the infiltration capacity went SI (Ks of a loam)
+    /// the soil takes the rain in and holds ~15 mm per cell that used to
+    /// sit in the lakes: at the former 8 mm (~42 mm per cell) the lakes
+    /// fell from 17-23 perennial cells to 4-9 (r30, seeds 42 / 7 / 123).
+    /// At 80 mm the box carries both the wet soils and the lakes (24-27
+    /// perennial lake cells, 15-72 perennial river reaches off lake,
+    /// rain 260-290 mm/yr on the map, `diag_water_cycle`).
     pub initial_water: f32,
-    pub initial_humidity: f32,
-    pub initial_groundwater: f32,
+    /// Water table seeded at worldgen, as the **map-mean** fraction of the
+    /// cell's total pore storage (`permeability` ×
+    /// `groundwater::DEFAULT_MAX_CAPACITY_MM`). Default
+    /// [`DEFAULT_FIELD_CAPACITY_FRAC`]: a spring soil at field capacity,
+    /// capillary water full and nothing yet above the threshold that can
+    /// drain laterally (FAO-56 bucket model, Veihmeyer & Hendrickson
+    /// 1931), the state a temperate soil reaches after winter recharge.
+    /// Around that mean the topographic wetness index moves each cell
+    /// (`groundwater_wetness_slope_mm`).
+    ///
+    /// #151: the previous endowment was a fixed 1.5 mm, set in April 2026
+    /// when a cell's capacity was ~0.5 mm; capacities were rescaled ×200
+    /// since (mean capacity now ~48 mm/cell) but this value never was,
+    /// leaving the water table at ~3% of capacity instead of the intended
+    /// "full at t0" and starving groundwater six years into a run.
+    pub initial_groundwater_frac: f32,
+    /// TOPMODEL's `m` (mm): the water table's deviation from the mean
+    /// endowment per unit of topographic wetness index anomaly,
+    /// `groundwater_i = frac × capacity_i + m × (λ_i − λ̄)` (Beven &
+    /// Kirkby 1979; `climatology::seed_groundwater_by_wetness`). Valleys
+    /// start above field capacity and drain into the rivers from the first
+    /// day, crests below it. The literature's 10-50 mm go with root zones
+    /// of 300-500 mm; scaled to this engine's 100 mm pore storage, 5 mm
+    /// spreads the water table from 0.25 of capacity on the driest crests
+    /// to 0.94 in the wettest valleys (sextiles of the index, r45 seed 42,
+    /// 2026-10-01), ±0.33 over the 5-95 % index range around the mean. 0
+    /// restores the uniform fraction of #151.
+    pub groundwater_wetness_slope_mm: f32,
+    /// Snowfall rate (mm of water equivalent per day) through the frost
+    /// run before January 1st, what the January snowpack is made of
+    /// (`climatology::seed_snowpack`). The engine's own winter
+    /// precipitation on the plains, 0.1 mm/day (bench 2026-09-30, three
+    /// seeds: 0.075-0.117 mm/day annual mean): a cell expected below zero
+    /// for six sampled weeks starts under ~4 mm of snow, the order the
+    /// engine reaches on its own by its sixth January (1.4-1.8 mm per
+    /// cell map-wide, 2026-10-01).
+    pub snowfall_mm_per_day: f32,
+    /// Mean of the exponential distribution the canopy ages are drawn
+    /// from at worldgen (years): the time since the last stand-replacing
+    /// disturbance, a fire rotation of a few decades in Mediterranean and
+    /// pre-alpine woodlands (Pausas 2004, *Climatic Change* 63). Varied
+    /// per cell by a hash of the seed, so no two neighbours start in step
+    /// (#161 step 4 names the synchrony of the uniform t0 as the likely
+    /// cause of the year-7 cliff).
+    pub stand_age_mean_years: f32,
     pub permeability_seed_offset: u32,
     pub permeability_frequency: f64,
     pub permeability_altitude_bias: f32,
@@ -108,11 +181,12 @@ impl Default for TerrainParams {
             // world at R=30 (scale-test standard): max 1789 m (2D:
             // 1807), std 417 (2D: 402), >1500 m: 30 cells (2D: 13).
             elevation_scale: 2400.0,
-            base_temperature: 20.0,
-            lapse_rate: 6.5,
-            initial_water: 1.0,
-            initial_humidity: 0.1,
-            initial_groundwater: 1.5,
+            temperature: TemperatureParams::default(),
+            initial_water: 80.0,
+            initial_groundwater_frac: DEFAULT_FIELD_CAPACITY_FRAC,
+            groundwater_wetness_slope_mm: 5.0,
+            snowfall_mm_per_day: 0.1,
+            stand_age_mean_years: 30.0,
             permeability_seed_offset: 1000,
             permeability_frequency: 0.08,
             permeability_altitude_bias: 0.8,
@@ -392,8 +466,12 @@ impl<'a> TerrainSampler<'a> {
         let elevation = shaped_elevation + params.base_elevation_offset;
 
         // Temperature (adiabatic gradient): no clamp, the lapse rate applies
-        // at any altitude (100% terrestrial world, no ocean at fixed temperature).
-        let temperature = params.base_temperature - (elevation / 1000.0) * params.lapse_rate;
+        // at any altitude (100% terrestrial world, no ocean at fixed
+        // temperature). The annual mean of the relief's own balance; the
+        // climatological seeding then replaces it with January's expected
+        // value (`seed_initial_state`).
+        let temperature =
+            params.temperature.base_temp - (elevation / 1000.0) * params.temperature.lapse_rate;
 
         // --- Mineral substrate (#136, L0) ---
         // The noise no longer carries `permeability` directly: it
@@ -486,7 +564,19 @@ fn smoothstep(x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Generates a world: the relief and its static properties
+/// (`sample_relief`), then the climatological state the relief carries
+/// on the morning of January 1st ([`seed_initial_state`]).
 pub fn generate_terrain(grid: &mut HexGrid, params: &TerrainParams) {
+    sample_relief(grid, params);
+    seed_initial_state(grid, params);
+}
+
+/// The static part of the world: elevation, lithology and permeability
+/// from the noise layers, the one-shot drainage network, the retention
+/// capacity. Every stock is left at zero; [`seed_initial_state`] sets
+/// them.
+fn sample_relief(grid: &mut HexGrid, params: &TerrainParams) {
     let sampler = TerrainSampler::new(grid.radius(), params);
     let coords: Vec<HexCoord> = grid.coords().copied().collect();
 
@@ -496,9 +586,6 @@ pub fn generate_terrain(grid: &mut HexGrid, params: &TerrainParams) {
             *cell = CellProperties {
                 elevation: sample.elevation,
                 temperature: sample.temperature,
-                water_level: params.initial_water,
-                humidity_upper: params.initial_humidity,
-                groundwater: params.initial_groundwater,
                 lithology: sample.lithology,
                 permeability: sample.permeability,
                 ..Default::default()
@@ -509,7 +596,7 @@ pub fn generate_terrain(grid: &mut HexGrid, params: &TerrainParams) {
     // One-shot fluvial erosion (#105): sculpts the drainage network into
     // the bare relief, THEN freezes. Before `assign_water_capacity`
     // (depends on final topology: basins carved here gain their capacity
-    // bonus), followed by a temperature recompute (elevation changed).
+    // bonus).
     erode_terrain(
         grid,
         &ErosionParams {
@@ -518,19 +605,50 @@ pub fn generate_terrain(grid: &mut HexGrid, params: &TerrainParams) {
         },
         params.erosion_iterations,
     );
-    if params.erosion_iterations > 0 {
-        recompute_temperature(grid, params);
-    }
 
     assign_water_capacity(grid, params);
 }
 
-/// Recalibrates temperature to the current elevation (lapse rate), after
-/// erosion has changed the relief. The live tick recomputes it anyway via
-/// the radiative balance; this is just a consistent initial state.
-fn recompute_temperature(grid: &mut HexGrid, params: &TerrainParams) {
+/// The climatological initial state of a relief (#152, see
+/// [`crate::climatology`]): every stock and the vegetation are
+/// **assigned** from the relief and `params.temperature`, so calling it
+/// again on a changed relief (a DEM override) rebuilds a consistent t0.
+/// Order matters: the water table and the lakes first, since the climate
+/// sweep reads the stocks (open-water cooling, root water), then snow and
+/// vegetation from that climate, then the January temperature field.
+///
+/// `Simulation::new` reruns the same climate sweep on the grid it
+/// receives to prime its climate normals, and gets the same normals: same
+/// function, same inputs.
+pub fn seed_initial_state(grid: &mut HexGrid, params: &TerrainParams) {
+    climatology::seed_groundwater_by_wetness(
+        grid,
+        params.initial_groundwater_frac,
+        params.groundwater_wetness_slope_mm,
+    );
+    let basins = ReliefBasins::of(grid);
+    climatology::fill_basins_with_runoff(grid, &basins, params.initial_water);
     for cell in grid.cells_slice_mut() {
-        cell.temperature = params.base_temperature - (cell.elevation / 1000.0) * params.lapse_rate;
+        cell.humidity_surface = 0.0;
+        cell.humidity_upper = 0.0;
+        cell.cloud_water = 0.0;
+        cell.sediment_load = 0.0;
+    }
+    let climate = climatology::terrain_climate(grid, params.temperature.clone());
+    climatology::seed_snowpack(grid, &climate, params.snowfall_mm_per_day);
+    climatology::seed_vegetation(
+        grid,
+        &climate.normals,
+        &VegetationParams::default(),
+        params.seed,
+        params.stand_age_mean_years,
+    );
+    for (cell, &t) in grid
+        .cells_slice_mut()
+        .iter_mut()
+        .zip(climate.temperature_day0.iter())
+    {
+        cell.temperature = t;
     }
 }
 
@@ -601,9 +719,9 @@ pub struct DemApplyReport {
 }
 
 /// Replaces the noise-generated elevation with an external survey (real
-/// DEM), recomputes temperature (lapse rate) and `water_capacity`
-/// accordingly. Domain cells absent from the override: noise-derived
-/// elevation is kept (no hole).
+/// DEM), then recomputes `water_capacity` and the whole climatological
+/// initial state ([`seed_initial_state`]) on the new relief. Domain cells
+/// absent from the override: noise-derived elevation is kept (no hole).
 ///
 /// Override cells outside the domain are ignored but **counted** in the
 /// [`DemApplyReport`]: loading a radius-120 survey into a radius-80 grid
@@ -625,12 +743,11 @@ pub fn apply_dem_override(
         let coord = HexCoord::new(entry.q, entry.r);
         if let Some(cell) = grid.get_mut(coord) {
             cell.elevation = entry.elevation;
-            cell.temperature =
-                params.base_temperature - (entry.elevation / 1000.0) * params.lapse_rate;
             applied += 1;
         }
     }
     assign_water_capacity(grid, params);
+    seed_initial_state(grid, params);
     DemApplyReport {
         applied,
         skipped: overrides.len() - applied,
@@ -1066,6 +1183,79 @@ mod tests {
     }
 
     #[test]
+    fn initial_groundwater_scales_with_permeability() {
+        // #151 step 1: the water table seeded at worldgen is a fraction
+        // of each cell's OWN pore storage (permeability * capacity), not
+        // a fixed mm value, so it must scale with permeability.
+        let params = TerrainParams {
+            initial_groundwater_frac: 0.4,
+            groundwater_wetness_slope_mm: 0.0,
+            ..TerrainParams::default()
+        };
+        let mut grid = HexGrid::from_radius(2);
+        generate_terrain(&mut grid, &params);
+
+        let mut min_perm = f32::MAX;
+        let mut max_perm = f32::MIN;
+        let mut gw_at_min = 0.0;
+        let mut gw_at_max = 0.0;
+        for (coord, cell) in grid.iter() {
+            let expected = params.initial_groundwater_frac
+                * cell.permeability
+                * crate::groundwater::DEFAULT_MAX_CAPACITY_MM;
+            assert!(
+                (cell.groundwater - expected).abs() < 1e-4,
+                "groundwater at {coord:?}: got {}, expected {expected}",
+                cell.groundwater
+            );
+            if cell.permeability < min_perm {
+                min_perm = cell.permeability;
+                gw_at_min = cell.groundwater;
+            }
+            if cell.permeability > max_perm {
+                max_perm = cell.permeability;
+                gw_at_max = cell.groundwater;
+            }
+        }
+        assert!(
+            max_perm > min_perm,
+            "grid too uniform to test the permeability ordering"
+        );
+        assert!(
+            gw_at_max > gw_at_min,
+            "the most permeable cell ({max_perm}) must hold more initial \
+             groundwater than the least permeable one ({min_perm}): {gw_at_max} vs {gw_at_min}"
+        );
+    }
+
+    #[test]
+    fn initial_groundwater_sits_at_field_capacity() {
+        // #151: with the default fraction (= DEFAULT_FIELD_CAPACITY_FRAC)
+        // and no wetness modulation, every cell starts with its capillary
+        // reservoir exactly full and nothing above field capacity, i.e. no
+        // drainable water at t0. (With the default slope, #152, the
+        // valleys start above it and the crests below: see
+        // `climatology::tests`.)
+        let params = TerrainParams {
+            groundwater_wetness_slope_mm: 0.0,
+            ..TerrainParams::default()
+        };
+        let mut grid = HexGrid::from_radius(2);
+        generate_terrain(&mut grid, &params);
+
+        for (coord, cell) in grid.iter() {
+            let field_capacity = cell.permeability
+                * crate::groundwater::DEFAULT_MAX_CAPACITY_MM
+                * DEFAULT_FIELD_CAPACITY_FRAC;
+            assert!(
+                (cell.groundwater - field_capacity).abs() < 1e-4,
+                "cell {coord:?} not at field capacity: groundwater={}, field_capacity={field_capacity}",
+                cell.groundwater
+            );
+        }
+    }
+
+    #[test]
     fn elevation_offset_shifts_median() {
         // Two grids, same seed, different offset: the median difference
         // must match the offset delta (within epsilon).
@@ -1123,11 +1313,18 @@ mod tests {
 
         let center = grid.get(HexCoord::new(0, 0)).unwrap();
         assert!((center.elevation - 1500.0).abs() < f32::EPSILON);
-        let expected_temp = params.base_temperature - (1500.0 / 1000.0) * params.lapse_rate;
-        assert!((center.temperature - expected_temp).abs() < 1e-4);
-
         let neighbor = grid.get(HexCoord::new(1, 0)).unwrap();
         assert!((neighbor.elevation - 200.0).abs() < f32::EPSILON);
+        // The climatological state follows the new relief: the 1500 m
+        // summit starts colder than the 200 m cell beside it. Only the
+        // order is pinned: that cell sits in the shadow of a 1300 m step
+        // one hex away, so the gap is well short of the lapse rate.
+        assert!(
+            center.temperature < neighbor.temperature,
+            "summit {} vs valley {}",
+            center.temperature,
+            neighbor.temperature
+        );
     }
 
     #[test]

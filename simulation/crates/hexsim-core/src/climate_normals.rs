@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::grid::HexGrid;
+use crate::par::for_each_chunk_mut;
 use crate::time::TICKS_PER_DAY_F32;
 
 /// Lethal extreme smoothing window (days). Species death shouldn't come from
@@ -174,9 +175,37 @@ impl ClimateNormalsAccumulator {
     /// `beam_mag · flux_factor[i]`, single source of truth shared with the
     /// thermal balance.
     pub fn record_tick(&mut self, grid: &HexGrid, flux_factor: &[f32], beam_mag: f32) {
-        for ((a, cell), &ff) in self.acc.iter_mut().zip(grid.cells_slice()).zip(flux_factor) {
-            let moisture = cell.groundwater + cell.water_level;
-            a.record(cell.temperature, moisture, beam_mag * ff);
+        let cells = grid.cells_slice();
+        // Per-cell accumulator update: `acc[i]` only ever depends on
+        // `cells[i]`/`flux_factor[i]`, never on another cell's accumulator
+        // — a pure per-cell map across THIS tick's call, parallelizable
+        // (`par::for_each_chunk_mut`) even though `CellAccum` itself
+        // carries state across ticks (that state stays private to index
+        // `i`, so it never crosses a thread boundary).
+        for_each_chunk_mut(&mut self.acc, |start, chunk| {
+            for (local, a) in chunk.iter_mut().enumerate() {
+                let i = start + local;
+                let cell = &cells[i];
+                let ff = flux_factor[i];
+                let moisture = cell.groundwater + cell.water_level;
+                a.record(cell.temperature, moisture, beam_mag * ff);
+            }
+        });
+    }
+
+    /// Accumulator whose normals start as `normals` instead of the zero
+    /// default: the analytic climatology of the relief (#152,
+    /// `climatology::terrain_climate`), so the vegetation reads a climate
+    /// from the first day instead of a blind year. The per-cell
+    /// accumulators start empty; the first rollover replaces these normals
+    /// with the measured year, as it always did.
+    #[must_use]
+    pub fn primed(normals: Vec<CellClimateNormals>) -> Self {
+        let cell_count = normals.len();
+        Self {
+            acc: vec![CellAccum::new(); cell_count],
+            normals,
+            finalized_once: true,
         }
     }
 
@@ -197,7 +226,9 @@ impl ClimateNormalsAccumulator {
         &self.normals
     }
 
-    /// `true` as soon as at least one year has been finalized.
+    /// `true` as soon as the normals hold a climate: a finalized year, or
+    /// the analytic climatology a fresh world is [`primed`](Self::primed)
+    /// with.
     #[must_use]
     pub fn has_normals(&self) -> bool {
         self.finalized_once

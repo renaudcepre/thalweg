@@ -129,16 +129,9 @@ fn sweeps() -> Vec<Sweep> {
             factors: &[0.0, 10.0],
             apply: |p, f| p.condensation_rate *= f,
         },
-        Sweep {
-            name: "cloud_evap_rate",
-            factors: &[0.0, 10.0],
-            apply: |p, f| p.cloud_evap_rate *= f,
-        },
-        Sweep {
-            name: "cloud_evap_hr_threshold",
-            factors: &[0.0, 10.0],
-            apply: |p, f| p.cloud_evap_hr_threshold *= f,
-        },
+        // #63 L2b: `cloud_evap_rate` and `cloud_evap_hr_threshold` are
+        // gone. The reverse transition is a saturation adjustment
+        // bounded by the layer's deficit, with no coefficient to sweep.
         Sweep {
             name: "kk2000_droplet_count",
             factors: &[0.1, 10.0],

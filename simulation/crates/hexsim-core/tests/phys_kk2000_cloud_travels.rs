@@ -39,6 +39,8 @@ use hexsim_core::snow::SnowParams;
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::{WindParams, WindVec};
 
+mod common;
+
 const SOURCE: HexCoord = HexCoord { q: 8, r: 0 };
 /// Magnitude of the former `west_bias` (cf. mapping #108, applied via
 /// `Simulation::set_uniform_wind` right after `sim` is built).
@@ -63,12 +65,15 @@ fn cloud_drifts_downwind_before_raining() {
         cell.cloud_water = 1.0;
     }
 
-    let atmo = AtmosphereParams {
-        // No humidity floor: we want an isolated cloud without
-        // distributed condensation that would mask the drift.
-        initial_humidity_floor: 0.0,
-        ..AtmosphereParams::default()
-    };
+    // #63 L2b: the fixture used to be `initial_humidity_floor = 0` plus
+    // the old `cloud_evap_rate`, i.e. a cloud sitting in air at RH 0 that
+    // the 0.10/day coefficient kept alive for days. Under the saturation
+    // adjustment that replaced it, the same cloud is gone within the hour
+    // and this test measured nothing. `freeze_phase_transition` pins both
+    // directions of the transition instead, which is the isolation this
+    // test wanted in the first place.
+    let mut atmo = AtmosphereParams::default();
+    common::freeze_phase_transition(&mut atmo);
     let wind = WindParams {
         noise_direction_amplitude: 0.0,
         noise_strength_amplitude: 0.0,

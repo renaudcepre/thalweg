@@ -127,23 +127,19 @@ fn mountain_gains_moisture_from_lake_evaporation() {
 #[test]
 fn total_water_is_conserved_in_local_cycle() {
     // Closed terrarium + no infiltration: conservation of the total
-    // water+humidity+gw+snow must be strict (drift < 1 %).
+    // water+humidity+gw+snow must be strict (drift < 1 %). The sky
+    // reservoir of the imposed weather regime (#63) counts as part of the
+    // terrarium: 0 here since this fixture leaves the regime off, but the
+    // budget must be written so it stays honest if it is ever turned on.
     let mut sim = build_sim();
-    let total_before: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    let budget = Simulation::water_budget_total;
+    let total_before = budget(&sim);
 
     for _ in 0..300 {
         sim.step();
     }
 
-    let total_after: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    let total_after = budget(&sim);
 
     let drift = (total_after - total_before).abs() / total_before.max(1.0);
     assert!(

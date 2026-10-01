@@ -26,9 +26,10 @@
 //!   all other `WindParams` mechanisms (Perlin noise, thermal, relief
 //!   deflection, vapor advection) neutralized
 //! - atmosphere: no `cloud_water` regeneration (`condensation_rate=0`,
-//!   `cloud_evap_rate=0`, `fog_condensation_rate=0`), no transpiration
-//!   (`transpiration_coef=0`), no initial humidity
-//!   (`initial_humidity_floor=0`)
+//!   `fog_condensation_rate=0`), no transpiration
+//!   (`transpiration_coef=0`), and the vapour ↔ droplet transition held
+//!   still by `common::freeze_phase_transition` (#63 L2b): both
+//!   directions inert, only transport acts on the pulse
 //! - KK2000 precipitation left active = normal part of the decay
 //!
 //! Pulse: `cloud_water = 5.0 mm` on cell (0,0), rest of the grid at 0.
@@ -56,6 +57,8 @@ use hexsim_core::snow::SnowParams;
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::{WindParams, WindVec};
 
+mod common;
+
 const RADIUS: i32 = 5;
 const SEED: u32 = 42;
 const PULSE_MM: f32 = 5.0;
@@ -75,20 +78,19 @@ const WEST_BIAS: f32 = 1.0;
 /// `max_precip_per_tick` field's doc says "at 0: disabled" but that's
 /// misleading, debt to fix.
 fn build_atmosphere(kk2000_droplet_count: f32) -> AtmosphereParams {
-    AtmosphereParams {
+    let mut atmo = AtmosphereParams {
         transpiration_coef: 0.0,
         sublimation_rate: 0.0,
         uplift_rate: 0.0,
         uplift_thermal_coef: 0.0,
-        condensation_rate: 0.0,
-        cloud_evap_rate: 0.0,
         fog_condensation_rate: 0.0,
         orographic_lift_coef: 0.0,
         convective_diurnal_coef: 0.0,
-        initial_humidity_floor: 0.0,
         kk2000_droplet_count,
         ..AtmosphereParams::default()
-    }
+    };
+    common::freeze_phase_transition(&mut atmo);
+    atmo
 }
 
 fn build_wind() -> WindParams {

@@ -14,6 +14,7 @@ const statRainMm = document.getElementById("stat-rain-mm");
 const statGroundwater = document.getElementById("stat-groundwater");
 const statSnow = document.getElementById("stat-snow");
 const statTotal = document.getElementById("stat-total");
+const statWorld = document.getElementById("stat-world");
 const viewModeEl = document.getElementById("view-mode");
 
 // --- Constants ---
@@ -212,13 +213,22 @@ function formatHps(hps) {
   return `${hps.toFixed(1)} h/s`;
 }
 
+// 8-point compass direction a vector points TO (E = +x). Shared by the wind
+// and the river flow labels.
+function compassDir(x, y) {
+  const angle = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  const dirs = ["E", "SE", "S", "SW", "W", "NW", "N", "NE"];
+  return dirs[Math.round(angle / 45) % 8];
+}
+
+// Wind vectors travel in the core's `WindVec` unit: ×10 = m/s
+// (`wind::WINDVEC_TO_MS`, the single conversion the engine itself uses).
+// Displayed in m/s, blowing toward the compass direction.
+const WINDVEC_TO_MS = 10;
 function windLabel(wx, wy) {
   const mag = Math.sqrt((wx || 0) * (wx || 0) + (wy || 0) * (wy || 0));
   if (mag < 0.01) return "calm";
-  const angle = ((Math.atan2(wy, wx) * 180 / Math.PI) + 360) % 360;
-  const dirs = ["E", "SE", "S", "SW", "W", "NW", "N", "NE"];
-  const idx = Math.round(angle / 45) % 8;
-  return `${mag.toFixed(2)} → ${dirs[idx]}`;
+  return `${(mag * WINDVEC_TO_MS).toFixed(1)} m/s → ${compassDir(wx, wy)}`;
 }
 
 // --- Compass + weather ---
@@ -417,11 +427,17 @@ const EMBED = ["minimal", "none"].includes(
   new URLSearchParams(location.search).get("chrome"),
 );
 
-// --- Shipped world (#147) ---
-// A fresh world is flat and history-less: bare ground, trees barely
-// sprouted, no lake settled in. A visitor arriving on an embed should see a
-// world that has lived, not tick 0, and they won't wait the three minutes of
-// computation that represents. So we ship an already-aged checkpoint.
+// --- Shipped world (#147), no longer the embed default ---
+// A fresh world used to be flat and history-less: bare ground, trees barely
+// sprouted, no lake settled in. So the embed booted on an already-aged
+// checkpoint, `worlds/aged.ckptz` (42 years, radius 45, engine v0.10.0).
+//
+// Since #152 a fresh world starts from its climatological t0: lakes in the
+// hollows, snow, vegetation seeded at equilibrium with hashed ages. That
+// removes the reason for the file, and it froze the embed at radius 45 under
+// the physics of v0.10.0, with no recipe to regenerate it. The embed now
+// opens a fresh world at the WASM default radius (transport/index.js);
+// `?world=aged` still loads the old file.
 //
 // Gzipped (50 MB -> 1.9 MB) and decompressed here rather than by the server:
 // the embed can be served by any static host, whose `Content-Encoding`
@@ -435,15 +451,13 @@ const EMBED = ["minimal", "none"].includes(
 // no server recognizes removes the trap at the root rather than documenting
 // it. Reported by the integrator on v0.10.0.
 //
-// `?world=neuf` forces the fresh world, `?world=<name>` loads `worlds/<name>.ckptz`.
-// Outside embed nothing loads by default: the dev loop wants a reproducible
-// world at tick 0, not a frozen 50 MB state.
+// `?world=<name>` loads `worlds/<name>.ckptz`; `?world=neuf` (the default,
+// kept so existing host URLs stay valid) loads nothing.
 const WORLD_PARAM = new URLSearchParams(location.search).get("world");
-const BOOT_WORLD_URL = (() => {
-  if (WORLD_PARAM === "neuf") return null;
-  if (WORLD_PARAM) return `worlds/${WORLD_PARAM}.ckptz`;
-  return EMBED ? "worlds/aged.ckptz" : null;
-})();
+// Hour a fresh embed world is advanced to before its first playback.
+const EMBED_FRESH_START_HOUR = 12;
+const BOOT_WORLD_URL =
+  WORLD_PARAM && WORLD_PARAM !== "neuf" ? `worlds/${WORLD_PARAM}.ckptz` : null;
 
 // An embed's lighting used to follow the simulation's real time… no: it was
 // frozen at noon on the summer solstice, whatever the actual time was. On a
@@ -1111,27 +1125,63 @@ function temperatureColor(temp) {
 // share the same scale, the engine picks one or the other depending on T,
 // we aggregate on the total intensity.
 //
-// The intensity is encoded only by the HUE (not the alpha) so the mesh can
-// use a single material with constant alpha. Square root on t to make
-// drizzle distinguishable from downpour.
-// mm/tick scale: physical ceiling max_precip_per_tick=4 mm (Chow 1988).
-// At 2 mm/day it's already a proper downpour → t=0.71, marked violet.
-// At 4 mm/day (cap reached) → deep violet, visual signal of extreme downpour.
-const PRECIP_MAX = 4.0;
-const PRECIP_MIN = 1e-3;
+// Units: rain_amount/snow_amount are mm fallen THIS HOUR-TICK (a flux, not
+// a daily stock, fix/rain-regime). PRECIP_MAX=4.0 is `max_precip_per_tick`,
+// the physical per-hour ceiling (Chow 1988): a cell cannot receive more
+// than that in one hour.
+//
+// Since the rain footprint (radius 3, JOURNAL 2026-09-06) spreads one
+// source over a gradient (~0.95 mm/h at the centre down to 0.02-0.04 on
+// ring 2, 0.001 on ring 3), a single display threshold and a constant
+// alpha made every painted cell look equally heavy and hid the gradient
+// the physics actually produces (measured visible footprint stuck at ~7
+// cells). Intensity is now encoded twice: HUE linearly from PRECIP_MIN to
+// PRECIP_MAX (unchanged shape, just a lower floor), and ALPHA on a
+// logarithmic ramp from PRECIP_MIN to PRECIP_SAT, because within one
+// footprint the intensity already spans three decades and a linear alpha
+// ramp would make everything past the centre read as fully transparent.
+//
+// PRECIP_MIN=0.02 mm/h is the display floor, not the WMO trace threshold:
+// WMO-No. 8 §6.3 sets 0.1 mm as "trace" per OBSERVATION PERIOD (a day for
+// a rain gauge), not per hour, so it doesn't apply to an hourly flux as-is.
+// A weather radar's minimum detectable rate is ~0.05 mm/h; PRECIP_MIN is
+// half of that so the footprint's ring 2 (0.02-0.04 mm/h) crosses it.
+// PRECIP_SAT=1.0 mm/h is where alpha saturates: WMO's light/moderate rain
+// boundary is 2.5 mm/h, halved so a steady 1 mm/h hour already reads as
+// solid rain rather than needing the 4 mm/h ceiling to look opaque.
+// A_MIN/A_MAX bound the ramp so drizzle stays visible as a soft rim
+// (never fully transparent) and a downpour never exceeds the overlay's
+// intended translucency (never fully opaque, terrain stays legible under
+// it).
+const PRECIP_MAX = 4.0; // mm/h, `max_precip_per_tick` physical ceiling (Chow 1988)
+const PRECIP_MIN = 0.02; // mm/h, display floor (half radar sensitivity, see above)
+const PRECIP_SAT = 1.0; // mm/h, alpha saturates here (half the WMO light/moderate boundary)
+const PRECIP_A_MIN = 0.12; // alpha at PRECIP_MIN: faint but not invisible
+const PRECIP_A_MAX = 0.85; // alpha at PRECIP_SAT and above: solid but not fully opaque
+
+function precipitationAlpha(total) {
+  const ratio =
+    Math.log10(total / PRECIP_MIN) / Math.log10(PRECIP_SAT / PRECIP_MIN);
+  const t = Math.min(1.0, Math.max(0.0, ratio));
+  return PRECIP_A_MIN + (PRECIP_A_MAX - PRECIP_A_MIN) * t;
+}
 
 function precipitationTintColor(cell) {
   const total = (cell.rain_amount ?? 0) + (cell.snow_amount ?? 0);
   if (total < PRECIP_MIN) return null;
-  const t = Math.sqrt(Math.min(1.0, total / PRECIP_MAX));
+  const t = Math.min(
+    1.0,
+    Math.max(0.0, (total - PRECIP_MIN) / (PRECIP_MAX - PRECIP_MIN)),
+  );
   // Saturated blue (0.35, 0.60, 1.00) → deep violet (0.24, 0.06, 0.63).
   // Starting from a solid blue (not a pale cyan) to stay visible even
   // when the overlay is rendered above the white snow.
-  return new THREE.Color(
-    0.35 * (1 - t) + 0.24 * t,
-    0.60 * (1 - t) + 0.06 * t,
-    1.00 * (1 - t) + 0.63 * t,
-  );
+  return {
+    r: 0.35 * (1 - t) + 0.24 * t,
+    g: 0.60 * (1 - t) + 0.06 * t,
+    b: 1.00 * (1 - t) + 0.63 * t,
+    a: precipitationAlpha(total),
+  };
 }
 
 // Color by DOMINANT SPECIES (vegetation layer, epic #78 #84). Blind
@@ -1143,15 +1193,90 @@ function precipitationTintColor(cell) {
 // must match exactly, otherwise `dominant_species` falls back to BARE_COLOR.
 // Past bug: keys `oak`/`grass` ≠ `oak_pubescent`/`alpine_grass` → oak and
 // grassland rendered as beige "bare soil", landscape diversity invisible.
+// One entry per species of the table (16 since #161), grouped so the strata
+// read at a glance: herbs in yellow-greens, shrubs in olive / grey-greens
+// (heath the purple-brown odd one), trees from very dark olive to blue-green.
+// Which species is a tree, a shrub or a grass is NOT decided here: it comes
+// from the header's `species_catalog` (see speciesLayout).
 const SPECIES_COLORS = {
+  // Herb stratum
+  dry_grassland: [0.78, 0.74, 0.42], // dry calcareous grassland, straw yellow-green
+  meadow:        [0.46, 0.72, 0.30], // mesophilous meadow, fresh green
+  alpine_grass:  [0.66, 0.72, 0.30], // alpine grassland, yellow-green
+  // Shrub stratum
+  boxwood:       [0.34, 0.42, 0.17], // boxwood, dark olive
+  juniper:       [0.42, 0.50, 0.44], // common juniper, grey-green
+  broom:         [0.62, 0.60, 0.18], // broom, yellow-olive
+  hazel:         [0.30, 0.50, 0.22], // hazel, mid green
+  heath:         [0.50, 0.34, 0.40], // heather / bilberry, purple-brown
+  // Tree stratum
+  holm_oak:      [0.21, 0.27, 0.12], // holm oak, very dark olive
   oak_pubescent: [0.45, 0.55, 0.20], // downy oak, warm green
-  pine:          [0.22, 0.46, 0.42], // pine / juniper, blue-green
   beech:         [0.40, 0.62, 0.28], // beech, light green
   fir:           [0.12, 0.34, 0.22], // fir / spruce, dark green
-  alpine_grass:  [0.66, 0.72, 0.30], // alpine grassland, yellow-green
+  pine:          [0.22, 0.46, 0.42], // Scots pine, blue-green
+  larch:         [0.58, 0.68, 0.36], // larch, light green-gold
+  maple:         [0.48, 0.62, 0.22], // maple, mid warm green
+  riparian:      [0.34, 0.58, 0.54], // willow / alder / ash, silvery blue-green
 };
 const WATER_COLOR = [0.12, 0.30, 0.58]; // lake blue
-const BARE_COLOR = [0.55, 0.52, 0.48];  // rock / bare soil
+
+// Tooltip cover line, all in PERCENT OF THE HEX AREA (1.46 ha). First the
+// canopy cover (`cell.vegetation`: the share of the ground under at least
+// one layer), then one line per stratum from the top down, as seen from
+// the sky: the stratum's cover (`cell.cover_by_stratum`) and its species
+// mix. Each stratum has its own space (#161): `fir 67%` reads "67% of this
+// hex is under fir", the species of a stratum sum to that stratum's cover,
+// and the strata overlap (an understory under a canopy), so they don't sum
+// to the total. Sorted by share, names shortened. The old line paired the
+// dominant species' NAME with the TOTAL cover as a bare 0-1 number and read
+// as "0.62 of fir" (2026-09-06). Blind consumption of the covers, the mix
+// and the header's species_catalog / stratum_order (anti-pattern #2).
+const SPECIES_SHORT = {
+  oak_pubescent: "oak",
+  holm_oak: "holm oak",
+  alpine_grass: "alpine",
+  dry_grassland: "dry grass",
+};
+const pctOfHex = (v) => `${Math.round((v ?? 0) * 100)}%`;
+// Continuation lines of the tooltip value, under the column of "cover    ".
+const TOOLTIP_INDENT = "\n         ";
+function coverLabel(cell, state) {
+  if (cell.is_open_water) return "water";
+  const total = `${pctOfHex(cell.vegetation)} of hex`;
+  const mix = cell.species_mix;
+  const covers = cell.cover_by_stratum;
+  const catalog = state?.species_catalog;
+  const strata = state?.stratum_order;
+  if (![mix, covers, catalog, strata].every(Array.isArray)) return total;
+  const lines = [];
+  for (let s = strata.length - 1; s >= 0; s--) {
+    const cover = covers[s] ?? 0;
+    if (cover < 0.005) continue;
+    const parts = catalog
+      .map((info, i) => ({ info, v: mix[i] ?? 0 }))
+      .filter((p) => p.info.stratum === strata[s] && p.v >= 0.005)
+      .sort((a, b) => b.v - a.v)
+      .map((p) => `${SPECIES_SHORT[p.info.id] ?? p.info.id} ${pctOfHex(p.v)}`);
+    lines.push(`${strata[s].padEnd(5)} ${pctOfHex(cover).padStart(4)}  ${parts.join(" · ")}`);
+  }
+  return lines.length ? `${total}${TOOLTIP_INDENT}${lines.join(TOOLTIP_INDENT)}` : `${total}  bare`;
+}
+const BARE_COLOR = [0.55, 0.52, 0.48];  // fallback when the snapshot has no lithology
+
+// Substrate tint by rock class (`cell.lithology`, exported by the core,
+// #136). What shows where no species holds, and through a partial cover:
+// a bare granite ridge is grey rock, a bare marl basin is brown soil, the
+// two used to share one BARE_COLOR (2026-09-06).
+const LITHOLOGY_COLORS = {
+  granite:   [0.50, 0.50, 0.53], // crystalline basement, cold grey rock
+  marl:      [0.50, 0.40, 0.31], // clay infill of the basins, brown soil
+  sandstone: [0.64, 0.55, 0.40], // intermediate, ochre
+  limestone: [0.74, 0.72, 0.64], // karst, pale
+};
+function substrateColor(cell) {
+  return LITHOLOGY_COLORS[cell.lithology] || BARE_COLOR;
+}
 
 // Snow on column walls (buildTerrain). A bit darker than the snow roof
 // (0xf0f0f8) so the walls read as walls under Lambert lighting, in the same
@@ -1166,15 +1291,21 @@ function speciesColor(cell) {
   if (cell.is_open_water) {
     return new THREE.Color(WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2]);
   }
+  const sub = substrateColor(cell);
   const sp = cell.dominant_species;
   if (!sp) {
-    // Bare soil / rock (no species holds on).
-    return new THREE.Color(BARE_COLOR[0], BARE_COLOR[1], BARE_COLOR[2]);
+    // Bare: the substrate shows (rock class tint).
+    return new THREE.Color(sub[0], sub[1], sub[2]);
   }
-  const base = SPECIES_COLORS[sp] || BARE_COLOR;
+  // Partial cover: the ground shows through in proportion. `vegetation` is
+  // the share of the hex under canopy, so a 30% cover is 70% substrate.
+  const base = SPECIES_COLORS[sp] || sub;
   const v = Math.min(1, Math.max(0, cell.vegetation || 0));
-  const shade = 0.6 + 0.4 * v;
-  return new THREE.Color(base[0] * shade, base[1] * shade, base[2] * shade);
+  return new THREE.Color(
+    sub[0] + (base[0] - sub[0]) * v,
+    sub[1] + (base[1] - sub[1]) * v,
+    sub[2] + (base[2] - sub[2]) * v,
+  );
 }
 
 // Canopy age: young (bright green) → old (dark green/rust brown).
@@ -1182,7 +1313,10 @@ function speciesColor(cell) {
 function ageColor(cell) {
   if (cell.is_open_water) return new THREE.Color(WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2]);
   const v = Math.min(1, Math.max(0, cell.vegetation || 0));
-  if (v < 0.02) return new THREE.Color(BARE_COLOR[0], BARE_COLOR[1], BARE_COLOR[2]);
+  if (v < 0.02) {
+    const sub = substrateColor(cell);
+    return new THREE.Color(sub[0], sub[1], sub[2]);
+  }
   const t = Math.min(1, (cell.stand_age || 0) / 80);
   // young [0.5,0.8,0.35] → old [0.35,0.22,0.12]
   const r = 0.5 + t * (0.35 - 0.5);
@@ -1349,10 +1483,15 @@ const TEMP_MAT = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
   depthWrite: false,
 });
+// Opacity comes from the geometry's 4-component color attribute (per-vertex
+// alpha, see precipitationAlpha above), not from a constant here: three.js
+// (0.183.2) derives its `USE_COLOR_ALPHA` shader define automatically from
+// `material.vertexColors === true` + `geometry.attributes.color.itemSize
+// === 4` (WebGLPrograms.js `vertexAlphas`), so `opacity` stays at its
+// default 1.0 and must not be set.
 const PRECIP_MAT = new THREE.MeshBasicMaterial({
   vertexColors: true,
   transparent: true,
-  opacity: 0.7,
   side: THREE.DoubleSide,
   depthWrite: false,
 });
@@ -1646,25 +1785,37 @@ const EDGE_OPPOSITE = [3, 4, 5, 0, 1, 2];
 // Sampling segments for a ribbon curve (7 points, 12 triangles).
 const CURVE_SEGS = 6;
 
+// Minimum overflow threshold to render a "lake" prism. 1 mm of surplus =
+// drizzle that exceeded the micro-retention capacity; on a hex that's a
+// trace, not a lake visible at this scale. Protects against the "entire
+// column blue" bug when water_capacity is tiny (0.05 mm post-Phase 3).
+// Shared by buildWater (the prism) and buildSnow (the sheet sits on the
+// prism's roof), one definition so the two can't disagree.
+const OVERFLOW_MIN_MM = 1.0;
+const OVERFLOW_Y = 0.03;
+// Lake ice: the prism's roof fades from lake blue to this pale ice as
+// `ice_level` takes over the water body's surplus (core: a frozen lake is
+// still a lake, `is_open_water` counts the ice).
+const ICE_COLOR = [0.62, 0.82, 0.95];
+
+// Free surface of a water body in mm above capacity, liquid + ice: the
+// same surplus rule as the core's `water_body_surplus`, consumed blindly.
+function waterBodySurplusMm(cell) {
+  return (cell.water_level || 0) + (cell.ice_level || 0) - (cell.water_capacity || 1.0);
+}
+
 function buildWater(cells, edgeFluxMax) {
   const positions = [];
   const colors = [];
   const indices = [];
   let vc = 0;
 
-  const OVERFLOW_Y = 0.03;
   const TRAIL_Y = 0.04;
   const TOP_COLOR = [0.22, 0.52, 0.88];
   const SIDE_COLOR = [0.08, 0.22, 0.52];
   const TRAIL_COLOR = [0.15, 0.40, 0.75];
 
   const TRAIL_WIDTH = 0.40;
-  // Minimum overflow threshold to render a "lake" prism. 1 mm of
-  // surplus = drizzle that exceeded the micro-retention capacity; on a
-  // hex that's a trace, not a lake visible at this scale. Protects
-  // against the "entire column blue" bug when water_capacity is tiny
-  // (0.05 mm post-Phase 3).
-  const OVERFLOW_MIN_MM = 1.0;
 
   // Center → edge-midpoint distance = half the center-to-center (√3·HEX_SIZE).
   const EDGE_MID_DIST = (SQRT3 / 2) * HEX_SIZE;
@@ -1773,27 +1924,36 @@ function buildWater(cells, edgeFluxMax) {
 
   for (const cell of cells) {
     const { x, z } = hexToWorld(cell.q, cell.r);
-    const wl = cell.water_level || 0;
-    const cap = cell.water_capacity || 1.0;
+    // Water body = liquid + ice above capacity (core rule, see
+    // waterBodySurplusMm): a frozen lake keeps its prism, roof tinted
+    // toward ICE_COLOR by the frozen share of the surplus.
+    const bodySurplus = waterBodySurplusMm(cell);
+    const ice = cell.ice_level || 0;
 
     // OVERFLOW: solid hex prism for the surplus above capacity, the
     // "one-hex lake = hex filled with water" render. Thresholded to
     // avoid a cell with near-zero capacity (post-Phase 3, water_capacity
     // ≈ 0.05-0.5 mm) showing a "lake" as soon as one mm of rain crosses
     // it; below the threshold, nothing (trace invisible at this scale).
-    if (wl > cap + OVERFLOW_MIN_MM) {
-      const surplus = (wl - cap) * WATER_SURFACE_M;
+    if (bodySurplus > OVERFLOW_MIN_MM) {
+      const surplus = bodySurplus * WATER_SURFACE_M;
       const bottomY = cell.elevation * ELEVATION_SCALE + OVERFLOW_Y;
       const topY = (cell.elevation + surplus) * ELEVATION_SCALE + OVERFLOW_Y;
       const verts = hexVertices(x, z);
+      const iceFrac = Math.min(1, ice / bodySurplus);
+      const roof = [
+        TOP_COLOR[0] + (ICE_COLOR[0] - TOP_COLOR[0]) * iceFrac,
+        TOP_COLOR[1] + (ICE_COLOR[1] - TOP_COLOR[1]) * iceFrac,
+        TOP_COLOR[2] + (ICE_COLOR[2] - TOP_COLOR[2]) * iceFrac,
+      ];
 
       const centerTop = vc;
       positions.push(x, topY, z);
-      colors.push(...TOP_COLOR);
+      colors.push(...roof);
       vc++;
       for (const v of verts) {
         positions.push(v.x, topY, v.z);
-        colors.push(...TOP_COLOR);
+        colors.push(...roof);
         vc++;
       }
       for (let i = 0; i < 6; i++) {
@@ -1826,11 +1986,11 @@ function buildWater(cells, edgeFluxMax) {
     // protocol and the diags: the simplification is purely
     // cartographic.
     if (edgeFluxMax <= 0) continue;
-    const isLake = wl > cap + OVERFLOW_MIN_MM;
+    const isLake = bodySurplus > OVERFLOW_MIN_MM;
     // Reference height of the ribbon/surface: the lake's roof for a
     // cell in overflow (a cascade lands there), the ground otherwise.
     const ySurf = isLake
-      ? (cell.elevation + (wl - cap) * WATER_SURFACE_M) * ELEVATION_SCALE + OVERFLOW_Y
+      ? (cell.elevation + bodySurplus * WATER_SURFACE_M) * ELEVATION_SCALE + OVERFLOW_Y
       : cell.elevation * ELEVATION_SCALE + TRAIL_Y;
 
     // Dominant outlet; the cell is a river if its discharge passes the
@@ -1861,11 +2021,10 @@ function buildWater(cells, edgeFluxMax) {
     // the level here to the level there, lake surface included, this is
     // how a river DIVES into a lake or RESURFACES at the outlet.
     if (isRiver && outNb) {
-      const nwl = outNb.water_level || 0;
-      const ncap = outNb.water_capacity || 1.0;
+      const nSurplus = waterBodySurplusMm(outNb);
       const yN =
-        nwl > ncap + OVERFLOW_MIN_MM
-          ? (outNb.elevation + (nwl - ncap) * WATER_SURFACE_M) * ELEVATION_SCALE + OVERFLOW_Y
+        nSurplus > OVERFLOW_MIN_MM
+          ? (outNb.elevation + nSurplus * WATER_SURFACE_M) * ELEVATION_SCALE + OVERFLOW_Y
           : outNb.elevation * ELEVATION_SCALE + TRAIL_Y;
       if (Math.abs(yN - ySurf) > 1e-6) {
         const [ux, uz] = EDGE_DIR_WORLD[outD];
@@ -2086,7 +2245,14 @@ function buildSnow(cells) {
   for (const cell of cells) {
     if (cell.snow_level < 0.01) continue;
     const { x, z } = hexToWorld(cell.q, cell.r);
-    const topY = cell.elevation * ELEVATION_SCALE;
+    // The sheet sits on the water body's roof when there is one (liquid +
+    // ice, same rule as buildWater's prism), otherwise on the ground: snow
+    // on a frozen lake must not hide inside the ice prism.
+    const bodySurplus = waterBodySurplusMm(cell);
+    const topY =
+      bodySurplus > OVERFLOW_MIN_MM
+        ? (cell.elevation + bodySurplus * WATER_SURFACE_M) * ELEVATION_SCALE + OVERFLOW_Y
+        : cell.elevation * ELEVATION_SCALE;
     const snowHeight = snowVisualHeight(cell.snow_level) * ELEVATION_SCALE;
     _cloudMtx.makeScale(1, snowHeight + 0.02, 1);
     _cloudMtx.setPosition(x, topY, z);
@@ -2102,29 +2268,53 @@ function buildSnow(cells) {
 
 // --- Build forest (instanced low-poly trees) -------------------------------
 // One hex = ~100 ha: we don't render actual trees but a *representative
-// cover*. Each vegetated hex scatters N stylized trees, driven blindly
-// by the core's data (anti-pattern #2):
-//   • count        ∝ vegetation (total cover)
-//   • species      drawn from species_mix (the mix, not just the dominant one)
-//   • shape        conifer (pine/fir) = cone; broadleaf (oak/beech) = blob
-//   • height       ∝ stand_age (young sapling → old-growth stand)
+// cover*. Each vegetated hex scatters stylized plants per woody stratum,
+// driven blindly by the core's data (anti-pattern #2):
+//   • count        ∝ the stratum's cover (`cover_by_stratum`): trees ∝ the
+//                  tree layer, bushes ∝ the shrub layer (#161)
+//   • species      drawn from that stratum's share of species_mix (the mix,
+//                  not just the dominant one)
+//   • shape        from the species' `growth_form` in the header's
+//                  `species_catalog`: conifer = cone, broadleaf = blob,
+//                  shrub = small low blob, grass = nothing
+//   • height       ∝ stand_age for trees (young sapling → old-growth stand)
 //   • position     hash(q, r, i) → deterministic, stable tick to tick (no
 //                  flicker), same spirit as the sub-hex decor seeded by (q,r)
-// Alpine grass doesn't carry a tree: it's a ground cover, rendered via the
-// terrain color. A pure-lawn hex therefore stays treeless (correct).
+// The herb stratum carries no silhouette: it is ground cover, rendered via
+// the terrain color. A pure-lawn hex therefore stays treeless (correct).
+// Which column is a tree or a conifer is read from the catalog, never
+// hardcoded here: a species added to the core's table draws on day one.
 const FOREST_MODES = new Set(["terrain", "species", "age"]);
-const CONIFER_SPECIES = new Set(["pine", "fir"]);
-const GRASS_SPECIES = new Set(["alpine_grass"]);
-const MAX_TREES_PER_HEX = 20;
-const MIN_VEG_FOR_TREES = 0.05;
-// Global budget of instanced trees (F16 / LOD). Without a ceiling, a mature
-// world at r200 generates >750k trees (round(veg·20) per cell over ~100k
-// cells), more triangles than everything else combined, and sub-pixel at
-// full-map view. We cap the total: beyond it, we thin all cells
-// proportionally (dense forests keep the most trees). At r60/r100 the
-// natural total is under the budget, so no effect (it's an anti-explosion
-// safeguard for large maps).
-const FOREST_BUDGET = 120000;
+// Scattered strata (a rendering choice: which layers get instances, how
+// many at full cover, and a hash salt so each layer's positions are drawn
+// independently). Keyed by the core's stratum ids (`stratum_order`).
+// Instances per hex at full cover. A hex is ~130 m across (1.46 ha): at
+// 20 trees it read as an orchard on bare ground (2026-10-01), 64 crowns
+// with the sizes below overlap into a closed canopy, 40 bushes fill the
+// understory. The global `FOREST_BUDGET` thins large maps.
+const SCATTERED_STRATA = {
+  tree:  { perHex: 64, salt: 0 },
+  shrub: { perHex: 40, salt: 4096 },
+};
+// Silhouette per growth form (`species_catalog[i].growth_form`). Sizes in
+// world units at full age; `aged` scales them with stand_age (trees), a
+// bush keeps its size. `grass` has no entry: no instance.
+const SILHOUETTES = {
+  conifer:   { mesh: "cone", r: 0.12, h: 0.45, aged: true },
+  broadleaf: { mesh: "blob", r: 0.15, h: 0.26, aged: true },
+  shrub:     { mesh: "blob", r: 0.08, h: 0.06, aged: false },
+};
+const MIN_COVER_FOR_SCATTER = 0.05;
+// Global budget of instances (F16 / LOD). Without a ceiling, a mature
+// world at r200 generates millions of instances (round(cover·64) trees
+// plus round(cover·40) bushes per cell over ~100k cells), more triangles
+// than everything else combined, and sub-pixel at full-map view. We cap
+// the total: beyond it, we thin all cells proportionally (dense forests
+// keep the most trees). A closed r30 world sits under the budget (~180k),
+// a closed r45 one just above it (~440k, thinned ×0.9); the knob to turn
+// if a machine struggles. 120k until 2026-10-01, when the per-hex density
+// tripled.
+const FOREST_BUDGET = 400000;
 
 // Deterministic integer hash (q, r, i) → [0, 1). Used to seed positions,
 // sizes, and species draws without Math.random (determinism = no flicker).
@@ -2139,95 +2329,110 @@ function hash3(a, b, c) {
   return (h >>> 0) / 4294967296;
 }
 
-// Draws a species proportionally to the mix (species_mix normalized). `r`
-// is in [0,1). Returns the name (SPECIES_COLORS key) or null for a bare hex.
-function pickSpeciesByMix(mix, order, r) {
-  let sum = 0;
-  for (const m of mix) sum += m;
-  if (sum <= 0) return null;
-  let x = r * sum;
-  for (let i = 0; i < order.length; i++) {
-    x -= mix[i];
-    if (x <= 0) return order[i];
-  }
-  return order[order.length - 1];
+// Columns of species_mix per stratum (index = position in `stratum_order`,
+// the index of `cover_by_stratum`), read from the header catalog. null when
+// the header lacks it (the forest is then not drawn rather than guessed).
+function speciesLayout(state) {
+  const catalog = state.species_catalog;
+  const strata = state.stratum_order;
+  if (!Array.isArray(catalog) || !Array.isArray(strata)) return null;
+  const columns = strata.map((stratum) =>
+    catalog.flatMap((info, i) => (info.stratum === stratum ? [i] : [])),
+  );
+  return { catalog, strata, columns };
 }
 
-function buildForest(cells, mode, speciesOrder) {
-  if (!FOREST_MODES.has(mode) || !Array.isArray(speciesOrder)) return null;
+// Draws a column among `columns` proportionally to its share of the mix.
+// `r` is in [0,1). Returns the column index, or -1 if they hold nothing.
+function pickSpeciesByMix(mix, columns, r) {
+  let sum = 0;
+  for (const c of columns) sum += mix[c] ?? 0;
+  if (sum <= 0) return -1;
+  let x = r * sum;
+  for (const c of columns) {
+    x -= mix[c] ?? 0;
+    if (x <= 0) return c;
+  }
+  return columns[columns.length - 1];
+}
 
-  // Pass 1 (F16): natural total of trees. Beyond the budget, we trim all
-  // cells by the same factor → total ≈ budget, relative density preserved.
+function buildForest(cells, mode, state) {
+  if (!FOREST_MODES.has(mode)) return null;
+  const layout = speciesLayout(state);
+  if (!layout) return null;
+  // Scattered strata present in this world, with their cover index.
+  const layers = layout.strata
+    .map((stratum, s) => ({ s, columns: layout.columns[s], ...SCATTERED_STRATA[stratum] }))
+    .filter((l) => l.perHex !== undefined);
+  const scatterable = (cell) => !cell.is_open_water
+    && Array.isArray(cell.species_mix) && Array.isArray(cell.cover_by_stratum);
+
+  // Pass 1 (F16): natural total of instances. Beyond the budget, we trim
+  // all cells by the same factor → total ≈ budget, relative density preserved.
   let naturalTotal = 0;
   for (const cell of cells) {
-    if (cell.is_open_water) continue;
-    const veg = cell.vegetation ?? 0;
-    if (veg < MIN_VEG_FOR_TREES || !Array.isArray(cell.species_mix)) continue;
-    naturalTotal += Math.round(veg * MAX_TREES_PER_HEX);
+    if (!scatterable(cell)) continue;
+    for (const l of layers) {
+      const cover = cell.cover_by_stratum[l.s] ?? 0;
+      if (cover >= MIN_COVER_FOR_SCATTER) naturalTotal += Math.round(cover * l.perHex);
+    }
   }
-  const treesPerHex =
-    naturalTotal > FOREST_BUDGET
-      ? MAX_TREES_PER_HEX * (FOREST_BUDGET / naturalTotal)
-      : MAX_TREES_PER_HEX;
+  const thin = naturalTotal > FOREST_BUDGET ? FOREST_BUDGET / naturalTotal : 1;
 
-  // Two silhouette categories, each its own separate InstancedMesh.
-  const conifer = []; // { x, y, z, r, h, cr, cg, cb }
-  const broadleaf = [];
+  // Two meshes (cone, blob), each its own InstancedMesh; bushes share the
+  // blob mesh at a smaller, flatter scale.
+  const byMesh = { cone: [], blob: [] }; // { x, y, z, r, h, cr, cg, cb }
 
   for (const cell of cells) {
-    if (cell.is_open_water) continue;
-    const veg = cell.vegetation ?? 0;
-    if (veg < MIN_VEG_FOR_TREES || !Array.isArray(cell.species_mix)) continue;
-
-    const n = Math.round(veg * treesPerHex);
-    if (n < 1) continue;
-
+    if (!scatterable(cell)) continue;
     const { x: cx, z: cz } = hexToWorld(cell.q, cell.r);
     const verts = hexVertices(cx, cz);
     const topY = cell.elevation * ELEVATION_SCALE;
     const ageF = 0.55 + 0.45 * Math.min(1, (cell.stand_age ?? 0) / 70);
 
-    for (let i = 0; i < n; i++) {
-      const b = i * 8; // base salt per tree: disjoint hash indices
-      const sp = pickSpeciesByMix(cell.species_mix, speciesOrder, hash3(cell.q, cell.r, b + 4));
-      if (!sp || GRASS_SPECIES.has(sp)) continue; // grass = no tree
-      const base = SPECIES_COLORS[sp];
-      if (!base) continue;
+    for (const l of layers) {
+      const cover = cell.cover_by_stratum[l.s] ?? 0;
+      if (cover < MIN_COVER_FOR_SCATTER) continue;
+      const n = Math.round(cover * l.perHex * thin);
 
-      // Position: uniform sample over the WHOLE hexagon (up to the edges),
-      // not a disc centered on it, otherwise trees clump in the center and
-      // two adjacent hexes don't connect (a "polka-dot" effect on plains).
-      // We draw one of the 6 triangles (center, corner t, corner t+1) then
-      // a uniform point inside it (barycentric fold of the unit square onto
-      // the triangle).
-      const t = Math.floor(hash3(cell.q, cell.r, b) * 6) % 6;
-      let s1 = hash3(cell.q, cell.r, b + 1);
-      let s2 = hash3(cell.q, cell.r, b + 2);
-      if (s1 + s2 > 1) { s1 = 1 - s1; s2 = 1 - s2; }
-      const va = verts[t];
-      const vb = verts[(t + 1) % 6];
-      const px = cx + s1 * (va.x - cx) + s2 * (vb.x - cx);
-      const pz = cz + s1 * (va.z - cz) + s2 * (vb.z - cz);
+      for (let i = 0; i < n; i++) {
+        const b = l.salt + i * 8; // base salt per instance: disjoint hash indices
+        const col = pickSpeciesByMix(cell.species_mix, l.columns, hash3(cell.q, cell.r, b + 4));
+        if (col < 0) continue;
+        const info = layout.catalog[col];
+        const shape = SILHOUETTES[info.growth_form];
+        const base = SPECIES_COLORS[info.id];
+        if (!shape || !base) continue; // grass = no instance
 
-      // Size: height ∝ age, with per-tree jitter.
-      const jit = 0.8 + 0.35 * hash3(cell.q, cell.r, b + 3);
-      const shade = 0.58 + 0.3 * hash3(cell.q, cell.r, b + 5);
-      const cr = base[0] * shade;
-      const cg = base[1] * shade;
-      const cb = base[2] * shade;
+        // Position: uniform sample over the WHOLE hexagon (up to the edges),
+        // not a disc centered on it, otherwise trees clump in the center and
+        // two adjacent hexes don't connect (a "polka-dot" effect on plains).
+        // We draw one of the 6 triangles (center, corner t, corner t+1) then
+        // a uniform point inside it (barycentric fold of the unit square onto
+        // the triangle).
+        const t = Math.floor(hash3(cell.q, cell.r, b) * 6) % 6;
+        let s1 = hash3(cell.q, cell.r, b + 1);
+        let s2 = hash3(cell.q, cell.r, b + 2);
+        if (s1 + s2 > 1) { s1 = 1 - s1; s2 = 1 - s2; }
+        const va = verts[t];
+        const vb = verts[(t + 1) % 6];
+        const px = cx + s1 * (va.x - cx) + s2 * (vb.x - cx);
+        const pz = cz + s1 * (va.z - cz) + s2 * (vb.z - cz);
 
-      if (CONIFER_SPECIES.has(sp)) {
-        const h = 0.5 * ageF * jit;
-        const r = 0.16 * ageF * jit;
-        conifer.push({ x: px, y: topY, z: pz, r, h, cr, cg, cb });
-      } else {
-        const h = 0.3 * ageF * jit;
-        const r = 0.2 * ageF * jit;
-        broadleaf.push({ x: px, y: topY, z: pz, r, h, cr, cg, cb });
+        // Size: height ∝ age for trees, with per-instance jitter.
+        const jit = 0.8 + 0.35 * hash3(cell.q, cell.r, b + 3);
+        const size = (shape.aged ? ageF : 1) * jit;
+        const shade = 0.58 + 0.3 * hash3(cell.q, cell.r, b + 5);
+        byMesh[shape.mesh].push({
+          x: px, y: topY, z: pz, r: shape.r * size, h: shape.h * size,
+          cr: base[0] * shade, cg: base[1] * shade, cb: base[2] * shade,
+        });
       }
     }
   }
 
+  const conifer = byMesh.cone;
+  const broadleaf = byMesh.blob;
   if (conifer.length === 0 && broadleaf.length === 0) return null;
 
   const group = new THREE.Group();
@@ -2250,7 +2455,8 @@ function buildForest(cells, mode, speciesOrder) {
     group.add(mesh);
   }
 
-  // Icosahedron (radius 1, detail 0 = 20 faces) → broadleaves, slightly flattened.
+  // Icosahedron (radius 1, detail 0 = 20 faces) → broadleaves and bushes,
+  // slightly flattened.
   if (broadleaf.length > 0) {
     const geo = new THREE.IcosahedronGeometry(1, 0);
     const mesh = new THREE.InstancedMesh(geo, TREE_MAT, broadleaf.length);
@@ -2437,8 +2643,9 @@ function buildTemperatureContours(cells) {
 // --- Build precipitation overlay (tinted hex top floating above everything) ---
 // A hexagonal disc per cell with active precipitation, positioned above the
 // highest surface (terrain + any lake + accumulated snow) so the white snow
-// doesn't mask the tint. Single alpha on the material, intensity encoded by
-// the hue from pale cyan to deep violet.
+// doesn't mask the tint. Intensity is double-encoded: hue (pale blue to
+// deep violet) and per-vertex alpha (drizzle translucent, downpour opaque),
+// see the comment above precipitationTintColor/precipitationAlpha.
 function buildPrecipitationOverlay(cells) {
   const positions = [];
   const colors = [];
@@ -2460,13 +2667,13 @@ function buildPrecipitationOverlay(cells) {
 
     const centerIdx = vc;
     positions.push(x, y, z);
-    colors.push(col.r, col.g, col.b);
+    colors.push(col.r, col.g, col.b, col.a);
     vc++;
 
     const verts = hexVertices(x, z);
     for (const v of verts) {
       positions.push(v.x, y, v.z);
-      colors.push(col.r, col.g, col.b);
+      colors.push(col.r, col.g, col.b, col.a);
       vc++;
     }
 
@@ -2480,7 +2687,10 @@ function buildPrecipitationOverlay(cells) {
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  // itemSize 4 (r,g,b,a): this is what makes three.js honour per-vertex
+  // alpha on PRECIP_MAT (see the material's comment). WIND_MAT/TEMP_MAT
+  // geometries below keep itemSize 3, unaffected.
+  geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 4));
   geometry.setIndex(indices);
 
   return new THREE.Mesh(geometry, PRECIP_MAT);
@@ -2568,7 +2778,7 @@ function rebuildScene(state) {
 
   // Forest: instanced trees, only on the map backgrounds where vegetation
   // makes sense (terrain / species / age).
-  forestMesh = buildForest(state.cells, viewModeEl.value, state.species_order);
+  forestMesh = buildForest(state.cells, viewModeEl.value, state);
   if (forestMesh) scene.add(forestMesh);
 
   if (showWind) {
@@ -2868,7 +3078,15 @@ function applySnapshot(state) {
   const h = state.total_humidity?.toFixed(1) ?? "-";
   const cw = state.total_cloud_water?.toFixed(2) ?? "-";
   const g = state.total_groundwater?.toFixed(1) ?? "-";
+  // Deep aquifer (#107), its own stock below the root zone: shown next to
+  // the soil water, counted once in the total.
+  const aquifer = state.total_aquifer ?? 0;
+  const groundwaterStat = aquifer > 0.05 ? `${g} (+${aquifer.toFixed(1)} aquifer)` : g;
   const sn = state.total_snow?.toFixed(1) ?? "-";
+  // Lake ice is its own stock in the core (a frozen lake is still a lake);
+  // shown next to the snowpack, counted once in the total.
+  const ice = state.total_ice ?? 0;
+  const snowStat = ice > 0.05 ? `${sn} (+${ice.toFixed(1)} ice)` : sn;
   // total_humidity already includes cloud_water (humidity_total = surface +
   // upper + cloud). So we don't add it a second time in the global total,
   // otherwise the same stock would be counted twice.
@@ -2876,21 +3094,31 @@ function applySnapshot(state) {
     (state.total_surface_water ?? 0) +
     (state.total_humidity ?? 0) +
     (state.total_groundwater ?? 0) +
-    (state.total_snow ?? 0)
+    (state.total_aquifer ?? 0) +
+    (state.total_snow ?? 0) +
+    (state.total_ice ?? 0)
   ).toFixed(1);
   statSurface.textContent = s;
   statHumidity.textContent = h;
   statCloud.textContent = cw;
-  // Average rainfall over the map: (total_precip / cells) × mm/unit gives
-  // mm of rain on the average cell for this tick (=1 day). Annualized =
-  // × 365 under the assumption of climate stability across the tick.
-  const precipPerCell =
+  // total_precip_this_tick is THIS HOUR's flux (fix/rain-regime), not a
+  // daily total: (total_precip / cells) gives mm fallen on the average
+  // cell this hour. ×24 extrapolates it into a "rate" (what the day would
+  // total if every hour rained like this one, which it won't), ×365 more
+  // into an annual rate. Both are rates, not observed totals, hence the
+  // "rate" label instead of a bare mm/d.
+  const precipPerCellPerHour =
     (state.total_precip_this_tick ?? 0) / Math.max(1, state.cell_count ?? 1);
-  const mmPerDay = precipPerCell;
-  const mmPerYear = mmPerDay * 365;
-  statRainMm.textContent = `${mmPerDay.toFixed(1)} mm/d (${Math.round(mmPerYear)} mm/yr)`;
-  statGroundwater.textContent = g;
-  statSnow.textContent = sn;
+  const mmPerDayRate = precipPerCellPerHour * 24;
+  const mmPerYearRate = mmPerDayRate * 365;
+  // Imposed weather regime (#63/#146, on by default since 2026-09-06):
+  // `weather_regime_wet` names the current dry/wet phase, already
+  // computed core-side, read here as-is (anti-pattern #2, no
+  // recomputing what the core already decided).
+  const regimePhase = state.weather_regime_wet === undefined ? "" : state.weather_regime_wet ? " · wet" : " · dry";
+  statRainMm.textContent = `${mmPerDayRate.toFixed(1)} mm/d rate (${Math.round(mmPerYearRate)} mm/yr)${regimePhase}`;
+  statGroundwater.textContent = groundwaterStat;
+  statSnow.textContent = snowStat;
   statTotal.textContent = total;
 
   lastState = state;
@@ -2961,6 +3189,17 @@ function dispatchMessage(msg) {
         : "unknown";
       el.title = `Build ${iso} UTC · hash ${msg.build_hash}`;
       el.classList.toggle("dirty", String(msg.build_hash).endsWith("-dirty"));
+    }
+    // World size (#L6, reset with a radius): both fields come straight from
+    // the core's grid (anti-pattern #2, never recomputed here). Refreshed
+    // on connect and again right after every `reset` (see btnReset below),
+    // so this stays correct even when the radius just changed.
+    if (typeof msg.radius === "number") {
+      if (statWorld) {
+        const cellCount = typeof msg.cell_count === "number" ? msg.cell_count.toLocaleString() : "?";
+        statWorld.textContent = `r${msg.radius} · ${cellCount}`;
+      }
+      if (radiusInput) radiusInput.placeholder = String(msg.radius);
     }
     return;
   }
@@ -3090,6 +3329,14 @@ function connect() {
       const demarre = () => {
         if (premierEmbed || hostIntent) applyPlayState(hostIntent !== "pause");
       };
+      // A fresh world starts at midnight on January 1st: a visitor would
+      // land on a dark board and wait ~8 s at 1 h/s for dawn. The shipped
+      // world avoided it by opening at noon; a fresh one is advanced to
+      // noon before the first playback (12 hourly ticks, ~0.1 s at r70).
+      // WASM only: in WS mode the world is the server's, not fresh.
+      if (premierEmbed && !BOOT_WORLD_URL && resolveMode() === "wasm") {
+        send({ cmd: "step_hour", n: EMBED_FRESH_START_HOUR });
+      }
       // The shipped world must replace the fresh world BEFORE the first playback,
       // otherwise the visitor sees tick 0 scroll by for a second before being overwritten.
       if (BOOT_WORLD_URL && !bootWorldDone) loadBootWorld().finally(demarre);
@@ -3193,6 +3440,7 @@ const btnStep = document.getElementById("btn-step");
 const btnMonth = document.getElementById("btn-month");
 const btnYear = document.getElementById("btn-year");
 const seedInput = document.getElementById("seed-input");
+const radiusInput = document.getElementById("radius-input");
 const btnRandomSeed = document.getElementById("btn-random-seed");
 const btnReset = document.getElementById("btn-reset");
 
@@ -3200,7 +3448,7 @@ const btnReset = document.getElementById("btn-reset");
 // stay active (purely client-side / harmless set_param).
 const BUSY_CONTROLS = [
   btnPlayPause, btnStepHour, btnStep, btnMonth, btnYear,
-  seedInput, btnRandomSeed, btnReset,
+  seedInput, radiusInput, btnRandomSeed, btnReset,
 ];
 
 // `busy` (logical) = a job is running: switches to true AS SOON as the
@@ -3295,7 +3543,19 @@ btnRandomSeed.addEventListener("click", () => {
   seedInput.value = Math.floor(Math.random() * 999999);
 });
 btnReset.addEventListener("click", () => {
-  send({ cmd: "reset", seed: parseInt(seedInput.value, 10) || 42 });
+  const cmd = { cmd: "reset", seed: parseInt(seedInput.value, 10) || 42 };
+  // Sent only if the user actually typed something: an empty field means
+  // "keep the current radius" (today's behaviour, byte-for-byte), not "0".
+  const radiusRaw = radiusInput?.value.trim();
+  if (radiusRaw) {
+    const radius = parseInt(radiusRaw, 10);
+    if (Number.isFinite(radius)) cmd.radius = radius;
+  }
+  send(cmd);
+  // Re-syncs the version badge, the World stat and the radius placeholder
+  // on the post-reset world: same path as the initial connect (#L6), so
+  // there's a single place that knows how to read a `meta` response.
+  send({ cmd: "meta" });
 });
 
 // --- Checkpoint save/load (binary file) ---
@@ -3602,9 +3862,13 @@ renderer.domElement.addEventListener("mousemove", (e) => {
   const c = lastState.cells[idx];
   const cap = (c.permeability * 100).toFixed(1);
   const sat = c.permeability > 0 ? ((c.groundwater / (c.permeability * 100)) * 100).toFixed(0) : "—";
+  // Outflow = 60-day mean of the water leaving the cell (mm/day, core EMA
+  // #106); its direction comes from today's flow vector, "—" when nothing
+  // leaves.
+  const outflow = c.outflow_flux || 0;
   const fvMag = Math.hypot(c.flow_vec_x || 0, c.flow_vec_y || 0);
-  const fvLabel = fvMag > 1e-4
-    ? `${fvMag.toFixed(3)} → ${windLabel(c.flow_vec_x, c.flow_vec_y).split(" → ")[1] || ""}`
+  const outflowLabel = outflow > 1e-4
+    ? `${outflow.toFixed(3)} mm/day${fvMag > 1e-4 ? ` → ${compassDir(c.flow_vec_x, c.flow_vec_y)}` : ""}  (60-day mean)`
     : "—";
   const lines = [
     `(${c.q}, ${c.r})`,
@@ -3614,12 +3878,14 @@ renderer.domElement.addEventListener("mousemove", (e) => {
     `hum surf ${(c.humidity_surface ?? 0).toFixed(2)} mm`,
     `hum up   ${(c.humidity_upper ?? 0).toFixed(2)} mm PW`,
     `cloud    ${(c.cloud_water ?? 0).toFixed(2)} mm  (drives the render)`,
-    `rain/d   ${(c.rain_amount ?? 0).toFixed(2)} mm   snow/d ${(c.snow_amount ?? 0).toFixed(2)} mm`,
+    // rain_amount/snow_amount are this hour-tick's flux, not a daily total
+    // (fix/rain-regime).
+    `rain/h   ${(c.rain_amount ?? 0).toFixed(2)} mm   snow/h ${(c.snow_amount ?? 0).toFixed(2)} mm`,
     `gwater   ${c.groundwater.toFixed(2)} mm / ${cap} mm (${sat}%)`,
-    `perm     ${c.permeability.toFixed(2)}`,
-    `cover    ${c.is_open_water ? "water" : (c.dominant_species ?? "bare")}   veg ${(c.vegetation ?? 0).toFixed(2)}`,
-    `outflow  ${(c.outflow_flux || 0).toFixed(3)}`,
-    `flow dir ${fvLabel}`,
+    `snow     ${(c.snow_level ?? 0).toFixed(1)} mm   ice ${(c.ice_level ?? 0).toFixed(1)} mm`,
+    `soil     ${c.lithology ?? "?"} · perm ${Math.round(c.permeability * 100)}%  (sets gw cap + infiltration)`,
+    `cover    ${coverLabel(c, lastState)}`,
+    `outflow  ${outflowLabel}`,
     `wind     ${windLabel(c.wind_x, c.wind_y)}`,
   ];
   tooltipData = lines.join("\n");
@@ -3801,7 +4067,10 @@ for (const input of paramsContent.querySelectorAll("input[data-local]")) {
     // core). For each vegetated cell: share of the dominant species
     // (max/sum) and effective number of species (inverse Simpson,
     // Σpᵢ²). Aggregates to answer "mono vs mixed". Cover threshold to
-    // ignore nearly-bare cells (noise).
+    // ignore nearly-bare cells (noise). Since the strata (#161) the sum
+    // runs over every layer's biomass, so an oak canopy over a meadow
+    // counts as a two-species mix; the columns follow `species_order`,
+    // whatever the table's size.
     mix(minVeg = 0.05) {
       if (!lastState || !lastState.cells || !lastState.species_order) return null;
       let n = 0;

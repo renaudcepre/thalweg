@@ -27,14 +27,16 @@ function parse(argv) {
   return o;
 }
 const opt = parse(process.argv.slice(2));
-const URL = opt.url ?? "http://localhost:8355";
+// Not `URL`: that name shadows the global constructor used two lines
+// below (`new URL(...)` then throws "URL is not a constructor").
+const baseUrl = opt.url ?? "http://localhost:8355";
 const timeout = Number(opt.timeout ?? 20000);
 
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
   // `?capture`: preserveDrawingBuffer on the front end, otherwise a black capture (main.js).
-  const captureUrl = new URL(URL);
+  const captureUrl = new URL(baseUrl);
   captureUrl.searchParams.set("capture", "1");
   await page.goto(captureUrl.href, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => window.__hexcam && window.__hexcam.ready(), {

@@ -26,6 +26,9 @@ struct StepParams {
 struct ResetParams {
     /// Random seed (optional)
     seed: Option<u32>,
+    /// Grid radius, 5-300 (optional, keeps the current radius if omitted).
+    /// Small radii run much faster, useful for quick tests.
+    radius: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -97,12 +100,15 @@ impl SimServer {
         }
     }
 
-    #[tool(description = "Reset simulation (optional seed)")]
+    #[tool(description = "Reset simulation (optional seed, optional radius 5-300)")]
     async fn sim_reset(&self, p: Parameters<ResetParams>) -> String {
-        let cmd = match p.0.seed {
-            Some(s) => serde_json::json!({"cmd": "reset", "seed": s}),
-            None => serde_json::json!({"cmd": "reset"}),
-        };
+        let mut cmd = serde_json::json!({"cmd": "reset"});
+        if let Some(s) = p.0.seed {
+            cmd["seed"] = serde_json::json!(s);
+        }
+        if let Some(r) = p.0.radius {
+            cmd["radius"] = serde_json::json!(r);
+        }
         let _ = self.ws.send(cmd).await.map_err(|e| format!("Error: {e}"));
         match self
             .ws

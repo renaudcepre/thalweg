@@ -30,11 +30,14 @@
 
 use crate::ablation::Ablation;
 use crate::atmosphere::{
-    AtmoForcing, AtmoScratch, AtmosphereParams, PrecipitationMap, smooth_upper_air_mean_t,
-    step_atmosphere_into, surface_means,
+    AtmoForcing, AtmoScratch, AtmoState, AtmosphereParams, MoistCoarseForcing, MoistCoarseMode,
+    MoistCoarseState, PrecipitationMap, VaporSources, moist_coarse_radius, saturation_upper,
+    smooth_upper_air_mean_t, step_atmosphere_into, step_moist_precip, surface_means,
+    upper_air_temperature,
 };
 use crate::climate::{ClimateHistory, DayRecord};
 use crate::climate_normals::ClimateNormalsAccumulator;
+use crate::climatology::{TerrainClimate, terrain_climate};
 use crate::dynamics::{SynopticParams, SynopticState};
 use crate::erosion::{
     DischargeEmaMap, EdgeFluxEmaMap, ErosionForcing, ErosionParams, step_erosion, update_edge_ema,
@@ -42,21 +45,22 @@ use crate::erosion::{
 };
 use crate::fire::{FireParams, step_fire};
 use crate::grid::HexGrid;
-use crate::groundwater::{GroundwaterParams, step_groundwater};
+use crate::groundwater::{GroundwaterParams, GroundwaterScratch, step_groundwater_into};
 use crate::hydro::{
-    DischargeMap, EdgeFluxMap, FlowVecMap, FluxMap, HydroParams, step_hydro_mfd_into,
+    DischargeMap, EdgeFluxMap, FlowVecMap, FluxMap, HydroParams, HydroScratch, step_hydro_mfd_into,
 };
 use crate::lake::{LakeParams, step_lake_leveling};
+use crate::par;
 use crate::phase_timing::{PhaseTimings, elapsed_s, mark};
 use crate::snow::{SnowForcing, SnowParams, step_snow};
 use crate::synoptic_mesh::SynopticMesh;
 use crate::temperature::{
-    IllumCache, TemperatureForcing, TemperatureParams, aspect_insolation_correction,
-    compute_illumination_cached, compute_surface_normals, solar_beam_at_tick, step_temperature,
+    IllumCache, TemperatureForcing, TemperatureParams, compute_illumination_cached,
+    compute_surface_normals, solar_beam_at_tick, step_temperature,
     terrain_annual_mean_insolation_factor,
 };
 use crate::time::{self, TICKS_PER_DAY};
-use crate::vegetation::{VegetationParams, step_vegetation};
+use crate::vegetation::{VegetationParams, fill_transpiration_cover_into, step_vegetation};
 use crate::wind::{
     WindField, WindParams, WindVec, compute_wind_field_into, compute_wind_magnitudes_into,
 };
@@ -247,6 +251,13 @@ pub struct Simulation {
     /// cell and per hour on a field that only changes every N hours (perf
     /// project #88).
     wind_mag: Vec<f32>,
+    /// Light-weighted transpiring cover per cell
+    /// (`vegetation::transpiration_cover`), refilled once a day at the end
+    /// of the daily tail, after vegetation and fire, the only two steps
+    /// that write biomass. Read every hour by the evaporation through
+    /// `AtmoForcing`: the 16-species, three-exponential sum once a day
+    /// instead of once an hour (#161).
+    transpiration_cover: Vec<f32>,
     /// Prognostic synoptic dynamics (Phase 1 of the synoptic-dynamics
     /// design: f-plane shallow-water core, not yet coupled to precip).
     /// Evolved every hour when `synoptic_enabled`; its geostrophic wind then
@@ -271,11 +282,55 @@ pub struct Simulation {
     /// Base wind on the coarse torus before interpolation to `synoptic_base`
     /// (scratch, coarse size).
     synoptic_coarse_base: WindField,
+    /// Moist-layer coarse mesh (coarse upper layer, step 1 of its
+    /// migration): a
+    /// SECOND, independent [`SynopticMesh`] instance dedicated to
+    /// `humidity_upper`/`cloud_water`, own target spacing
+    /// (`atmosphere::coarse::MOIST_COARSE_SPACING_M`), own radius — NOT
+    /// the synoptic solver's mesh above. Never serialized (deterministic
+    /// from the grid and the persisted radius, same contract as
+    /// `synoptic_mesh`).
+    moist_mesh: SynopticMesh,
+    /// The moist upper layer's coarse state: a read-only **mirror** of
+    /// the fine `humidity_upper`/`cloud_water`, re-gathered every hour, on
+    /// both live modes ([`MoistCoarseMode::Fine`],
+    /// [`MoistCoarseMode::CoarsePrecip`]). See `atmosphere::coarse`'s
+    /// module doc.
+    moist_coarse: MoistCoarseState,
+    /// Which moist-layer mode is live. Resolved once, at construction or
+    /// checkpoint load, from `Ablation::effective().moist_coarse_mode()`
+    /// (`HEXSIM_MOIST_COARSE`), and carried to the atmosphere as
+    /// `AtmoForcing::moist_coarse` — the physics never reads the
+    /// environment. NOT derivable from `Rc == R`: at radius ≤ 2 the mesh
+    /// degenerates to the identity but a coarse mode still drops the
+    /// neighbour share and the fine footprint.
+    moist_coarse_mode: MoistCoarseMode,
+    /// Diagnostic probe: record every fine column's signed vapour ↔
+    /// droplet transfer into `AtmoScratch::cloud_transfer`, so an
+    /// instrument can read it back through
+    /// [`Self::cloud_transfer`](Self::cloud_transfer). Off in production
+    /// on both paths, set by
+    /// [`Self::set_cloud_transfer_probe`](Self::set_cloud_transfer_probe);
+    /// the legacy coarse-stock path turns the recording on by itself
+    /// because its cloud fraction reads the same field. Not
+    /// checkpointed — an instrument, not physics.
+    cloud_transfer_probe: bool,
     climate_history: ClimateHistory,
     last_precipitation: PrecipitationMap,
-    /// Persistent state of the global precipitation gate (hysteresis).
-    /// See `AtmosphereParams.global_precip_gate`.
-    precip_gate_open: bool,
+    /// Vapour emitted by each cell since the last midnight, by source
+    /// (`atmosphere::VaporSources`, mm), summed from the per-tick output
+    /// of `step_evaporation` and reset with `last_precipitation`. The
+    /// evaporation side of the daily water cycle, read by the
+    /// instruments; not checkpointed (an instrument, restarts at the next
+    /// midnight).
+    vapor_today: Vec<VaporSources>,
+    /// Persistent state the atmosphere carries between ticks: the
+    /// precipitation gate's hysteresis (`AtmosphereParams::global_precip_gate`)
+    /// and the imposed weather regime (#63, phase of the synoptic chain
+    /// plus the sky reservoir). Grouped because `step_atmosphere_into` is
+    /// at the 7-argument ceiling (see `AtmoState`); split back into flat
+    /// fields in the checkpoint so files predating the regime still load.
+    atmo_state: AtmoState,
     /// Diurnally smoothed map-mean surface temperature (°C) anchoring the
     /// upper layer (`atmosphere::upper_air_temperature`): exponential
     /// moving average of the instantaneous map mean with
@@ -293,6 +348,15 @@ pub struct Simulation {
     scratch_flux: FluxMap,
     scratch_flow_vec: FlowVecMap,
     scratch_edge_flux: EdgeFluxMap,
+    /// Two-phase scatter -> gather scratch of the daily MFD routing
+    /// (r250 perf effort, chunk C1): `dir_out`, reused across the 8
+    /// passes of [`Self::step_hydro_tranche`], content undefined
+    /// between two calls.
+    hydro_scratch: HydroScratch,
+    /// Same role for the piezometric flow of [`step_groundwater_into`]
+    /// (chunk C1): `dir_out` plus the post-infiltration snapshot it
+    /// reads.
+    groundwater_scratch: GroundwaterScratch,
     /// Current hour precipitation (written by `step_atmosphere_into`).
     /// Accumulated into `last_precipitation` after each Tier 1 sub-tick, reset
     /// at the start of each day. Allows `climate_history` to see 24h total
@@ -336,6 +400,148 @@ fn init_illum_cache_and_terrain_factor(
     illum_cache
 }
 
+/// Closed terrarium: no external humidity input. The cycle is bootstrapped
+/// by a relative-humidity floor on `humidity_upper` from tick 0
+/// (`AtmosphereParams::initial_humidity_floor`): the layer's saturation at
+/// its own upper-air temperature, so a winter summit and a summer plain
+/// each get their own vapour (#152), otherwise the system starts entirely
+/// dry and takes years to start. Factored out of `Simulation::new` to keep
+/// it under clippy's line budget.
+fn apply_humidity_floor(
+    grid: &mut HexGrid,
+    atmosphere: &AtmosphereParams,
+    temperature: &TemperatureParams,
+) {
+    let floor_rh = atmosphere.initial_humidity_floor;
+    if floor_rh <= 0.0 {
+        return;
+    }
+    let (mean_surface_t, mean_elevation) = surface_means(grid);
+    for cell in grid.cells_slice_mut() {
+        let t_upper = upper_air_temperature(
+            mean_surface_t,
+            mean_elevation,
+            cell.elevation,
+            atmosphere,
+            temperature,
+        );
+        let floor = floor_rh * saturation_upper(t_upper, atmosphere);
+        cell.humidity_upper = cell.humidity_upper.max(floor);
+    }
+}
+
+/// Bundle returned by [`build_synoptic_dynamics`]: a named struct rather
+/// than a tuple purely to keep clippy's `type_complexity` calm on the
+/// return type (six fields, no life beyond the one call site in `new`).
+struct SynopticInit {
+    params: SynopticParams,
+    state: SynopticState,
+    /// Prod default hardcoded since #108 (ex-env flag `HEXSIM_SYNOPTIC`,
+    /// exact duplicate of runtime param `synoptic.enabled`). Override via
+    /// `update_param("synoptic.enabled", ...)`.
+    enabled: bool,
+    mesh: SynopticMesh,
+    coarse_base: WindField,
+    base: WindField,
+}
+
+/// Builds the synoptic solver's prognostic state: seed + latitude
+/// inherited from the world to stay consistent with "one world". The
+/// solver integrates on its own dedicated coarse torus (~calibration
+/// spacing, `SynopticMesh`), not on the fine grid at 130 m, where CFL
+/// imposed 163 substeps/h on all cells, 82 % of tick (task #88).
+/// `HEXSIM_SYNOPTIC_COARSE=0` forces the identity mesh (historical
+/// fine-grid behavior, bit-for-bit) for ablation A/B.
+///
+/// Coarse ON toggle validated by climate ablation (2026-07-10, M=3
+/// subsample protocol: hexsim-bench r30, seeds {42,7,99}, warmup 365 d,
+/// measure 3 years, fine vs coarse):
+///
+/// | metric                      | 42          | 7           | 99         |
+/// |-----------------------------|-------------|-------------|------------|
+/// | `water_drift` (x1e-5)       | 1.93->1.92  | 4.46->4.54  | 1.10->1.02 |
+/// | byAlt (d/yr, 4 bands)       | ≤3 d        | ≤2 d        | ≤1 d       |
+/// | plainsP (mm/d)              | -0.1 %      | -1.3 %      | +0.5 %     |
+/// | `dry_streak` (d)            | -0.4 %      | +9.4 %*     | -3.5 %     |
+/// | summer/winter ratio         | -0.6 %      | -0.5 %      | +0.2 %     |
+/// | `gust_days_frac_mean`       | +0.0 %      | +0.4 %      | -1.5 %     |
+/// | ms/tick (6-proc contention) | -74 %       | -74 %       | -72 %      |
+///
+/// (*) metric nearly saturated (971-1095 d over 1095 window).
+/// `plains_max_daily_rain_median` (~0.0003-0.003 mm/d, 300x below gust
+/// threshold) oscillates -100 % to +124 % with no constant sign by seed,
+/// so floor noise, same verdict as plainsP on 07-07. Perf outside
+/// contention: synoptic 83.2 % -> 2.0 % of tick r30 (7.131 -> 0.029
+/// ms/hour-tick), r45 end-to-end 427 -> 75.3 ms/tick.
+///
+/// Effective value: `SYNOPTIC_COARSE_DEFAULT` unless overridden by
+/// `HEXSIM_SYNOPTIC_COARSE`, resolved through [`Ablation::effective`]
+/// (reads the environment once for the whole process).
+///
+/// Factored out of `Simulation::new` for the same reason as
+/// `init_illum_cache_and_terrain_factor`/`build_moist_layer`: keeps `new`
+/// under clippy's line budget.
+fn build_synoptic_dynamics(
+    grid: &HexGrid,
+    wind_params: &WindParams,
+    temperature_params: &TemperatureParams,
+) -> SynopticInit {
+    let synoptic_coarse = Ablation::effective().synoptic_coarse;
+    let mut mesh = if synoptic_coarse {
+        SynopticMesh::build(grid)
+    } else {
+        SynopticMesh::identity(grid)
+    };
+    let params = SynopticParams {
+        seed: wind_params.seed,
+        latitude_deg: temperature_params.latitude_deg,
+        ..SynopticParams::for_spacing(mesh.spacing_m())
+    };
+    let n_coarse = mesh.grid().len();
+    let state = SynopticState::new(n_coarse, &params);
+    mesh.aggregate_temperature(grid);
+    let mut coarse_base: WindField = vec![WindVec::default(); n_coarse];
+    state.write_base_wind(&params, &mut coarse_base);
+    let mut base: WindField = vec![WindVec::default(); grid.len()];
+    mesh.interpolate_wind(&coarse_base, &mut base);
+    SynopticInit {
+        params,
+        state,
+        enabled: true,
+        mesh,
+        coarse_base,
+        base,
+    }
+}
+
+/// Builds the moist-layer coarse mesh and its initial mirror (coarse upper
+/// layer): a SECOND, independent
+/// [`SynopticMesh`] dedicated to `humidity_upper`/`cloud_water`, own
+/// target spacing (`atmosphere::coarse`), not the synoptic solver's mesh
+/// built separately in `new`. `HEXSIM_MOIST_COARSE=0` forces the identity
+/// (`Rc = R`) and the historical fine pipeline, for ablation A/B — same
+/// pattern as the synoptic mesh's own toggle. Factored out of
+/// `Simulation::new` for the same reason as
+/// `init_illum_cache_and_terrain_factor`: keeps `new` under clippy's line
+/// budget.
+///
+/// The mirror is the mean of the fine fields on both modes: `grid` is
+/// only read, never rewritten (the legacy coarse-stock mode, which
+/// rewrote the fine fields as broadcast views of a prognostic reference
+/// stock, was retired 2026-09-07 — see `atmosphere::coarse`'s module
+/// doc).
+fn build_moist_layer(grid: &HexGrid, mode: MoistCoarseMode) -> (SynopticMesh, MoistCoarseState) {
+    let rc = if mode.precipitates_coarse() {
+        moist_coarse_radius(grid.radius())
+    } else {
+        grid.radius()
+    };
+    let mesh = SynopticMesh::with_coarse_radius(grid, rc);
+    let mut state = MoistCoarseState::new(mesh.coarse_len());
+    state.gather_from_fine(&mesh, grid);
+    (mesh, state)
+}
+
 impl Simulation {
     #[must_use]
     pub fn new(
@@ -348,92 +554,46 @@ impl Simulation {
         wind_params: WindParams,
     ) -> Self {
         let n = grid.len();
-        // Closed terrarium: no external humidity input. We bootstrap the cycle
-        // by applying a floor to `humidity_upper` from tick 0, otherwise the
-        // system starts entirely dry and takes years to start.
-        let floor = atmosphere_params.initial_humidity_floor;
-        if floor > 0.0 {
-            let coords: Vec<_> = grid.coords().copied().collect();
-            for coord in coords {
-                if let Some(cell) = grid.get_mut(coord) {
-                    cell.humidity_upper = cell.humidity_upper.max(floor);
-                }
-            }
-        }
+        apply_humidity_floor(&mut grid, &atmosphere_params, &temperature_params);
 
-        // Surface normal per cell (aspect sunny/shaded slope, #102): precalculated
-        // once, elevation frozen after generation (no erosion). Both buffers
-        // inherit it (clone below), and each tick preserves it via the
-        // clone_from_slice in `step_temperature`.
-        compute_surface_normals(&mut grid);
-        // Thermal offset calibration: localizing flux by aspect shifts the map
-        // mean of the geometric factor; we absorb it in the offset to keep
-        // `mean_annual(T) = base_temp`. Flat terrain -> 0 -> unchanged.
-        let mut temperature_params = temperature_params;
-        temperature_params.aspect_correction =
-            aspect_insolation_correction(&grid, &temperature_params);
-        // Real-terrain insolation deficit (relief occlusion + diffuse
-        // sky, JOURNAL 2026-09-02/03): the cache built here is adopted
-        // below instead of being rebuilt on the first tick.
-        let illum_cache = init_illum_cache_and_terrain_factor(&grid, &mut temperature_params);
+        // The relief's climate, one sweep (#152, `climatology::terrain_climate`):
+        // the surface normal per cell (aspect sunny/shaded slope, #102,
+        // both buffers inherit it through the clone below and each tick
+        // preserves it via the clone_from_slice in `step_temperature`); the
+        // thermal offset calibration on the real terrain (`aspect_correction`
+        // and `terrain_insolation_factor`, JOURNAL 2026-09-02/03, so that
+        // `mean_annual(T) = base_temp` on the relief the map actually has;
+        // flat terrain -> identity, bit-identical to the historical path);
+        // the illumination cache adopted below instead of being rebuilt on
+        // the first tick; and the analytic climate normals every cell
+        // starts with, so the vegetation reads a climate from day one. A
+        // generated world was seeded from these same normals (same
+        // function, same inputs) by `terrain::seed_initial_state`.
+        let TerrainClimate {
+            params: temperature_params,
+            cache: illum_cache,
+            normals: initial_normals,
+            ..
+        } = terrain_climate(&mut grid, temperature_params);
+        // Moist-layer coarse mesh and mirror (coarse upper layer): see
+        // `build_moist_layer`'s doc.
+        let moist_coarse_mode = Ablation::effective().moist_coarse_mode();
+        let (moist_mesh, moist_coarse) = build_moist_layer(&grid, moist_coarse_mode);
         let next = grid.clone();
         // The upper-air anchor starts on the instantaneous mean: no
         // history yet, the EMA settles within ~3τ (3 days).
         let (upper_air_mean_t, _) = surface_means(&grid);
 
-        // Synoptic dynamics: seed + latitude inherited from world to stay
-        // consistent with "one world". Solver integrates on its dedicated torus
-        // (~calibration spacing, `SynopticMesh`), not on the fine grid at 130 m
-        // where CFL imposed 163 substeps/h on all cells, 82 % of tick (task #88).
-        // `HEXSIM_SYNOPTIC_COARSE=0` forces identity mesh (historical fine-grid
-        // behavior, bit-for-bit) for ablation A/B.
-        //
-        // Coarse ON toggle validated by climate ablation (2026-07-10, M=3
-        // subsample protocol: hexsim-bench r30, seeds {42,7,99}, warmup 365 d,
-        // measure 3 years, fine vs coarse):
-        //
-        // | metric                      | 42          | 7           | 99         |
-        // |-----------------------------|-------------|-------------|------------|
-        // | water_drift (x1e-5)         | 1.93->1.92  | 4.46->4.54  | 1.10->1.02 |
-        // | byAlt (d/yr, 4 bands)       | ≤3 d        | ≤2 d        | ≤1 d       |
-        // | plainsP (mm/d)              | -0.1 %      | -1.3 %      | +0.5 %     |
-        // | dry_streak (d)              | -0.4 %      | +9.4 %*     | -3.5 %     |
-        // | summer/winter ratio         | -0.6 %      | -0.5 %      | +0.2 %     |
-        // | gust_days_frac_mean         | +0.0 %      | +0.4 %      | -1.5 %     |
-        // | ms/tick (6-proc contention) | -74 %       | -74 %       | -72 %      |
-        //
-        // (*) metric nearly saturated (971-1095 d over 1095 window).
-        // plains_max_daily_rain_median (~0.0003-0.003 mm/d, 300x below gust
-        // threshold) oscillates -100 % to +124 % with no constant sign by seed,
-        // so floor noise, same verdict as plainsP on 07-07. Perf outside
-        // contention: synoptic 83.2 % -> 2.0 % of tick r30 (7.131 -> 0.029
-        // ms/hour-tick), r45 end-to-end 427 -> 75.3 ms/tick.
-        //
-        // Effective value: `SYNOPTIC_COARSE_DEFAULT` unless overridden by
-        // `HEXSIM_SYNOPTIC_COARSE`, resolved through [`Ablation::effective`]
-        // (reads the environment once for the whole process).
-        let synoptic_coarse = Ablation::effective().synoptic_coarse;
-        let mut synoptic_mesh = if synoptic_coarse {
-            SynopticMesh::build(&grid)
-        } else {
-            SynopticMesh::identity(&grid)
-        };
-        let synoptic_params = SynopticParams {
-            seed: wind_params.seed,
-            latitude_deg: temperature_params.latitude_deg,
-            ..SynopticParams::for_spacing(synoptic_mesh.spacing_m())
-        };
-        let n_coarse = synoptic_mesh.grid().len();
-        let synoptic_state = SynopticState::new(n_coarse, &synoptic_params);
-        // Prod default hardcoded since #108 (ex-env flag `HEXSIM_SYNOPTIC`,
-        // exact duplicate of runtime param `synoptic.enabled`). Override via
-        // `update_param("synoptic.enabled", ...)`.
-        let synoptic_enabled = true;
-        synoptic_mesh.aggregate_temperature(&grid);
-        let mut synoptic_coarse_base: WindField = vec![WindVec::default(); n_coarse];
-        synoptic_state.write_base_wind(&synoptic_params, &mut synoptic_coarse_base);
-        let mut synoptic_base: WindField = vec![WindVec::default(); n];
-        synoptic_mesh.interpolate_wind(&synoptic_coarse_base, &mut synoptic_base);
+        // Synoptic solver's prognostic state: see `build_synoptic_dynamics`'s
+        // doc for the coarse-mesh ablation rationale and its A/B table.
+        let SynopticInit {
+            params: synoptic_params,
+            state: synoptic_state,
+            enabled: synoptic_enabled,
+            mesh: synoptic_mesh,
+            coarse_base: synoptic_coarse_base,
+            base: synoptic_base,
+        } = build_synoptic_dynamics(&grid, &wind_params, &temperature_params);
 
         let mut wind_field: WindField = vec![WindVec::default(); n];
         let mut scratch_wind_snap: WindField = vec![WindVec::default(); n];
@@ -447,6 +607,8 @@ impl Simulation {
         );
         let mut wind_mag: Vec<f32> = Vec::with_capacity(n);
         compute_wind_magnitudes_into(&wind_field, &mut wind_mag);
+        let mut transpiration_cover = Vec::with_capacity(n);
+        fill_transpiration_cover_into(&grid, &mut transpiration_cover);
         Self {
             current: grid,
             next,
@@ -475,28 +637,36 @@ impl Simulation {
             wind_field,
             uniform_wind: None,
             wind_mag,
+            transpiration_cover,
             synoptic_params,
             synoptic_state,
             synoptic_enabled,
             synoptic_base,
             synoptic_mesh,
             synoptic_coarse_base,
+            moist_mesh,
+            moist_coarse,
+            moist_coarse_mode,
+            cloud_transfer_probe: false,
             climate_history: ClimateHistory::new(),
             last_precipitation: vec![DayRecord::default(); n],
-            precip_gate_open: false,
+            vapor_today: vec![VaporSources::default(); n],
+            atmo_state: AtmoState::default(),
             upper_air_mean_t,
             scratch_wind_snap,
             scratch_atmo: AtmoScratch::new(n),
             scratch_flux: vec![0.0; n],
             scratch_flow_vec: vec![(0.0, 0.0); n],
             scratch_edge_flux: vec![[0.0; 6]; n],
+            hydro_scratch: HydroScratch::new(n),
+            groundwater_scratch: GroundwaterScratch::new(n),
             scratch_precip_tick: vec![DayRecord::default(); n],
             scratch_flux_factor: vec![0.0; n],
             scratch_illumination: vec![1.0; n],
             // Already built above to compute `terrain_insolation_factor`:
             // reused instead of rebuilding it on the first tick.
             illum_cache,
-            climate_normals: ClimateNormalsAccumulator::new(n),
+            climate_normals: ClimateNormalsAccumulator::primed(initial_normals),
             timings: PhaseTimings::default(),
         }
     }
@@ -524,14 +694,41 @@ impl Simulation {
     ///   closed 24h precipitation sum. The gw -> hydro order preserves mass
     ///   conservation (strict 10-year test).
     pub fn step_hour(&mut self) {
-        // Start of a new day: reset the precip accumulator. Hydro flux maps
-        // (`discharge_map` & co) are NOT reset here; they reset at the start of
-        // the hydro slice itself (`step_hydro_tranche`), otherwise they'd be
-        // empty 23 h out of 24 for any reader not at midnight sharp (#103).
+        let cells = self.current.len();
+        par::install(cells, || self.step_hour_in_pool());
+    }
+
+    /// What happens at midnight, before the hour itself runs: the daily
+    /// precipitation accumulator is emptied and the imposed weather
+    /// regime draws its day.
+    ///
+    /// Hydro flux maps (`discharge_map` & co) are deliberately NOT reset
+    /// here; they reset at the start of the hydro slice itself
+    /// (`step_hydro_tranche`), otherwise they'd be empty 23 h out of 24
+    /// for any reader not at midnight sharp (#103).
+    fn start_of_day(&mut self) {
+        for record in &mut self.last_precipitation {
+            *record = DayRecord::default();
+        }
+        self.vapor_today.fill(VaporSources::default());
+        // Imposed weather regime (#63): one transition of the two-state
+        // synoptic chain per simulated day. The draw is a hash of (world
+        // seed, absolute day), never a stateful generator, so a
+        // checkpoint restart replays the same weather; the seed is
+        // `wind_params.seed`, the one `Simulation::new` already treats as
+        // the world's (it seeds the synoptic dynamics too), not
+        // `self.seed`, which only the server sets. No-op while the regime
+        // is disabled.
+        self.atmo_state.regime.advance_day(
+            self.wind_params.seed,
+            time::ticks_to_days(self.hour_tick),
+            &self.atmosphere_params,
+        );
+    }
+
+    fn step_hour_in_pool(&mut self) {
         if time::hour_of_day(self.hour_tick) == 0 {
-            for record in &mut self.last_precipitation {
-                *record = DayRecord::default();
-            }
+            self.start_of_day();
         }
 
         // Year rollover: freeze the climate normals of the elapsed year (#79).
@@ -562,6 +759,13 @@ impl Simulation {
         self.timings.illumination += elapsed_s(t0);
 
         // Tier 1: the whole atmo-radiative pipeline, every hour.
+        // Map means of the pre-temperature state, the mixed boundary-layer
+        // air the balance exchanges sensible heat with: one full-grid
+        // reduction, memoized into the forcing and timed apart from the
+        // balance sweep so the two costs read separately.
+        let t0 = mark();
+        let (mean_surface_t, mean_elevation) = surface_means(&self.current);
+        self.timings.temp_means += elapsed_s(t0);
         let t0 = mark();
         step_temperature(
             &self.current,
@@ -571,6 +775,8 @@ impl Simulation {
                 hour_tick: self.hour_tick,
                 flux_factor: &self.scratch_flux_factor,
                 snow: &self.snow_params,
+                mean_surface_t,
+                mean_elevation,
             },
         );
         std::mem::swap(&mut self.current, &mut self.next);
@@ -598,32 +804,14 @@ impl Simulation {
         std::mem::swap(&mut self.current, &mut self.next);
         self.timings.snow += elapsed_s(t0);
 
-        let t0 = mark();
-        // Upper-air anchor: one EMA step on the instantaneous map-mean
-        // surface temperature of the state the atmosphere is about to
-        // read (post temperature + snow), τ = 24 h
-        // (`UPPER_AIR_SMOOTHING_TAU_S`). Persistent state, mutated here
-        // and nowhere else; the atmosphere only reads it.
-        let (mean_surface_t, _) = surface_means(&self.current);
-        self.upper_air_mean_t = smooth_upper_air_mean_t(self.upper_air_mean_t, mean_surface_t);
-        step_atmosphere_into(
-            &self.current,
-            &mut self.next,
-            &self.atmosphere_params,
-            &AtmoForcing {
-                temp_params: &self.temperature_params,
-                wind_params: &self.wind_params,
-                wind_field: &self.wind_field,
-                wind_mag: &self.wind_mag,
-                hour_tick: self.hour_tick,
-                upper_air_mean_t: self.upper_air_mean_t,
-            },
-            &mut self.precip_gate_open,
-            &mut self.scratch_atmo,
-            &mut self.scratch_precip_tick,
-        );
+        self.step_atmosphere_hour();
+        // Coarse upper layer: the moist layer's own hour, the second half
+        // of the atmosphere on a coarse mode — see `step_moist_layer`.
+        self.step_moist_layer();
         std::mem::swap(&mut self.current, &mut self.next);
-        self.timings.atmosphere += elapsed_s(t0);
+        // Sub-phase breakdown of the bucket just closed above.
+        self.timings
+            .accumulate_atmo(&self.scratch_atmo.step_timings);
 
         // Accumulate tick precip in the daily accumulator.
         for (total, tick) in self
@@ -633,6 +821,15 @@ impl Simulation {
         {
             total.rain += tick.rain;
             total.snow += tick.snow;
+        }
+        self.vapor_today
+            .resize(self.current.len(), VaporSources::default());
+        for (total, tick) in self
+            .vapor_today
+            .iter_mut()
+            .zip(self.scratch_atmo.evap_cells.iter())
+        {
+            total.add(tick.vapor);
         }
 
         // Climate normals (#79): accumulate hourly state (T + water) and
@@ -709,6 +906,106 @@ impl Simulation {
         }
     }
 
+    /// The atmosphere's hour: the upper-air anchor's EMA step, then
+    /// `step_atmosphere_into` on `next`. Split out of
+    /// [`Self::step_hour_in_pool`] for clippy's line budget only, no
+    /// behaviour change — the moist layer's own hour follows immediately
+    /// at the call site ([`Self::step_moist_layer`]), the two being one
+    /// pipeline tied by `AtmoForcing::moist_coarse`.
+    fn step_atmosphere_hour(&mut self) {
+        // Upper-air anchor: one EMA step on the instantaneous map-mean
+        // surface temperature of the state the atmosphere is about to
+        // read (post temperature + snow), τ = 24 h
+        // (`UPPER_AIR_SMOOTHING_TAU_S`). Persistent state, mutated here
+        // and nowhere else; the atmosphere only reads it. The same
+        // reduction yields the map-mean elevation `fill_upper_air` needs,
+        // carried by the forcing instead of reduced again there.
+        let t0 = mark();
+        let (mean_surface_t, mean_elevation) = surface_means(&self.current);
+        self.upper_air_mean_t = smooth_upper_air_mean_t(self.upper_air_mean_t, mean_surface_t);
+        self.timings.atmo_means += elapsed_s(t0);
+        let t0 = mark();
+        step_atmosphere_into(
+            &self.current,
+            &mut self.next,
+            &self.atmosphere_params,
+            &AtmoForcing {
+                temp_params: &self.temperature_params,
+                wind_params: &self.wind_params,
+                wind_field: &self.wind_field,
+                wind_mag: &self.wind_mag,
+                transpiration_cover: Some(&self.transpiration_cover),
+                synoptic_wind: self.synoptic_enabled.then_some(&self.synoptic_base),
+                hour_tick: self.hour_tick,
+                upper_air_mean_t: self.upper_air_mean_t,
+                mean_elevation,
+                moist_coarse: self.moist_coarse_mode.precipitates_coarse(),
+                track_cloud_transfer: self.cloud_transfer_probe,
+            },
+            &mut self.atmo_state,
+            &mut self.scratch_atmo,
+            &mut self.scratch_precip_tick,
+        );
+        self.timings.atmosphere += elapsed_s(t0);
+    }
+
+    /// The moist upper layer's own hour, on `next` — the state
+    /// `step_atmosphere_into` just wrote, BEFORE the current/next swap the
+    /// caller runs right after this.
+    ///
+    /// It runs here rather than inside `step_atmosphere_into` because the
+    /// coarse mesh and state are the simulation's, not the atmosphere's,
+    /// and `step_atmosphere_into` is at the 7-argument ceiling (convention
+    /// #61); the two calls are one pipeline, tied together by
+    /// `AtmoForcing::moist_coarse`.
+    ///
+    /// One branch per [`MoistCoarseMode`] (`atmosphere::coarse`):
+    ///
+    /// - `Fine`: step 1's read-only mirror. The coarse state is
+    ///   re-gathered from the fine grid so [`Self::water_budget_total`]
+    ///   reads the same accessor whatever the mode, and nothing is
+    ///   written back — the tick stays bit-identical to `main`.
+    /// - `CoarsePrecip`: the ~1 km torus decides the drain and drops the
+    ///   sheet (`step_moist_precip`), then the mirror is re-gathered like
+    ///   on `Fine` — the fine fields are still the state, and the gather
+    ///   has to happen **after** the drain so the budget sees the cloud
+    ///   water that just left.
+    ///
+    /// A third branch, `CoarseStock` — the second half of the atmosphere
+    /// living on the torus, a fine → coarse transfer, KK2000 and a
+    /// broadcast view refresh, no mirror gather — was retired 2026-09-07
+    /// (see `atmosphere::coarse`'s module doc).
+    fn step_moist_layer(&mut self) {
+        let t0 = mark();
+        let forcing = MoistCoarseForcing {
+            mesh: &self.moist_mesh,
+            params: &self.atmosphere_params,
+            hour_tick: self.hour_tick,
+        };
+        match self.moist_coarse_mode {
+            MoistCoarseMode::Fine => {
+                self.moist_coarse
+                    .gather_from_fine(&self.moist_mesh, &self.next);
+                self.timings.atmo_moist_gather += elapsed_s(t0);
+            }
+            MoistCoarseMode::CoarsePrecip => {
+                step_moist_precip(
+                    &mut self.next,
+                    &forcing,
+                    &mut self.atmo_state,
+                    &mut self.scratch_atmo,
+                    &mut self.scratch_precip_tick,
+                );
+                self.timings
+                    .accumulate_moist(&self.scratch_atmo.moist.timings);
+                let t1 = mark();
+                self.moist_coarse
+                    .gather_from_fine(&self.moist_mesh, &self.next);
+                self.timings.atmo_moist_gather += elapsed_s(t1);
+            }
+        }
+    }
+
     /// 8 MFD passes once a day, an integration budget to converge the
     /// surface water transfer (CFL ~1/7 per pass with `flow_rate=0.12`).
     /// **Not a time proxy**, cf. the doc on `HYDRO_MFD_PASSES_PER_DAY`. The
@@ -720,29 +1017,60 @@ impl Simulation {
     /// permanently).
     fn step_hydro_tranche(&mut self) {
         let n = self.current.len();
+        let t0 = mark();
         self.discharge_map.resize(n, 0.0);
         self.discharge_map.fill(0.0);
         self.flow_vec_map.resize(n, (0.0, 0.0));
         self.flow_vec_map.fill((0.0, 0.0));
         self.edge_flux_map.resize(n, [0.0; 6]);
         self.edge_flux_map.fill([0.0; 6]);
+        self.timings.hydro_accumulate += elapsed_s(t0);
         for _ in 0..HYDRO_MFD_PASSES_PER_DAY {
             step_hydro_mfd_into(
                 &self.current,
                 &mut self.next,
                 &self.hydro_params,
+                &mut self.hydro_scratch,
                 &mut self.scratch_flux,
                 &mut self.scratch_flow_vec,
                 &mut self.scratch_edge_flux,
             );
-            for i in 0..n {
-                self.discharge_map[i] += self.scratch_flux[i];
-                self.flow_vec_map[i].0 += self.scratch_flow_vec[i].0;
-                self.flow_vec_map[i].1 += self.scratch_flow_vec[i].1;
-                for d in 0..6 {
-                    self.edge_flux_map[i][d] += self.scratch_edge_flux[i][d];
+            // Sub-phase breakdown of the substep just run (`hydro_*`
+            // buckets, a breakdown of the `hydro` row the caller closes).
+            self.timings
+                .accumulate_hydro(&self.hydro_scratch.step_timings);
+            let t0 = mark();
+            // Accumulation into the day's maps (r250 perf effort, chunk
+            // C1): a pure per-cell map over the substep's fresh output
+            // (`scratch_*`) and the running total (`discharge_map` & co),
+            // parallelizable. Local bindings of the read side
+            // (`scratch_flux`/`scratch_flow_vec`/`scratch_edge_flux`) so
+            // the borrow checker sees them as disjoint from the `&mut`
+            // write side, both projections of the same `self`.
+            let scratch_flux = &self.scratch_flux;
+            let scratch_flow_vec = &self.scratch_flow_vec;
+            par::for_each_chunk_mut2(
+                &mut self.discharge_map,
+                &mut self.flow_vec_map,
+                |start, d_chunk, v_chunk| {
+                    for (local, (d, v)) in d_chunk.iter_mut().zip(v_chunk.iter_mut()).enumerate() {
+                        let i = start + local;
+                        *d += scratch_flux[i];
+                        v.0 += scratch_flow_vec[i].0;
+                        v.1 += scratch_flow_vec[i].1;
+                    }
+                },
+            );
+            let scratch_edge_flux = &self.scratch_edge_flux;
+            par::for_each_chunk_mut(&mut self.edge_flux_map, |start, chunk| {
+                for (local, edges) in chunk.iter_mut().enumerate() {
+                    let i = start + local;
+                    for (d, edge) in edges.iter_mut().enumerate() {
+                        *edge += scratch_edge_flux[i][d];
+                    }
                 }
-            }
+            });
+            self.timings.hydro_accumulate += elapsed_s(t0);
             std::mem::swap(&mut self.current, &mut self.next);
         }
     }
@@ -761,7 +1089,12 @@ impl Simulation {
         self.timings.history += elapsed_s(t0);
 
         let t0 = mark();
-        step_groundwater(&self.current, &mut self.next, &self.groundwater_params);
+        step_groundwater_into(
+            &self.current,
+            &mut self.next,
+            &self.groundwater_params,
+            &mut self.groundwater_scratch,
+        );
         std::mem::swap(&mut self.current, &mut self.next);
         self.timings.groundwater += elapsed_s(t0);
 
@@ -869,6 +1202,12 @@ impl Simulation {
         self.fire_peak_burning = self.fire_peak_burning.max(ft.burning);
         std::mem::swap(&mut self.current, &mut self.next);
         self.timings.fire += elapsed_s(t0);
+
+        // The biomass is settled for the day: memoize what the hourly
+        // transpiration reads from it (timed with the vegetation).
+        let t0 = mark();
+        fill_transpiration_cover_into(&self.current, &mut self.transpiration_cover);
+        self.timings.vegetation += elapsed_s(t0);
     }
 }
 
@@ -876,6 +1215,57 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::terrain::{TerrainParams, generate_terrain};
+
+    #[test]
+    fn transpiration_memo_follows_the_daily_vegetation_step() {
+        // Seeded biomass decays by background mortality at every daily
+        // tail; after a few days the memo the hourly evaporation reads
+        // must equal, bit for bit, the cover recomputed from `current`,
+        // on every cell (radius 2, transport irrelevant: the memo is
+        // cell-local).
+        let mut grid = HexGrid::from_radius(2);
+        for (k, cell) in grid.cells_slice_mut().iter_mut().enumerate() {
+            let oak = crate::species::species_index(crate::species::SpeciesId::OakPubescent);
+            let meadow = crate::species::species_index(crate::species::SpeciesId::Meadow);
+            cell.vegetation[oak] = [0.0, 0.1, 0.2, 0.3, 0.4][k % 5];
+            cell.vegetation[meadow] = 0.5;
+            cell.water_capacity = 10.0;
+        }
+        let mut sim = Simulation::new(
+            grid,
+            HydroParams::default(),
+            AtmosphereParams::default(),
+            GroundwaterParams::default(),
+            SnowParams::default(),
+            TemperatureParams::default(),
+            WindParams::default(),
+        );
+        let before = sim.transpiration_cover.clone();
+        for _ in 0..(3 * time::TICKS_PER_DAY + 5) {
+            sim.step();
+        }
+        let fresh: Vec<f32> = sim
+            .current
+            .cells_slice()
+            .iter()
+            .map(crate::vegetation::transpiration_cover)
+            .collect();
+        assert_eq!(fresh.len(), sim.transpiration_cover.len());
+        assert!(
+            fresh
+                .iter()
+                .zip(before.iter())
+                .any(|(f, b)| f.to_bits() != b.to_bits()),
+            "the biomass should have moved over three daily tails"
+        );
+        for (i, (memo, want)) in sim.transpiration_cover.iter().zip(fresh.iter()).enumerate() {
+            assert_eq!(
+                memo.to_bits(),
+                want.to_bits(),
+                "cell {i}: memo {memo} vs {want}"
+            );
+        }
+    }
 
     fn default_sim(radius: i32) -> Simulation {
         let grid = HexGrid::from_radius(radius);
@@ -950,20 +1340,35 @@ mod tests {
                 cell.groundwater
             );
             assert!(
+                cell.aquifer.is_finite(),
+                "aquifer NaN at {coord:?}: {}",
+                cell.aquifer
+            );
+            assert!(
                 cell.snow_level.is_finite(),
                 "snow_level NaN at {coord:?}: {}",
                 cell.snow_level
+            );
+            assert!(
+                cell.ice_level.is_finite(),
+                "ice_level NaN at {coord:?}: {}",
+                cell.ice_level
             );
             assert!(
                 cell.temperature.is_finite(),
                 "temperature NaN at {coord:?}: {}",
                 cell.temperature
             );
-            let veg_total: f32 = cell.vegetation.iter().sum();
+            // Each stratum has its own space budget (#161): the bound is
+            // per stratum, the plain sum reaches 3 × k_total.
+            let max_stratum = crate::species::STRATA
+                .iter()
+                .map(|&s| crate::vegetation::stratum_cover(cell, s))
+                .fold(0.0_f32, f32::max);
             assert!(
                 cell.vegetation.iter().all(|v| v.is_finite() && *v >= 0.0)
-                    && veg_total <= 1.0 + 1e-3,
-                "vegetation hors borne at {coord:?}: {:?} (total {veg_total})",
+                    && max_stratum <= 1.0 + 1e-3,
+                "vegetation hors borne at {coord:?}: {:?} (densest stratum {max_stratum})",
                 cell.vegetation
             );
         }
@@ -1009,15 +1414,31 @@ mod tests {
 
     #[test]
     fn climate_normals_ready_after_one_year() {
-        // #79: before 1 year, no normals; after, they're consistent.
+        // #79: the normals are consistent after a full year. Since #152
+        // they are no longer zero before it: a fresh world starts on the
+        // analytic climatology of its relief (`climatology::terrain_climate`),
+        // and the first rollover replaces it with the measured year.
         let mut sim = sim_with_terrain(3, 42);
-        assert!(!sim.climate_normals_ready());
+        assert!(sim.climate_normals_ready(), "primed at t0 (#152)");
+        let primed: Vec<_> = sim.climate_normals().to_vec();
+        assert!(
+            primed
+                .iter()
+                .all(|n| n.t_max > n.t_min && n.insolation_mean > 0.0)
+        );
         // 366 days: the year rollover (finalize) triggers at the start of
         // the 366th step (hour_tick == TICKS_PER_YEAR).
         for _ in 0..366 {
             sim.step();
         }
         assert!(sim.climate_normals_ready());
+        assert!(
+            sim.climate_normals()
+                .iter()
+                .zip(primed.iter())
+                .any(|(a, b)| a.t_mean.to_bits() != b.t_mean.to_bits()),
+            "the measured year replaces the analytic normals"
+        );
 
         let normals = sim.climate_normals();
         assert_eq!(normals.len(), sim.grid().len());
@@ -1033,5 +1454,88 @@ mod tests {
             );
             assert!(n.insolation_mean >= 0.0, "insolation negative : {n:?}");
         }
+    }
+
+    /// Coarse upper layer, step 1: the mirror is refreshed on the state
+    /// each hour just wrote (`gather_from_fine` on `next`, before the
+    /// swap), so after N hours it must equal a direct
+    /// `aggregate_mean(humidity_upper)`/`aggregate_mean(cloud_water)` of
+    /// `current` — bit for bit, not the checkpoint round trip (that one
+    /// only proves persistence, not that the hourly refresh point is the
+    /// right one).
+    #[test]
+    fn moist_coarse_mirror_matches_a_direct_gather_after_two_days() {
+        let mut sim = sim_with_terrain(30, 42);
+        for _ in 0..(2 * 24) {
+            sim.step_hour();
+        }
+
+        let humidity: Vec<f32> = sim
+            .current
+            .cells_slice()
+            .iter()
+            .map(|c| c.humidity_upper)
+            .collect();
+        let cloud: Vec<f32> = sim
+            .current
+            .cells_slice()
+            .iter()
+            .map(|c| c.cloud_water)
+            .collect();
+        let mut expected_humidity = vec![0.0_f32; sim.moist_mesh.coarse_len()];
+        let mut expected_cloud = vec![0.0_f32; sim.moist_mesh.coarse_len()];
+        sim.moist_mesh
+            .aggregate_mean(&humidity, &mut expected_humidity);
+        sim.moist_mesh.aggregate_mean(&cloud, &mut expected_cloud);
+
+        assert_eq!(sim.moist_coarse.humidity_upper, expected_humidity);
+        assert_eq!(sim.moist_coarse.cloud_water, expected_cloud);
+    }
+
+    /// Reset/radius-change path (#6 of the brief, fcd928b): `Simulation::new`
+    /// is the only place the moist mesh is built (confirmed by grep on
+    /// `Simulation::new` call sites: `World::from_grid` and `World::reset`),
+    /// so a rebuild at a different radius must NOT carry over any stale
+    /// coarse state from the previous world. No dedicated synoptic-mesh
+    /// radius-change test existed to twin, so this is the micro-test of
+    /// construction the brief asks for instead.
+    ///
+    /// Both modes are pinned through `set_moist_coarse_mode` rather than
+    /// inherited from the compiled default (coarse since 2026-09-30, see
+    /// `atmosphere::coarse::MOIST_COARSE_DEFAULT`): the seam is the only
+    /// way a test can state its mode, the environment switch being a
+    /// process-wide `OnceLock`, and a test that read the default would
+    /// measure whichever `HEXSIM_MOIST_COARSE` happened to be set.
+    #[test]
+    fn moist_mesh_rebuilds_at_the_new_radius_on_a_fresh_simulation() {
+        let mut sim_r30 = default_sim(30);
+        sim_r30.set_moist_coarse_mode(MoistCoarseMode::CoarsePrecip);
+        assert_eq!(sim_r30.moist_mesh.grid().radius(), moist_coarse_radius(30));
+        assert_eq!(
+            sim_r30.moist_coarse.humidity_upper.len(),
+            sim_r30.moist_mesh.coarse_len()
+        );
+
+        let mut sim_r10 = default_sim(10);
+        sim_r10.set_moist_coarse_mode(MoistCoarseMode::CoarsePrecip);
+        assert_eq!(sim_r10.moist_mesh.grid().radius(), moist_coarse_radius(10));
+        assert_eq!(
+            sim_r10.moist_coarse.humidity_upper.len(),
+            sim_r10.moist_mesh.coarse_len()
+        );
+
+        assert_ne!(
+            sim_r30.moist_mesh.coarse_len(),
+            sim_r10.moist_mesh.coarse_len(),
+            "r30 and r10 must give different coarse mesh sizes, otherwise this test proves nothing"
+        );
+
+        // On the fine path (`HEXSIM_MOIST_COARSE=0`) the mesh is the
+        // identity instead, and the mirror is one value per fine cell.
+        let mut fine = default_sim(10);
+        fine.set_moist_coarse_mode(MoistCoarseMode::Fine);
+        assert!(!fine.moist_coarse_path());
+        assert_eq!(fine.moist_mesh.grid().radius(), 10);
+        assert_eq!(fine.moist_coarse.humidity_upper.len(), fine.grid().len());
     }
 }

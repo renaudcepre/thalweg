@@ -137,13 +137,24 @@ pub struct AltitudeStats {
     pub effective_lapse_rate_c_per_km: f32,
 }
 
-/// Total water cycle budget (conservation = surface + humidity + groundwater).
+/// Total water cycle budget (conservation = surface + humidity + groundwater
+/// + aquifer + snow + ice + sky).
 #[derive(Debug, Serialize)]
 pub struct WaterBudget {
     pub surface: f32,
     pub humidity: f32,
     pub groundwater: f32,
+    /// Deep aquifer below the root zone (#107), mm, map total.
+    pub aquifer: f32,
     pub snow: f32,
+    /// Lake / river ice (mm w.e.), the frozen surplus of water bodies.
+    pub ice: f32,
+    /// Water held outside the box by the imposed weather regime (#63),
+    /// mm, map total. Filled by `Simulation::diagnostics` (the reservoir
+    /// lives in the simulation, not in the grid); 0 through
+    /// `compute_diagnostics` alone, and 0 whenever the regime is off.
+    /// It IS part of `total`: the terrarium is the map plus the sky.
+    pub sky: f32,
     pub total: f32,
 }
 
@@ -186,6 +197,36 @@ pub struct HydrologyStats {
     pub raining_cells: usize,
 }
 
+/// Per-stock totals of the box, `sky` left at 0 for
+/// `Simulation::diagnostics` to fill. Each stock accumulates over the
+/// cells in grid order, as the single loop it was split from did.
+fn water_budget(grid: &HexGrid) -> WaterBudget {
+    let mut surface = 0.0_f32;
+    let mut humidity = 0.0_f32;
+    let mut groundwater = 0.0_f32;
+    let mut aquifer = 0.0_f32;
+    let mut snow = 0.0_f32;
+    let mut ice = 0.0_f32;
+    for cell in grid.cells_slice() {
+        surface += cell.water_level;
+        humidity += cell.humidity_total();
+        groundwater += cell.groundwater;
+        aquifer += cell.aquifer;
+        snow += cell.snow_level;
+        ice += cell.ice_level;
+    }
+    WaterBudget {
+        surface,
+        humidity,
+        groundwater,
+        aquifer,
+        snow,
+        ice,
+        sky: 0.0,
+        total: surface + humidity + groundwater + aquifer + snow + ice,
+    }
+}
+
 /// Computes the diagnostics from the simulation's current state.
 #[must_use]
 pub(crate) fn compute_diagnostics(
@@ -205,10 +246,6 @@ pub(crate) fn compute_diagnostics(
     let mut temp_entries: Vec<(HexCoord, f32)> = Vec::with_capacity(cell_count);
     let mut elev_entries: Vec<(HexCoord, f32)> = Vec::with_capacity(cell_count);
 
-    let mut total_surface = 0.0_f32;
-    let mut total_humidity = 0.0_f32;
-    let mut total_groundwater = 0.0_f32;
-    let mut total_snow = 0.0_f32;
     let mut raining_cells = 0_usize;
     let mut puddle_cells = 0_usize;
     let mut overflow_cells = 0_usize;
@@ -221,11 +258,6 @@ pub(crate) fn compute_diagnostics(
         snow_entries.push((coord, cell.snow_level));
         temp_entries.push((coord, cell.temperature));
         elev_entries.push((coord, cell.elevation));
-
-        total_surface += cell.water_level;
-        total_humidity += cell.humidity_total();
-        total_groundwater += cell.groundwater;
-        total_snow += cell.snow_level;
 
         if cell.water_level > cell.water_capacity {
             overflow_cells += 1;
@@ -269,13 +301,7 @@ pub(crate) fn compute_diagnostics(
         cell_count,
         synoptic: None,
         erosion: None,
-        water_budget: WaterBudget {
-            surface: total_surface,
-            humidity: total_humidity,
-            groundwater: total_groundwater,
-            snow: total_snow,
-            total: total_surface + total_humidity + total_groundwater + total_snow,
-        },
+        water_budget: water_budget(grid),
         surface: property_stats(&mut water_entries),
         humidity: property_stats(&mut humidity_entries),
         groundwater: property_stats(&mut gw_entries),

@@ -8,14 +8,28 @@ import? 'justfile.local'
 
 jq_compact := "walk(if type == \"object\" then del(.top, .bottom) else . end)"
 
-# Tracked reds, physics not hygiene (#111 for phys_wet_peak_snows,
-# #146 for the three other binaries). Excluded from the gates so a
+# Tracked reds, physics not hygiene (#146). Excluded from the gates so a
 # green means "nothing NEW is broken", and checked to always stay red
 # by `just reds`, which alarms if one heals. Measured on 2026-08-28:
-# these 4 binaries contain ONLY these 5 tests, so filtering by binary
+# these binaries contain ONLY these tests, so filtering by binary
 # hides no green test. Delist here once the physics fix lands.
-known_reds := "binary(phys_wet_peak_snows) | binary(physics_lake_concentration) | test(summer_temperature_targets_plain_and_mountain) | binary(scale_universal_invariants)"
-known_reds_count := "4"
+#
+# `phys_wet_peak_snows` (#111) delisted on 2026-09-06 by #63 L2b: the
+# saturation adjustment that replaced `cloud_evap_rate` took the peak's
+# max snow from 47.96 to 82.27 mm against a threshold of 80, so it is
+# green and back inside the gates. Fixture fully deterministic (no seed),
+# but the margin is 2.8 %: it is one calibration change away from red
+# again, and it is now the gates that will say so.
+#
+# `physics_lake_concentration` and `scale_universal_invariants` (#146)
+# delisted on 2026-09-06 by the `regime_enabled` default flip to on
+# (same day, #63): both climate-level sentinels needed the imposed
+# weather regime's dry spells, not a fixture change, to go green.
+# `summer_temperature_targets_plain_and_mountain` stays listed: plains
+# still run ~2 C under the summer target (26.0 vs >= 28.0 C), an
+# unrelated temperature debt.
+known_reds := "test(summer_temperature_targets_plain_and_mountain)"
+known_reds_count := "1"
 
 # ── Dev ──────────────────────────────────────────────
 
@@ -43,8 +57,8 @@ alias test-fast := test
 # before merging a physics change; target a single heavy one with:
 #   cargo nextest run --profile heavy -E 'test(dry_periods)'
 #
-# The 4 tracked reds (`known_reds`) are excluded from it: they're measured by
-# `just reds`, which checks that they ALWAYS fail all 4 (the winter half of
+# The tracked red(s) (`known_reds`) are excluded from it: they're measured
+# by `just reds`, which checks that they ALWAYS fail (the winter half of
 # `scale_seasonal_climatology` is green since 2026-09-03, the summer half
 # stays tracked by test name). See
 # scripts/known-reds.sh for why exclusion alone isn't enough.
@@ -165,9 +179,12 @@ bench_bin := "./target/release/hexsim-bench"
 
 # Isolated run of the bench runner with a params JSON (default seed 42).
 # Example: just bench /tmp/params.json
-bench params seed="42":
+# Extra flags go straight to the binary, so an ablation can pick its own
+# windows without a second recipe:
+#   just bench /tmp/params.json 42 --warmup-ticks 365 --measure-ticks 730
+bench params seed="42" *extra:
     cargo build --release --bin hexsim-bench
-    {{bench_bin}} --params {{params}} --seed {{seed}}
+    {{bench_bin}} --params {{params}} --seed {{seed}} {{extra}}
 
 # Random search over N configurations (default 50). 3 seeds, radius 30.
 # Results go to scripts/optim/results/run_<timestamp>/.
@@ -177,10 +194,15 @@ bench-search n="50":
 
 # ── Profiling ────────────────────────────────────────
 
-# Wall-clock breakdown by top-level tick phase (dedicated bench, ~30s).
-# `#[ignore]`: it's a benchmark, not a test, excluded from the default suite.
+# Per-phase breakdown of the REAL tick, read from the timings embedded in
+# `Simulation::step_hour` (`PhaseTimings`, atmosphere sub-buckets included).
+# Env: HEXSIM_PERF_RADIUS (45), HEXSIM_PERF_YEARS (2), HEXSIM_PERF_SEED (42),
+# HEXSIM_THREADS. Example: HEXSIM_PERF_RADIUS=250 HEXSIM_PERF_YEARS=0 just perf-phases
+# The former mirror `perf_phase_breakdown` re-implemented the tick and drifted
+# twice (synoptic missing 2026-07-10, illumination recomputed 2026-09-04):
+# removed, one instrument.
 perf-phases:
-    cargo test --release --test perf_phase_breakdown -- --ignored --nocapture
+    cargo test --release --test perf_full_breakdown -- --ignored --nocapture
 
 # Per-tick cost on a radius-45 grid (~6k cells), 2 years. Same status.
 perf-scale:
@@ -242,9 +264,14 @@ param key value:
 climate:
     {{ctl}} climate | jq
 
-# Resets the simulation (optional seed)
-reset seed="":
-    {{ctl}} reset {{seed}} | jq '{{jq_compact}}'
+# Resets the simulation (optional seed, optional radius: just reset 42 30)
+reset seed="" radius="":
+    #!/usr/bin/env bash
+    set -e
+    cmd=({{ctl}} reset)
+    [ -n "{{seed}}" ] && cmd+=({{seed}})
+    [ -n "{{radius}}" ] && cmd+=(--radius {{radius}})
+    "${cmd[@]}" | jq '{{jq_compact}}'
 
 # ── Screenshots (Playwright) ────────────────────
 # The server must be running (just run / just rebuild). Drive the sim with
@@ -344,3 +371,13 @@ shot-top *ARGS:
 # Vegetation cover composition of the current state (species, mix per hex).
 cover:
     cd .. && node scripts/shot/cover.mjs
+
+# ── Diag on a live server ────────────────────────────
+
+# Rain pattern probe: what the precipitation overlay paints per hour, how
+# sticky the rained-on cells are, islets, daily totals (#63). It RESETS the
+# target world: never point it at :8355 while someone watches it. Start a
+# second instance first, from simulation/: HEXSIM_PORT=8356 ./target/release/hexsim-cli
+# Env passthrough: SEED, WARMUP_DAYS, HOURS, PAINT (see the script header).
+rain-pattern port="8356":
+    cd .. && WS_URL=ws://localhost:{{port}}/ws node scripts/diag/rain_pattern.mjs

@@ -5,8 +5,8 @@
 //! Setup:
 //! - radius 3, flat terrain 200 m, T = 25 °C.
 //! - `groundwater` = 80 mm everywhere (high water table, no water stress).
-//! - `vegetation` = 0.6 everywhere (established cover, transpiration scales
-//!   with biomass, bare soil does not transpire).
+//! - `vegetation` = 0.6 of downy oak everywhere (established canopy,
+//!   transpiration scales with biomass, bare soil does not transpire).
 //! - `water_level` = 0 everywhere (no open-water Meyer evaporation).
 //!
 //! After 200 ticks (~8 simulated days):
@@ -20,6 +20,7 @@ use hexsim_core::groundwater::GroundwaterParams;
 use hexsim_core::hydro::HydroParams;
 use hexsim_core::simulation::Simulation;
 use hexsim_core::snow::SnowParams;
+use hexsim_core::species::{SPECIES_COUNT, SpeciesId, species_index};
 use hexsim_core::temperature::TemperatureParams;
 use hexsim_core::wind::WindParams;
 
@@ -33,9 +34,11 @@ fn humid_vegetated_soil_feeds_atmosphere() {
             cell.temperature = 25.0;
             cell.water_level = 0.0;
             cell.groundwater = 80.0;
-            // Established cover (0.6 total biomass, one species): transpiration
-            // scales with total cover.
-            cell.vegetation = [0.6, 0.0, 0.0, 0.0, 0.0];
+            // Established cover (0.6 of downy oak, a canopy species in full
+            // light): transpiration scales with cover. Seeded by id, the
+            // column order is the species table's business.
+            cell.vegetation = [0.0; SPECIES_COUNT];
+            cell.vegetation[species_index(SpeciesId::OakPubescent)] = 0.6;
             cell.humidity_surface = 0.0;
             cell.humidity_upper = 0.0;
             cell.cloud_water = 0.0;

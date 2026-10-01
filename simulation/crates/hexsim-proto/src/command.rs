@@ -11,6 +11,8 @@
 //! shell, which decides how to log them: `tracing` on the server side,
 //! console in the browser.
 
+use std::ops::RangeInclusive;
+
 use hexsim_core::coord::HexCoord;
 use serde_json::Value;
 use thiserror::Error;
@@ -26,6 +28,12 @@ pub const MIN_TICK_MS: u64 = 1;
 pub const MAX_TICK_MS: u64 = 2000;
 /// Maximum radius of a `region` query, in cells.
 pub const MAX_REGION_RADIUS: i32 = 50;
+/// Accepted range for an explicit `radius` on `reset`. Below 5, the coarse
+/// synoptic torus degenerates (the micro-test rule "no transport at radius
+/// 0" generalizes: too few cells and a hex is effectively its own
+/// neighbor); above 300, we're past the r250 target that the perf work
+/// (#63, JOURNAL 2026-09-06) already treats as its ceiling.
+pub const RESET_RADIUS_RANGE: RangeInclusive<i32> = 5..=300;
 
 /// A validated client command. Bounds have already been applied: a
 /// constructed [`Command`] is executable as-is.
@@ -43,9 +51,16 @@ pub enum Command {
     Speed { tick_ms: u64, requested: u64 },
     /// Advances by `n` units: hours if `hourly`, days otherwise.
     Step { n: u64, hourly: bool },
-    /// Regenerates the world. `seed: None` = reuse the current seed.
-    Reset { seed: Option<u32> },
-    /// Hot-reloads a parameter (`"atmosphere.cloud_evap_rate"`).
+    /// Regenerates the world. `seed: None` = reuse the current seed,
+    /// `radius: None` = keep the current radius (today's behaviour,
+    /// byte-for-byte). An explicit `radius` is already bounded to
+    /// [`RESET_RADIUS_RANGE`]: whether it can actually be honored (a DEM
+    /// world locks its radius) is a `World::apply` concern, not parsing's.
+    Reset {
+        seed: Option<u32>,
+        radius: Option<i32>,
+    },
+    /// Hot-reloads a parameter (`"atmosphere.condensation_rate"`).
     SetParam { key: String, value: f32 },
     /// Read-only, never mutates the world.
     Query(Query),
@@ -133,17 +148,34 @@ impl Command {
             // Seed out of u32 bounds: rejected rather than silently
             // truncated (a truncated seed gives a different world than the
             // one requested).
-            "reset" => match value.get("seed") {
-                None | Some(Value::Null) => Ok(Self::Reset { seed: None }),
-                Some(v) => v
-                    .as_u64()
-                    .and_then(|s| u32::try_from(s).ok())
-                    .map(|seed| Self::Reset { seed: Some(seed) })
-                    .ok_or(ParseError::BadField {
-                        cmd: "reset",
-                        field: "seed",
-                    }),
-            },
+            "reset" => {
+                let seed = match value.get("seed") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_u64().and_then(|s| u32::try_from(s).ok()).ok_or(
+                        ParseError::BadField {
+                            cmd: "reset",
+                            field: "seed",
+                        },
+                    )?),
+                };
+                // Same rationale as the seed: an out-of-range radius is
+                // rejected outright rather than clamped, silently shrinking
+                // a request for r400 down to r300 gives a world the client
+                // didn't ask for.
+                let radius = match value.get("radius") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_i64()
+                            .and_then(|r| i32::try_from(r).ok())
+                            .filter(|r| RESET_RADIUS_RANGE.contains(r))
+                            .ok_or(ParseError::BadField {
+                                cmd: "reset",
+                                field: "radius",
+                            })?,
+                    ),
+                };
+                Ok(Self::Reset { seed, radius })
+            }
             "set_param" => {
                 let key = value
                     .get("key")
@@ -280,11 +312,17 @@ mod tests {
     fn reset_seed_is_optional_and_bounded() {
         assert_eq!(
             Command::parse(r#"{"cmd":"reset"}"#),
-            Ok(Command::Reset { seed: None })
+            Ok(Command::Reset {
+                seed: None,
+                radius: None
+            })
         );
         assert_eq!(
             Command::parse(r#"{"cmd":"reset","seed":42}"#),
-            Ok(Command::Reset { seed: Some(42) })
+            Ok(Command::Reset {
+                seed: Some(42),
+                radius: None
+            })
         );
         assert_eq!(
             Command::parse(r#"{"cmd":"reset","seed":4294967296}"#),
@@ -295,14 +333,76 @@ mod tests {
         );
     }
 
+    /// `radius` is optional (absent = keep the current radius, today's
+    /// behaviour byte-for-byte) and bounded to [`RESET_RADIUS_RANGE`]: an
+    /// out-of-range value is rejected, not clamped, same rationale as the
+    /// seed above.
+    #[test]
+    fn reset_radius_is_optional_and_bounded() {
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":30}"#),
+            Ok(Command::Reset {
+                seed: None,
+                radius: Some(30)
+            })
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","seed":7,"radius":120}"#),
+            Ok(Command::Reset {
+                seed: Some(7),
+                radius: Some(120)
+            })
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":5}"#),
+            Ok(Command::Reset {
+                seed: None,
+                radius: Some(5)
+            }),
+            "the lower bound itself is accepted"
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":300}"#),
+            Ok(Command::Reset {
+                seed: None,
+                radius: Some(300)
+            }),
+            "the upper bound itself is accepted"
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":4}"#),
+            Err(ParseError::BadField {
+                cmd: "reset",
+                field: "radius"
+            }),
+            "below RESET_RADIUS_RANGE"
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":301}"#),
+            Err(ParseError::BadField {
+                cmd: "reset",
+                field: "radius"
+            }),
+            "above RESET_RADIUS_RANGE"
+        );
+        assert_eq!(
+            Command::parse(r#"{"cmd":"reset","radius":-5}"#),
+            Err(ParseError::BadField {
+                cmd: "reset",
+                field: "radius"
+            }),
+            "negative radius"
+        );
+    }
+
     #[test]
     fn set_param_requires_key_and_value() {
         assert_eq!(
             Command::parse(
-                r#"{"cmd":"set_param","key":"atmosphere.cloud_evap_rate","value":0.02}"#
+                r#"{"cmd":"set_param","key":"atmosphere.condensation_rate","value":0.02}"#
             ),
             Ok(Command::SetParam {
-                key: "atmosphere.cloud_evap_rate".to_owned(),
+                key: "atmosphere.condensation_rate".to_owned(),
                 value: 0.02
             })
         );

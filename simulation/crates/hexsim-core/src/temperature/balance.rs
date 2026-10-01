@@ -9,8 +9,8 @@
 //! [`super::illumination`] (the `flux_factor`) without depending on their
 //! implementation.
 
-use crate::atmosphere::surface_means;
 use crate::grid::HexGrid;
+use crate::par::for_each_chunk_mut;
 use crate::snow::SnowParams;
 
 use super::{
@@ -85,7 +85,7 @@ pub fn local_t_ref(
 /// (additive, the pure sunny/shaded-slope tilt). Both default to the
 /// flat-world identity (1.0 and 0.0), so `mean_factor` is bit-identical
 /// to the pre-terrain-calibration value on a flat map.
-fn calibration_offset(params: &TemperatureParams, lat_rad: f32) -> f32 {
+pub(crate) fn calibration_offset(params: &TemperatureParams, lat_rad: f32) -> f32 {
     let mean_factor = cached_annual_mean_insolation_factor(lat_rad)
         * params.terrain_insolation_factor
         + params.aspect_correction;
@@ -144,6 +144,17 @@ pub struct TemperatureForcing<'a> {
     /// the ice-albedo feedback (#60 Phase 2, single source of truth for
     /// snow albedo shared between the two phenomena).
     pub snow: &'a SnowParams,
+    /// Map-mean surface temperature (°C) of `current`, the first half of
+    /// `atmosphere::surface_means(current)`: with `mean_elevation` it
+    /// defines the mixed boundary-layer air the surface exchanges
+    /// sensible heat with (`SENSIBLE_EXCHANGE_COEF`). A full-grid
+    /// reduction memoized once per tick by the caller (timed apart as
+    /// `PhaseTimings::temp_means`) rather than recomputed inside the
+    /// phase, like `flux_factor`.
+    pub mean_surface_t: f32,
+    /// Map-mean elevation (m) of `current`, the second half of the same
+    /// `surface_means` call as `mean_surface_t`.
+    pub mean_elevation: f32,
 }
 
 pub fn step_temperature(
@@ -156,18 +167,9 @@ pub fn step_temperature(
         hour_tick,
         flux_factor,
         snow,
+        mean_surface_t: mean_t,
+        mean_elevation: mean_z,
     } = *forcing;
-
-    // Full current → next propagation: without this, fields other
-    // than `temperature` (cloud_water, water_level, humidity_*, etc.)
-    // that `step_temperature` doesn't explicitly touch are lost at the
-    // next buffer swap (see swap pattern in `Simulation`). Symptom:
-    // all of the previous tick's `step_atmosphere` work is erased,
-    // clouds frozen, rain that doesn't accumulate. Aligns the
-    // behavior with `step_snow` and `step_atmosphere_into`, which
-    // already do a full copy before their modifications.
-    next.cells_slice_mut()
-        .clone_from_slice(current.cells_slice());
 
     let lat_rad = params.latitude_deg.to_radians();
 
@@ -182,19 +184,27 @@ pub fn step_temperature(
 
     // Mixed boundary-layer air the surface exchanges sensible heat with:
     // map-mean temperature, standard lapse from the map-mean ground
-    // (`SENSIBLE_EXCHANGE_COEF`). One pass over the grid per tick.
-    let (mean_t, mean_z) = surface_means(current);
+    // (`SENSIBLE_EXCHANGE_COEF`), both carried by the forcing.
     let air_lapse_per_m = params.lapse_rate / 1000.0;
 
     // Local radiative balance plus the exchange with the shared air
-    // (no neighbor lookup) → parallelizable per cell.
+    // (no neighbor lookup) → parallelizable per cell (`par::for_each_chunk_mut`).
     // Index-based (cur[i] → next[i]): zero HashMap lookup, zero coord alloc.
+    //
+    // Folds the historical `current → next` full-grid copy into this same
+    // sweep (r250 perf effort, chunk B2): this is the first (and only)
+    // per-cell pass of the phase, it reads only `current[i]` and
+    // read-only tick inputs, and writes only `next[i]` — starting each
+    // cell from `*cell` before overwriting `.temperature` is exactly what
+    // the separate copy did, one fewer barrier and one fewer 88-byte
+    // full-grid stream per tick, bit-identical.
     let cur = current.cells_slice();
-    next.cells_slice_mut()
-        .iter_mut()
-        .zip(cur.iter())
-        .zip(flux_factor.iter())
-        .for_each(|((nc, cell), &ff)| {
+    for_each_chunk_mut(next.cells_slice_mut(), |start, chunk| {
+        for (local, nc) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            let cell = &cur[i];
+            *nc = cell.clone();
+            let ff = flux_factor[i];
             // LOCAL cloud cover for the IR back-radiation (#44): the
             // downward IR comes from the cloud ABOVE the cell, not from
             // the lateral solar shadow (already counted in `flux_factor`).
@@ -211,7 +221,11 @@ pub fn step_temperature(
             // protect itself: it absorbs ~2.8x less solar, the cell
             // stays cold, the snow persists, the ice-albedo loop
             // (scenario gap §5.9, closed).
-            let snow_albedo_factor = if cell.snow_level > 0.0 {
+            // `frozen_surface` = snowpack + lake ice: a frozen lake is
+            // white too (snow albedo as an approximation for its ice; bare
+            // lake ice sits at 0.3-0.5, a refinement left for later).
+            let frozen = cell.frozen_surface();
+            let snow_albedo_factor = if frozen > 0.0 {
                 // Cold pack = dry snow (0.80); melting pack (T > 0) =
                 // wet snow (0.60, USACE), liquid water absorbs. Same
                 // switch as the melt balance (`snow::step_snow`, Phase 4).
@@ -220,7 +234,7 @@ pub fn step_temperature(
                 } else {
                     snow.snow_albedo_dry
                 };
-                let snow_cover = cell.snow_level / (cell.snow_level + snow.snow_masking_half_mm);
+                let snow_cover = frozen / (frozen + snow.snow_masking_half_mm);
                 let albedo_eff =
                     params.ground_albedo + (snow_albedo - params.ground_albedo) * snow_cover;
                 (1.0 - albedo_eff) / (1.0 - params.ground_albedo).max(1e-6)
@@ -264,12 +278,14 @@ pub fn step_temperature(
 
             let delta_temp_k = params.thermal_coupling * net_radiative * SECONDS_PER_HOUR / c_local;
             nc.temperature = cell.temperature + delta_temp_k;
-        });
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atmosphere::surface_means;
     use crate::coord::HexCoord;
     use crate::dynamics::CELL_SPACING_M;
     use crate::temperature::compute_illumination;
@@ -316,6 +332,7 @@ mod tests {
             &mut ff,
             &mut il,
         );
+        let (mean_surface_t, mean_elevation) = surface_means(grid);
         step_temperature(
             grid,
             next,
@@ -324,6 +341,8 @@ mod tests {
                 hour_tick,
                 flux_factor: &ff,
                 snow: &SnowParams::default(),
+                mean_surface_t,
+                mean_elevation,
             },
         );
     }

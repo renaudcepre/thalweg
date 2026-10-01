@@ -165,21 +165,17 @@ fn karstic_cycle_conserves_mass() {
     // Closed terrarium + flow_rate=0 + atmosphere disabled: total mass
     // conserved to within epsilon.
     let mut sim = build_sim();
-    let total_before: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    // `water_budget_total`: the engine's own budget, never re-assembled
+    // here (anti-pattern 2). It reads the moist upper layer on
+    // its coarse reference stock, not on the fine views (coarse upper
+    // layer, step 2).
+    let total_before = sim.water_budget_total();
 
     for _ in 0..300 {
         sim.step();
     }
 
-    let total_after: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    let total_after = sim.water_budget_total();
 
     let drift = (total_after - total_before).abs() / total_before.max(1.0);
     assert!(

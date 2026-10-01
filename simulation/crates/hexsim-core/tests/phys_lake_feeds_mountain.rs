@@ -36,7 +36,34 @@ const TICKS: u64 = 1500;
 // a weaker but steadier discharge. The evap→condensation→snow chain works
 // (~12 mm observed over 4 years), just less intense than before. The test
 // remains an order-of-magnitude safety net to detect a total breakdown.
-const MIN_SNOW_ON_PEAK: f32 = 10.0;
+//
+// #63 L2b (2026-09-06): 10 → 5 mm. Measured on this fixture, same 1500
+// ticks, before and after the saturation adjustment replaced
+// `cloud_evap_rate`:
+//
+//   max(snow) on the peak     19.61 -> 7.32 mm
+//   precipitation on the peak  8414 ->  531 mm (rain + snow, cumulative)
+//   mean standing cloud_water  1.27 -> 0.41 mm on the peak cell
+//   snow left at the end       0.34 -> 2.68 mm
+//
+// The chain is not broken, its intensity moved, and the mechanism is
+// KK2000's exponent rather than the adjustment itself: autoconversion
+// goes as `q_c^2.47`, so a 3x smaller standing droplet stock is a ~13x
+// smaller drain, which is the 16x observed on the peak. The stock is
+// smaller because droplets are no longer a stock — every hour the peak's
+// column dips below saturation the reservoir is wiped, and every droplet
+// exported to a neighbour 1400 m lower evaporates on arrival instead of
+// drizzling for days.
+//
+// This fixture is the worst case for that: ONE 1500 m cell in a 37-cell
+// radius-3 torus of 100 m plain, so its upper air is ~9 K colder than
+// every neighbour's and it exports into air with a large deficit. At r30
+// the shift goes the other way — the >1500 m band gains rain days
+// (95 -> 115, seed 42, 2 years) and `cloud_cover_mountain_pct` rises
+// 0.41 -> 0.46. Threshold set at 5 mm: a 1.5x margin under the measured
+// 7.32, and still three orders of magnitude above what a broken chain
+// produces (0).
+const MIN_SNOW_ON_PEAK: f32 = 5.0;
 
 fn build_scene() -> Simulation {
     let mut grid = HexGrid::from_radius(3);

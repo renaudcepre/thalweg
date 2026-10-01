@@ -1,4 +1,4 @@
-// End-to-end check that an embed starts up correctly: shipped world loaded,
+// End-to-end check that an embed starts up correctly: right starting world,
 // playback running, no page error.
 //
 // There is no other honest way to check it. The three embed bugs of the
@@ -14,7 +14,7 @@
 // Usage (server running):
 //   node scripts/shot/embed-check.mjs                    # WASM, the real path of an embed
 //   node scripts/shot/embed-check.mjs '...?chrome=none'  # through the WS server
-//   node scripts/shot/embed-check.mjs '...&world=neuf'            # without the shipped world
+//   node scripts/shot/embed-check.mjs '...&world=aged'            # with the shipped world
 //
 // Exits 1 if the page raised an error or if no tick arrived.
 import { chromium } from "playwright";
@@ -22,8 +22,10 @@ import { chromium } from "playwright";
 const EMBED_URL =
   process.argv[2] ?? "http://localhost:8355/?mode=wasm&chrome=none";
 const WINDOW_MS = Number(process.argv[3] ?? 20000);
-const EXPECT_AGED = !EMBED_URL.includes("world=neuf");
-// `?world=neuf` means "do not import the shipped world", not "reset". In WS
+// Since #152 an embed boots a fresh (climatological t0) world: the shipped
+// world is only expected when asked for with `?world=<name>`.
+const EXPECT_AGED = /[?&]world=(?!neuf\b)/.test(EMBED_URL);
+// No shipped world means "do not import one", not "reset". In WS
 // mode the world lives in the server, which keeps what it had; an already
 // aged server stays aged, and that is correct. Only WASM mode, where the front
 // owns the world, lets us assert the opposite.
@@ -349,7 +351,7 @@ const failures = [];
 if (!ticks.length) failures.push("no tick received; the host would see nothing");
 if (!last?.playing) failures.push("playback did not start");
 if (EXPECT_AGED && !switchTick) failures.push("the shipped world was not loaded");
-if (!EXPECT_AGED && switchTick && WASM_MODE) failures.push("world=neuf loaded a shipped world anyway");
+if (!EXPECT_AGED && switchTick && WASM_MODE) failures.push("a shipped world loaded without `?world=`");
 if (!api.views.length) failures.push("`views` lists no base map");
 if (!api.layers.length) failures.push("`layers` lists no overlay");
 if (api.viewApplied !== api.viewRequested) {

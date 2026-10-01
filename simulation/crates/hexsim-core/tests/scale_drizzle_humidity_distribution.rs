@@ -1,5 +1,14 @@
 //! Phase 4 of task #63, diagnostic `HR_upper` distribution by altitude band.
 //!
+//! **Status since #63 L2b (2026-09-06)**: the chain this module describes
+//! below is the one that existed in 2026-07. The `cloud_evap` window is
+//! gone from the engine — below saturation the droplets go back to
+//! vapour, bounded by the layer's deficit and nothing else. The
+//! histogram keeps the 0.40 bin edge as a *display* constant
+//! ([`EVAP_ONSET_HR`]) so its output stays comparable with the runs that
+//! motivated the phase. Read the paragraphs that follow as the
+//! hypothesis of the day, not as current model behaviour.
+//!
 //! Hypothesis to test (Phase 3 invalidated the orographic-pump cause and
 //! pointed here instead): planetary drizzle comes from **chronic
 //! asymmetry** in `condensation_rate` / `cloud_evap_rate`
@@ -58,6 +67,15 @@ const TOTAL_DAYS: u64 = YEARS * 365;
 /// delimits `%cond` window of histogram, decoupled from any engine parameter
 /// (ex-`condensation_hr_threshold` dead, removed via #67).
 const COND_ONSET_HR: f32 = 1.0;
+/// RH threshold below which the histogram counts an observation in the
+/// `%evap` window. Same status as [`COND_ONSET_HR`]: a display constant,
+/// no longer an engine parameter. It is the value the dead
+/// `cloud_evap_hr_threshold` carried (0.4), kept verbatim so this
+/// diagnostic's bins stay comparable with the runs of 2026-07 that
+/// motivated #63 Phase 4. Since #63 L2b there is no window at all in the
+/// engine: below saturation the droplets go back to vapour, bounded only
+/// by the layer's deficit.
+const EVAP_ONSET_HR: f32 = 0.4;
 
 /// Same bands as `scale_drizzle_by_altitude` and `scale_knockout_drizzle`.
 const BANDS: &[(&str, f32, f32)] = &[
@@ -155,7 +173,7 @@ fn collect_hr_observations(
         cond: vec![0; BANDS.len()],
         dead: vec![0; BANDS.len()],
     };
-    let evap_threshold = atmo.cloud_evap_hr_threshold;
+    let evap_threshold = EVAP_ONSET_HR;
     let cond_threshold = COND_ONSET_HR;
 
     let t0 = std::time::Instant::now();
@@ -235,7 +253,7 @@ fn build_reports(
 fn drizzle_humidity_distribution_baseline() {
     let atmo = AtmosphereParams::default();
     let temp = TemperatureParams::default();
-    let evap_threshold = atmo.cloud_evap_hr_threshold;
+    let evap_threshold = EVAP_ONSET_HR;
     let cond_threshold = COND_ONSET_HR;
     let t_offset = temp.lapse_rate * atmo.upper_layer_altitude_m / 1000.0;
 

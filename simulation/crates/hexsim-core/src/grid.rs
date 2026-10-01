@@ -358,7 +358,7 @@ mod tests {
     // behind the edge rain hotspots under the mirror wrap.
 
     fn opposite(dir: usize) -> usize {
-        (dir + 3) % 6
+        crate::coord::opposite_direction(dir)
     }
 
     /// Each direction is a permutation of the cells: everyone has exactly
@@ -417,6 +417,30 @@ mod tests {
             for i in 0..grid.len() {
                 for &j in &grid.neighbor_indices_toric(i) {
                     assert_ne!(j, i, "unexpected self-transfer at R={radius}, cell {i}");
+                }
+            }
+        }
+    }
+
+    /// The identity the atmosphere's scatter → gather split relies on
+    /// (r250 perf effort): a source cell `i` scatters an outflow toward
+    /// its neighbor in direction `dir`; the destination gathers it back
+    /// by reading `dir` from the OPPOSITE side of the same edge. Checked
+    /// at radius 0 (degenerate torus, every direction self-loops), 1
+    /// (smallest real ring), 2 (smallest radius transport tests use, cf.
+    /// `oro_pump_world`) and 5 (a few rings of interior + border cells).
+    #[test]
+    fn gather_identity_matches_scatter_direction() {
+        for radius in [0, 1, 2, 5] {
+            let grid = HexGrid::from_radius(radius);
+            for i in 0..grid.len() {
+                let row = grid.neighbor_indices_toric(i);
+                for (dir, &j) in row.iter().enumerate() {
+                    assert_eq!(
+                        grid.neighbor_indices_toric(j)[crate::coord::opposite_direction(dir)],
+                        i,
+                        "R={radius}: cell {i} dir {dir} -> {j}, gather back must land on {i}"
+                    );
                 }
             }
         }

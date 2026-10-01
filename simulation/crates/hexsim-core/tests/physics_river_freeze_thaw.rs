@@ -116,20 +116,22 @@ fn cold_climate_locks_water_into_snow() {
         sim.step();
     }
 
+    // Frozen = snowpack + river ice: a river with 4 m of free water is a
+    // water body, its surplus freezes into `ice_level`, not `snow_level`.
     let total_water: f32 = sim.grid().iter().map(|(_, c)| c.water_level).sum();
-    let total_snow: f32 = sim.grid().iter().map(|(_, c)| c.snow_level).sum();
+    let total_frozen: f32 = sim.grid().iter().map(|(_, c)| c.frozen_surface()).sum();
 
     assert!(
-        total_snow > total_water,
-        "at T=-10 after 500 ticks, snow must dominate: \
-         snow={total_snow:.2}, water={total_water:.2}"
+        total_frozen > total_water,
+        "at T=-10 after 500 ticks, the frozen stock must dominate: \
+         frozen={total_frozen:.2}, water={total_water:.2}"
     );
     // Phase 3: rescale x200 (18 to 3600, close to 4000 initial with tolerance).
     assert!(
-        total_snow + total_water > 3600.0,
-        "conservation: total water+snow must stay close to 4000: \
-         {total_snow:.2} + {total_water:.2} = {:.2}",
-        total_snow + total_water
+        total_frozen + total_water > 3600.0,
+        "conservation: total water+frozen must stay close to 4000: \
+         {total_frozen:.2} + {total_water:.2} = {:.2}",
+        total_frozen + total_water
     );
 }
 

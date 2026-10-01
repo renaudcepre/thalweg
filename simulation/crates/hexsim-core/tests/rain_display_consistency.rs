@@ -63,7 +63,11 @@ fn snapshot_is_raining_matches_precipitation_map() {
     for _ in 0..20 {
         sim.step();
 
-        let precip = sim.last_precipitation();
+        // `snapshot()` sources `is_raining` from this hour-tick's flux
+        // (fix/rain-regime), not the daily accumulator: compare against the
+        // same map, `last_precipitation()` would diverge every hour but the
+        // last of the day.
+        let precip = sim.precip_this_tick();
         let snapshot = sim.snapshot();
         let grid = sim.grid();
 

@@ -230,7 +230,7 @@ self.onmessage = async (event) => {
         // ms, and a log that only arrives afterward doesn't say it's
         // working.
         if (msg.cmd.cmd === "reset") {
-          log("INFO", "reset", { seed: msg.cmd.seed ?? null });
+          log("INFO", "reset", { seed: msg.cmd.seed ?? null, radius: msg.cmd.radius ?? null });
         } else if (msg.cmd.cmd === "step" || msg.cmd.cmd === "step_hour") {
           log("INFO", msg.cmd.cmd, { n: msg.cmd.n ?? 1 });
         }

@@ -63,7 +63,7 @@ fn deep_water_does_not_become_permanent_glacier() {
         std::mem::swap(&mut current, &mut next);
     }
 
-    let snow_after_winter = current.get(c).unwrap().snow_level;
+    let snow_after_winter = current.get(c).unwrap().frozen_surface();
     let water_after_winter = current.get(c).unwrap().water_level;
     println!(
         "End of winter: snow={snow_after_winter:.2} water={water_after_winter:.2} (initial water=50)"
@@ -82,7 +82,7 @@ fn deep_water_does_not_become_permanent_glacier() {
         std::mem::swap(&mut current, &mut next);
     }
 
-    let snow_after_summer = current.get(c).unwrap().snow_level;
+    let snow_after_summer = current.get(c).unwrap().frozen_surface();
     let water_after_summer = current.get(c).unwrap().water_level;
     println!("End of summer: snow={snow_after_summer:.2} water={water_after_summer:.2}");
 
@@ -168,7 +168,7 @@ fn high_altitude_still_forms_glacier() {
         std::mem::swap(&mut current, &mut next);
     }
 
-    let snow_after_winter = current.get(c).unwrap().snow_level;
+    let snow_after_winter = current.get(c).unwrap().frozen_surface();
 
     // Summer at +5°C: snow_after_winter expected >> glacier_threshold
     // (1000 mm) and elevation=1200 > glacier_min_elevation → glacier
@@ -184,7 +184,7 @@ fn high_altitude_still_forms_glacier() {
         std::mem::swap(&mut current, &mut next);
     }
 
-    let snow_after_summer = current.get(c).unwrap().snow_level;
+    let snow_after_summer = current.get(c).unwrap().frozen_surface();
     println!(
         "Peak: snow={snow_after_winter:.2} end of winter → {snow_after_summer:.2} end of summer (+5°C)"
     );

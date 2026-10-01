@@ -129,19 +129,52 @@ pub(crate) fn step_lake_leveling(current: &HexGrid, next: &mut HexGrid, params: 
         // Rewrites each cell: trapped water (capacity) + depth up to `H`.
         // A cell whose terrain exceeds `H` falls back to its capacity (it
         // leaves the lake, its surplus has flowed toward the low points).
+        //
+        // `level_m` is `lowest_elevation + volume_m` (see
+        // `solve_flat_level`): computing each cell's depth as `level_m -
+        // elevation` subtracts back out an elevation of a completely
+        // different magnitude than the surplus it was added to (hundreds
+        // of meters vs. a few tens of centimeters), so the f32 rounding
+        // of that addition is baked into `level_m` and never recovered —
+        // a real, pre-existing conservation gap (reproduced standalone in
+        // `tests::deep_lake_over_high_terrain_still_conserves_exactly`:
+        // ~8 mm lost on a 2-cell, ~350 m elevation lake, large enough to
+        // trip the engine's strict 10-year water-budget test on some
+        // seeds). Exact fix: credit/debit the rounding residual to the
+        // deepest cell of the component (always wet here, with enough
+        // headroom that a sub-mm correction is physically inert) so
+        // `Σ new_surplus` matches `volume_m` exactly rather than
+        // approximately, the same "credit what actually moved" pattern
+        // `step_evaporation` already uses for snow sublimation.
         let out = next.cells_slice_mut();
+        let mut assigned_mm = 0.0_f32;
+        let mut deepest = (comp[0], -1.0_f32);
         for &i in &comp {
-            let depth_m = Meters((level_m - cells[i].elevation).max(0.0));
-            out[i].water_level = (Mm(cells[i].water_capacity) + depth_m.to_mm()).0;
+            let depth_m = (level_m - cells[i].elevation).max(0.0);
+            let depth_mm = Meters(depth_m).to_mm().0;
+            out[i].water_level = cells[i].water_capacity + depth_mm;
+            assigned_mm += depth_mm;
+            if depth_m > deepest.1 {
+                deepest = (i, depth_m);
+            }
+        }
+        let residual_mm = Meters(volume_m).to_mm().0 - assigned_mm;
+        if residual_mm != 0.0 {
+            out[deepest.0].water_level += residual_mm;
         }
     }
 }
 
 /// Solves the flat level `H` (m) such that `Σ max(0, H − elev_i) = volume_m`
-/// over the component's cells. Incremental fill from the low point: each
+/// over the component's cells. Shared with the worldgen lake fill
+/// (`climatology::fill_basins_with_runoff`), the same hydrostatics at t0. Incremental fill from the low point: each
 /// step covers one more cell. Cells whose terrain exceeds `H` stay dry
 /// (their surplus flows downstream).
-fn solve_flat_level(comp: &[usize], cells: &[crate::cell::CellProperties], volume_m: f32) -> f32 {
+pub(crate) fn solve_flat_level(
+    comp: &[usize],
+    cells: &[crate::cell::CellProperties],
+    volume_m: f32,
+) -> f32 {
     let mut elevs: Vec<f32> = comp.iter().map(|&i| cells[i].elevation).collect();
     elevs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -167,7 +200,7 @@ fn solve_flat_level(comp: &[usize], cells: &[crate::cell::CellProperties], volum
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coord::HexCoord;
+    use crate::coord::{DIRECTIONS, HexCoord};
 
     /// r1 grid (center + 6 neighbors), all filled with deep free water over
     /// a bowl-shaped terrain: after leveling, the surface
@@ -283,5 +316,54 @@ mod tests {
                 "shallow water must not be leveled"
             );
         }
+    }
+
+    /// Reproduces a real conservation gap uncovered chasing the r250
+    /// atmosphere strict water-budget test (2026-09-04): `solve_flat_level`
+    /// adds `volume_m` (order 0.1-1 m of surplus) onto an elevation
+    /// baseline two to three orders of magnitude larger, then each cell's
+    /// depth is recovered by subtracting that same elevation back out —
+    /// the f32 rounding of the addition is baked into `level_m` and never
+    /// recoverable from the subtraction alone. A modest surplus split
+    /// unevenly between two high-elevation neighbors (~350 m) is enough
+    /// to lose several mm, comfortably above the strict 10-year
+    /// water-budget test's tolerance once compounded over many lake
+    /// events. Values are a real state pulled from that failure, not
+    /// tuned to trigger it.
+    #[test]
+    fn deep_lake_over_high_terrain_still_conserves_exactly() {
+        let mut grid = HexGrid::from_radius(1);
+        let center = HexCoord::new(0, 0);
+        let neighbor = center + DIRECTIONS[0];
+        {
+            let c = grid.get_mut(center).unwrap();
+            c.elevation = 347.197_63;
+            c.water_capacity = 140.824_65;
+            c.water_level = 771.013_6;
+        }
+        {
+            let c = grid.get_mut(neighbor).unwrap();
+            c.elevation = 349.175_78;
+            c.water_capacity = 142.212_94;
+            c.water_level = 208.076_98;
+        }
+
+        let before: f64 = grid
+            .cells_slice()
+            .iter()
+            .map(|c| f64::from(c.water_level))
+            .sum();
+        let mut next = grid.clone();
+        step_lake_leveling(&grid, &mut next, &LakeParams::default());
+        let after: f64 = next
+            .cells_slice()
+            .iter()
+            .map(|c| f64::from(c.water_level))
+            .sum();
+
+        assert!(
+            (after - before).abs() < 1e-3,
+            "lake leveling must conserve surplus exactly: {before} -> {after}"
+        );
     }
 }

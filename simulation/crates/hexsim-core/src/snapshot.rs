@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::grid::HexGrid;
 use crate::hydro::HydroMaps;
-use crate::species::{SPECIES, SPECIES_COUNT, SpeciesId};
-use crate::vegetation::{cell_total_vegetation, dominant_species, is_open_water};
+use crate::lithology::LithologyId;
+use crate::species::{
+    GrowthForm, SPECIES, SPECIES_COUNT, STRATA, STRATUM_COUNT, Species, SpeciesId, Stratum,
+};
+use crate::vegetation::{canopy_cover, dominant_species, is_open_water, stratum_cover};
 use crate::wind::WindField;
 
 /// A flattened cell for JSON serialization: coord + properties + flux.
@@ -37,15 +40,40 @@ pub struct CellSnapshot {
     pub cloud_water: f32,
     pub groundwater: f32,
     pub snow_level: f32,
+    /// Lake / river ice (mm w.e.): the frozen surplus of a water body,
+    /// apart from the snowpack. Rendered as part of the water body.
+    pub ice_level: f32,
+    /// Hydric aptitude ∈ [0, 1] derived from `lithology` and relief: the
+    /// water table holds `permeability × 100 mm`, infiltration scales with
+    /// it. Dimensionless by construction, shown as a percent by the front.
     pub permeability: f32,
-    /// Total vegetation cover [0, 1] (sum of per-species biomass).
+    /// Rock class of the substrate (`snake_case`: granite, marl, sandstone,
+    /// limestone), the source of `permeability` (#136). Exported so the
+    /// inspector can name the soil instead of showing a bare 0-1 number.
+    pub lithology: LithologyId,
+    /// Canopy cover [0, 1]: share of the ground under at least one
+    /// vegetation layer, `1 − Π(1 − cover_S)` over the strata
+    /// (`vegetation::canopy_cover`, #161). No longer the plain sum of the
+    /// biomasses, which exceeds 1 as soon as an understory lives under a
+    /// canopy.
     pub vegetation: f32,
-    /// Dominant species (highest biomass), or `null` if bare ground. Derived
-    /// by the core, consumed as-is by the front (anti-pattern #2).
+    /// Cover of each stratum [0, 1], order = `GridState::stratum_order`
+    /// (herb, shrub, tree): the sum of `species_mix` over the species of
+    /// that stratum (`vegetation::stratum_cover`). Each stratum has its
+    /// own space, so the three don't add up to `vegetation`. Lets the
+    /// front size a tree scatter by the tree layer without knowing which
+    /// columns are trees (anti-pattern #2).
+    pub cover_by_stratum: [f32; STRATUM_COUNT],
+    /// Dominant species **as seen from the sky** (`vegetation::dominant_species`:
+    /// a grass under a closed canopy shows as the canopy), or `null` if
+    /// bare ground. Derived by the core, consumed as-is by the front
+    /// (anti-pattern #2).
     pub dominant_species: Option<SpeciesId>,
-    /// Biomass per species [0, 1], in the order of `species::SPECIES`. Lets
-    /// callers judge the **mix** of species in a hex (mono vs mixed) without
-    /// recomputing on the consumer side. Sum = `vegetation`.
+    /// Biomass per species [0, 1], in the order of `species::SPECIES`
+    /// (`GridState::species_order`). Lets callers judge the **mix** of
+    /// species in a hex (mono vs mixed) without recomputing on the
+    /// consumer side. Summed over one stratum's species = that entry of
+    /// `cover_by_stratum`.
     pub species_mix: [f32; SPECIES_COUNT],
     /// Average canopy age (years), proxy for "old-growth forest" (#wildfire).
     pub stand_age: f32,
@@ -53,10 +81,12 @@ pub struct CellSnapshot {
     pub fire_intensity: f32,
     /// `true` if open water (lake): the front renders it blue, not as cover.
     pub is_open_water: bool,
+    /// `true` if it is raining or snowing this hour-tick (same map as
+    /// `rain_amount`/`snow_amount`, not the daily accumulator).
     pub is_raining: bool,
-    /// Liquid precipitation fallen this tick (rain/tick).
+    /// Liquid precipitation fallen this hour-tick (mm, rain/h).
     pub rain_amount: f32,
-    /// Solid precipitation fallen this tick (snow/tick).
+    /// Solid precipitation fallen this hour-tick (mm w.e., snow/h).
     pub snow_amount: f32,
     /// Outflow flux, sourced from `HydroMaps::discharge`: the 60-day EMA
     /// (#106) in production via `Simulation::snapshot`, not the
@@ -94,6 +124,31 @@ pub struct CellSnapshot {
     pub illumination: f32,
 }
 
+/// What a consumer needs to know about a species to draw it: its layer
+/// and its silhouette. One entry per column of `CellSnapshot::species_mix`
+/// (`GridState::species_catalog`), built from `species::SPECIES`, so the
+/// front never hardcodes which id is a conifer or a grass: a species added
+/// to the table draws right on the day it is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeciesInfo {
+    pub id: SpeciesId,
+    /// Vertical layer, the index of `CellSnapshot::cover_by_stratum` it
+    /// counts in (through `GridState::stratum_order`).
+    pub stratum: Stratum,
+    /// Silhouette (grass = ground tint, shrub, broadleaf, conifer).
+    pub growth_form: GrowthForm,
+}
+
+impl From<&Species> for SpeciesInfo {
+    fn from(s: &Species) -> Self {
+        Self {
+            id: s.id,
+            stratum: s.stratum,
+            growth_form: s.growth_form,
+        }
+    }
+}
+
 /// Complete grid state, ready to serialize to JSON.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GridState {
@@ -111,15 +166,43 @@ pub struct GridState {
     /// Stock of condensed droplets (visible clouds). Subset of
     /// `total_humidity`, exported separately for the UI.
     pub total_cloud_water: f32,
-    /// Rain + snow fallen during this tick only (flux, not stock).
-    /// Used to compute average rainfall in mm/day for the UI.
+    /// Rain + snow fallen during this hour-tick only (flux, not stock),
+    /// summed over the grid. The front derives an mm/day-ish rate from it
+    /// by multiplying the per-cell mean by 24, it is not itself a daily
+    /// total (see `CellSnapshot::rain_amount`/`snow_amount`).
     pub total_precip_this_tick: f32,
     pub total_groundwater: f32,
+    /// Deep aquifer over the grid (mm, #107), apart from the root zone's
+    /// `total_groundwater`. Header only, like `total_sky_water`.
+    pub total_aquifer: f32,
     pub total_snow: f32,
+    /// Lake / river ice over the grid (mm w.e.), apart from `total_snow`.
+    pub total_ice: f32,
+    /// Water held outside the box by the imposed weather regime (#63),
+    /// mm, map total. Header only, no per-cell field: it is one scalar
+    /// for the whole map, and the wire already costs 140 B/cell. Filled
+    /// by `Simulation::snapshot` (the reservoir lives in the simulation);
+    /// 0 through `HexGrid::snapshot` alone, and 0 whenever the regime is
+    /// off. ON is the shipped default since 2026-09-06 (#63/#146), so a
+    /// consumer that sums the totals to check the terrarium must include
+    /// it.
+    pub total_sky_water: f32,
+    /// `true` while the imposed weather regime is in its wet phase.
+    /// Same provenance as `total_sky_water`; always `false` when the
+    /// regime is off.
+    pub weather_regime_wet: bool,
     /// Species order matching the indices of `CellSnapshot::species_mix`
     /// (= order of `species::SPECIES`). Makes the mix self-describing on
     /// the consumer side: `species_mix[i]` ↔ `species_order[i]`.
     pub species_order: [SpeciesId; SPECIES_COUNT],
+    /// Layer and silhouette of each species, same order as
+    /// `species_order` (`species_catalog[i]` describes `species_mix[i]`).
+    /// Header only: static for the engine's lifetime, paid once per frame.
+    pub species_catalog: [SpeciesInfo; SPECIES_COUNT],
+    /// Strata order matching the indices of `CellSnapshot::cover_by_stratum`
+    /// (= `species::STRATA`, bottom to top): the stratum cover is
+    /// self-describing the same way `species_order` makes the mix.
+    pub stratum_order: [Stratum; STRATUM_COUNT],
     /// Quantization scale for `CellSnapshot::edge_flux`: largest edge flux
     /// (mm) observed this frame. 0 if nothing flows anywhere.
     pub edge_flux_max: f32,
@@ -187,8 +270,11 @@ impl HexGrid {
                     cloud_water: props.cloud_water,
                     groundwater: props.groundwater,
                     snow_level: props.snow_level,
+                    ice_level: props.ice_level,
                     permeability: props.permeability,
-                    vegetation: cell_total_vegetation(props),
+                    lithology: props.lithology,
+                    vegetation: canopy_cover(props),
+                    cover_by_stratum: STRATA.map(|stratum| stratum_cover(props, stratum)),
                     dominant_species: dominant_species(props),
                     species_mix: props.vegetation,
                     stand_age: props.stand_age,
@@ -220,7 +306,9 @@ impl HexGrid {
         let total_cloud_water: f32 = self.cells_slice().iter().map(|c| c.cloud_water).sum();
         let total_precip_this_tick: f32 = precipitation.iter().map(|p| p.rain + p.snow).sum();
         let total_groundwater: f32 = self.cells_slice().iter().map(|c| c.groundwater).sum();
+        let total_aquifer: f32 = self.cells_slice().iter().map(|c| c.aquifer).sum();
         let total_snow: f32 = self.cells_slice().iter().map(|c| c.snow_level).sum();
+        let total_ice: f32 = self.cells_slice().iter().map(|c| c.ice_level).sum();
 
         GridState {
             tick,
@@ -231,10 +319,102 @@ impl HexGrid {
             total_cloud_water,
             total_precip_this_tick,
             total_groundwater,
+            total_aquifer,
             total_snow,
+            total_ice,
+            // Filled by `Simulation::snapshot`: the regime's state lives
+            // in the simulation, the grid knows nothing about it (same
+            // pattern as the synoptic and illumination fields above).
+            total_sky_water: 0.0,
+            weather_regime_wet: false,
             species_order: SPECIES.map(|s| s.id),
+            species_catalog: SPECIES.each_ref().map(SpeciesInfo::from),
+            stratum_order: STRATA,
             edge_flux_max,
             cells,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coord::HexCoord;
+    use crate::species::species_index;
+
+    fn empty_hydro_maps() -> HydroMaps<'static> {
+        HydroMaps {
+            discharge: &[],
+            flow_vec: &[],
+            edge_flux: &[],
+        }
+    }
+
+    /// One cell with a meadow under a boxwood under a downy oak: each
+    /// stratum's cover is the sum of its species' columns, exported in the
+    /// header's `stratum_order`, and `vegetation` is the canopy cover
+    /// (`1 − Π(1 − cover_S)`), not the 1.4 plain sum.
+    #[test]
+    fn snapshot_exports_the_cover_of_each_stratum() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).expect("center cell");
+        cell.vegetation[species_index(SpeciesId::Meadow)] = 0.5;
+        cell.vegetation[species_index(SpeciesId::Boxwood)] = 0.25;
+        cell.vegetation[species_index(SpeciesId::OakPubescent)] = 0.5;
+        cell.vegetation[species_index(SpeciesId::Beech)] = 0.25;
+
+        let state = grid.snapshot(0, 0, &empty_hydro_maps(), &Vec::new(), &Vec::new());
+        let c = &state.cells[0];
+        let cover = |s: Stratum| {
+            let i = state
+                .stratum_order
+                .iter()
+                .position(|&o| o == s)
+                .expect("every stratum is in the order");
+            c.cover_by_stratum[i]
+        };
+        assert!((cover(Stratum::Herb) - 0.5).abs() < 1e-6);
+        assert!((cover(Stratum::Shrub) - 0.25).abs() < 1e-6);
+        assert!((cover(Stratum::Tree) - 0.75).abs() < 1e-6);
+        let canopy = 1.0 - 0.5 * 0.75 * 0.25;
+        assert!(
+            (c.vegetation - canopy).abs() < 1e-6,
+            "canopy cover {} vs {canopy}",
+            c.vegetation
+        );
+        assert_eq!(
+            c.species_mix.map(f32::to_bits),
+            grid.cells_slice()[0].vegetation.map(f32::to_bits)
+        );
+    }
+
+    /// The catalog is the species table's own layer and silhouette, in the
+    /// `species_order` columns: the front reads the conifers from it,
+    /// never from a hardcoded id list.
+    #[test]
+    fn species_catalog_mirrors_the_species_table() {
+        let grid = HexGrid::from_radius(0);
+        let state = grid.snapshot(0, 0, &empty_hydro_maps(), &Vec::new(), &Vec::new());
+        for ((info, &id), s) in state
+            .species_catalog
+            .iter()
+            .zip(&state.species_order)
+            .zip(&SPECIES)
+        {
+            assert_eq!(info.id, id, "catalog and order share the columns");
+            assert_eq!((info.stratum, info.growth_form), (s.stratum, s.growth_form));
+        }
+        assert_eq!(state.stratum_order, STRATA);
+        let fir = state.species_catalog[species_index(SpeciesId::Fir)];
+        assert_eq!(
+            (fir.stratum, fir.growth_form),
+            (Stratum::Tree, GrowthForm::Conifer)
+        );
+        let json = serde_json::to_value(fir).expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({"id": "fir", "stratum": "tree", "growth_form": "conifer"}),
+            "snake_case on the wire, the front's keys"
+        );
     }
 }

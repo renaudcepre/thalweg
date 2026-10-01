@@ -8,8 +8,8 @@
 //! compact than JSON, while staying self-descriptive: the consumer zips
 //! `cell_fields` with each row without a hardcoded schema.
 //!
-//! The header (`tick`, totals, `species_order`…) stays a named map: its
-//! cost is paid once per frame, not per cell.
+//! The header (`tick`, totals, `species_order`, `species_catalog`…) stays
+//! a named map: its cost is paid once per frame, not per cell.
 //!
 //! The `GridState` from `hexsim-core` remains the single source of truth
 //! for the content; this module is only its transport projection. The
@@ -21,7 +21,7 @@ use hexsim_core::snapshot::{CellSnapshot, GridState};
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, SerializeTuple, Serializer};
 
 /// Cell field names, in the exact order of `CellRow`'s elements.
-pub const CELL_FIELDS: [&str; 31] = [
+pub const CELL_FIELDS: [&str; 34] = [
     "q",
     "r",
     "elevation",
@@ -33,8 +33,11 @@ pub const CELL_FIELDS: [&str; 31] = [
     "cloud_water",
     "groundwater",
     "snow_level",
+    "ice_level",
     "permeability",
+    "lithology",
     "vegetation",
+    "cover_by_stratum",
     "dominant_species",
     "species_mix",
     "stand_age",
@@ -73,8 +76,11 @@ impl Serialize for CellRow<'_> {
         row.serialize_element(&c.cloud_water)?;
         row.serialize_element(&c.groundwater)?;
         row.serialize_element(&c.snow_level)?;
+        row.serialize_element(&c.ice_level)?;
         row.serialize_element(&c.permeability)?;
+        row.serialize_element(&c.lithology)?;
         row.serialize_element(&c.vegetation)?;
+        row.serialize_element(&c.cover_by_stratum)?;
         row.serialize_element(&c.dominant_species)?;
         row.serialize_element(&c.species_mix)?;
         row.serialize_element(&c.stand_age)?;
@@ -117,7 +123,7 @@ struct WireGridState<'a>(&'a GridState);
 impl Serialize for WireGridState<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let g = self.0;
-        let mut st = serializer.serialize_struct("GridState", 13)?;
+        let mut st = serializer.serialize_struct("GridState", 19)?;
         st.serialize_field("tick", &g.tick)?;
         st.serialize_field("hour_tick", &g.hour_tick)?;
         st.serialize_field("cell_count", &g.cell_count)?;
@@ -126,8 +132,14 @@ impl Serialize for WireGridState<'_> {
         st.serialize_field("total_cloud_water", &g.total_cloud_water)?;
         st.serialize_field("total_precip_this_tick", &g.total_precip_this_tick)?;
         st.serialize_field("total_groundwater", &g.total_groundwater)?;
+        st.serialize_field("total_aquifer", &g.total_aquifer)?;
         st.serialize_field("total_snow", &g.total_snow)?;
+        st.serialize_field("total_ice", &g.total_ice)?;
+        st.serialize_field("total_sky_water", &g.total_sky_water)?;
+        st.serialize_field("weather_regime_wet", &g.weather_regime_wet)?;
         st.serialize_field("species_order", &g.species_order)?;
+        st.serialize_field("species_catalog", &g.species_catalog)?;
+        st.serialize_field("stratum_order", &g.stratum_order)?;
         st.serialize_field("edge_flux_max", &g.edge_flux_max)?;
         // Slice, not array: serde only implements Serialize for [T; 0..=32].
         st.serialize_field("cell_fields", CELL_FIELDS.as_slice())?;
@@ -173,10 +185,16 @@ mod tests {
             "cloud_water": 108.0,
             "groundwater": 109.0,
             "snow_level": 110.0,
+            "ice_level": 125.0,
             "permeability": 111.0,
+            "lithology": "limestone",
             "vegetation": 112.0,
+            "cover_by_stratum": [128.0, 129.0, 130.0],
             "dominant_species": "oak_pubescent",
-            "species_mix": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "species_mix": [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
+            ],
             "stand_age": 113.0,
             "fire_intensity": 114.0,
             "is_open_water": true,
@@ -231,6 +249,7 @@ mod tests {
     /// `GridState` (including `cells`, reformatted) + `cell_fields`.
     #[test]
     fn wire_header_matches_named_serialization() {
+        let probe = sample_grid_state_probe();
         let state = GridState {
             tick: 42,
             hour_tick: 1009,
@@ -240,8 +259,14 @@ mod tests {
             total_cloud_water: 203.0,
             total_precip_this_tick: 204.0,
             total_groundwater: 205.0,
+            total_aquifer: 210.0,
             total_snow: 206.0,
-            species_order: sample_grid_state_probe().species_order,
+            total_ice: 208.0,
+            total_sky_water: 209.0,
+            weather_regime_wet: true,
+            species_order: probe.species_order,
+            species_catalog: probe.species_catalog,
+            stratum_order: probe.stratum_order,
             edge_flux_max: 207.0,
             cells: vec![sample_cell()],
         };
@@ -270,7 +295,8 @@ mod tests {
     }
 
     /// Minimal `GridState` from the real engine, for an authentic
-    /// `species_order` without copying the constant from `hexsim-core`.
+    /// `species_order` / `species_catalog` / `stratum_order` without
+    /// copying the constants from `hexsim-core`.
     /// Empty `HydroMaps` for the probes: the snapshot tolerates maps shorter
     /// than the grid (`get(i)` → defaults).
     fn empty_hydro_maps() -> hexsim_core::hydro::HydroMaps<'static> {
@@ -290,9 +316,12 @@ mod tests {
     /// only reason to exist. Threshold at 45%: measured 27% on fresh
     /// terrain R=15 and 23% on a 30-day lived-in world (139 B/cell
     /// constant in wire, f32 msgpack weighs 5 B regardless of the value;
-    /// JSON bloats to 584 B/cell with populated floats). The margin
-    /// absorbs content drift without letting a regression toward named
-    /// msgpack (~95%) slip through.
+    /// JSON bloats to 584 B/cell with populated floats). With the 16
+    /// species and the 3 stratum covers (#161, +71 B/cell of f32
+    /// columns) fresh terrain R=15 measures 35%, 249 B/cell: a zero f32
+    /// is 5 B in msgpack but 4 in JSON (`0.0,`), so the empty columns of a
+    /// bare world close the gap. The margin absorbs content drift without
+    /// letting a regression toward named msgpack (~95%) slip through.
     #[test]
     fn wire_is_much_smaller_than_json() {
         let mut grid = hexsim_core::grid::HexGrid::from_radius(15);

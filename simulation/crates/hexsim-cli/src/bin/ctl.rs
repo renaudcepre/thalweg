@@ -5,7 +5,7 @@
 ///   pause                    → pauses it
 ///   step [N]                 → advances N ticks (default: 1)
 ///   step-hour [N]            → advances N hours (diurnal cycle, synoptic drift)
-///   reset [SEED]             → resets (seed optional)
+///   reset [SEED] [--radius N] → resets (seed and radius optional)
 ///   diag                     → current diagnostics
 ///   climate                  → climate aggregates
 ///   param <KEY> <VALUE>      → hot-changes a parameter
@@ -39,8 +39,14 @@ enum Cmd {
         #[arg(default_value = "1")]
         n: u64,
     },
-    /// Reset (seed optional)
-    Reset { seed: Option<u32> },
+    /// Reset (seed optional). `--radius` rebuilds the grid at that size
+    /// (small worlds run much faster, #L6); omitted, the current radius is
+    /// kept.
+    Reset {
+        seed: Option<u32>,
+        #[arg(long)]
+        radius: Option<i32>,
+    },
     /// Current diagnostics
     Diag,
     /// Climate aggregates
@@ -123,11 +129,14 @@ async fn run() -> Result<()> {
                 .await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        Cmd::Reset { seed } => {
-            let cmd = match seed {
-                Some(s) => serde_json::json!({"cmd": "reset", "seed": s}),
-                None => serde_json::json!({"cmd": "reset"}),
-            };
+        Cmd::Reset { seed, radius } => {
+            let mut cmd = serde_json::json!({"cmd": "reset"});
+            if let Some(s) = seed {
+                cmd["seed"] = serde_json::json!(s);
+            }
+            if let Some(r) = radius {
+                cmd["radius"] = serde_json::json!(r);
+            }
             ws.send(cmd).await?;
             // Let the reset take effect, then request diagnostics
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

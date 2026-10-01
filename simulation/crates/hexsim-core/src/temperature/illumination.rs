@@ -14,6 +14,7 @@ use crate::ablation::Ablation;
 use crate::coord::hex_direction_to_world;
 use crate::dynamics::CELL_SPACING_M;
 use crate::grid::HexGrid;
+use crate::par::for_each_chunk_mut2;
 
 use super::{SolarBeam, TemperatureParams, solar_beam_at_tick};
 
@@ -413,60 +414,67 @@ pub fn compute_illumination_cached(
         Some((_, ray_slope)) => cloud_sample_step(cloud_altitude_m / ray_slope),
         None => 0,
     };
-    for i in 0..n {
-        let (ne, nn) = (cells[i].normal_east, cells[i].normal_north);
-        let n_u = (1.0 - ne * ne - nn * nn).max(0.0).sqrt();
-        let cos_inc = (beam.s_e * ne + beam.s_n * nn + beam.s_u * n_u).max(0.0);
-        let mut t = 0.0_f32; // normalized occlusion = (over / ILLUM_FULL_M).min(1)
-        let mut eff_cloud = cells[i].cloud_water; // default: local (zenith) cloud
-        // Same gate as the reference march: a slope facing away from
-        // the sun has no direct beam to occlude, only the diffuse sky.
-        if let Some((sun_dir, ray_slope)) = march.filter(|_| cos_inc > 0.0) {
-            // Cloud shadow: cell at the layer crossing, via 2^j jumps.
-            if kstar > 0 {
-                let mut idx = i;
-                let mut bits = kstar;
-                let mut level = 0;
-                while bits != 0 {
-                    if bits & 1 == 1 {
-                        idx = cache.shift[sun_dir][level][idx];
+    // Per-cell raymarch reading `cells`/`cache` at arbitrary (neighbor,
+    // jump-table) indices, writing only its own `flux_factor[i]` and
+    // `illumination[i]`: a pure gather map, parallelizable
+    // (`par::for_each_chunk_mut2`).
+    for_each_chunk_mut2(flux_factor, illumination, |start, ff_chunk, il_chunk| {
+        for (local, (ffo, ilo)) in ff_chunk.iter_mut().zip(il_chunk.iter_mut()).enumerate() {
+            let i = start + local;
+            let (ne, nn) = (cells[i].normal_east, cells[i].normal_north);
+            let n_u = (1.0 - ne * ne - nn * nn).max(0.0).sqrt();
+            let cos_inc = (beam.s_e * ne + beam.s_n * nn + beam.s_u * n_u).max(0.0);
+            let mut t = 0.0_f32; // normalized occlusion = (over / ILLUM_FULL_M).min(1)
+            let mut eff_cloud = cells[i].cloud_water; // default: local (zenith) cloud
+            // Same gate as the reference march: a slope facing away from
+            // the sun has no direct beam to occlude, only the diffuse sky.
+            if let Some((sun_dir, ray_slope)) = march.filter(|_| cos_inc > 0.0) {
+                // Cloud shadow: cell at the layer crossing, via 2^j jumps.
+                if kstar > 0 {
+                    let mut idx = i;
+                    let mut bits = kstar;
+                    let mut level = 0;
+                    while bits != 0 {
+                        if bits & 1 == 1 {
+                            idx = cache.shift[sun_dir][level][idx];
+                        }
+                        bits >>= 1;
+                        level += 1;
                     }
-                    bits >>= 1;
-                    level += 1;
+                    eff_cloud = cells[idx].cloud_water;
                 }
-                eff_cloud = cells[idx].cloud_water;
-            }
-            // Relief occlusion: precomputed tangents, march only in penumbra.
-            let slope_w = f64::from(ray_slope);
-            if slope_w >= cache.s_clear[sun_dir][i] {
-                // no upstream step occludes: over = 0, t = 0 (majority path)
-            } else if slope_w <= cache.s_full[sun_dir][i] {
-                t = 1.0; // full occlusion guaranteed: the march would give min(1)
-            } else {
-                let cy = cache.elev[i];
-                let dmax = cache.dir_max[sun_dir][i];
-                let step1 = &cache.shift[sun_dir][0];
-                let mut over = 0.0_f32;
-                let mut idx = i;
-                let mut dist = 0.0_f32;
-                for _ in 0..ILLUM_MAX_STEPS {
-                    idx = step1[idx];
-                    dist += CELL_SPACING_M;
-                    let ray_h = cy + dist * ray_slope;
-                    over = over.max(cache.elev[idx] - ray_h);
-                    if ray_h >= dmax {
-                        break; // nothing tall enough left in this direction
+                // Relief occlusion: precomputed tangents, march only in penumbra.
+                let slope_w = f64::from(ray_slope);
+                if slope_w >= cache.s_clear[sun_dir][i] {
+                    // no upstream step occludes: over = 0, t = 0 (majority path)
+                } else if slope_w <= cache.s_full[sun_dir][i] {
+                    t = 1.0; // full occlusion guaranteed: the march would give min(1)
+                } else {
+                    let cy = cache.elev[i];
+                    let dmax = cache.dir_max[sun_dir][i];
+                    let step1 = &cache.shift[sun_dir][0];
+                    let mut over = 0.0_f32;
+                    let mut idx = i;
+                    let mut dist = 0.0_f32;
+                    for _ in 0..ILLUM_MAX_STEPS {
+                        idx = step1[idx];
+                        dist += CELL_SPACING_M;
+                        let ray_h = cy + dist * ray_slope;
+                        over = over.max(cache.elev[idx] - ray_h);
+                        if ray_h >= dmax {
+                            break; // nothing tall enough left in this direction
+                        }
                     }
+                    t = (over / ILLUM_FULL_M).min(1.0);
                 }
-                t = (over / ILLUM_FULL_M).min(1.0);
             }
+            let cover = eff_cloud.clamp(0.0, 1.0); // cloud_water normalized to 1 mm PW
+            let transm = 1.0 - (cover * cloud_albedo_coef).min(0.95);
+            let ff = tilted_flux_factor(beam.s_u, n_u, cos_inc, t) * transm;
+            *ffo = ff;
+            *ilo = (ff / beam.s_u).clamp(0.0, 1.0);
         }
-        let cover = eff_cloud.clamp(0.0, 1.0); // cloud_water normalized to 1 mm PW
-        let transm = 1.0 - (cover * cloud_albedo_coef).min(0.95);
-        let ff = tilted_flux_factor(beam.s_u, n_u, cos_inc, t) * transm;
-        flux_factor[i] = ff;
-        illumination[i] = (ff / beam.s_u).clamp(0.0, 1.0);
-    }
+    });
 }
 
 /// Day-of-year sampling stride for
@@ -478,6 +486,15 @@ pub fn compute_illumination_cached(
 /// sweep by the unit test below). Mirrors the sweep in
 /// `tests/diag_illumination_budget.rs`.
 const TERRAIN_INSOLATION_SAMPLE_STRIDE_DAYS: u16 = 7;
+
+/// The sampling stride of the annual sweep, for the climate sweep of
+/// `climatology::terrain_climate`, which walks the same days and hours so
+/// its terrain factor comes out bit for bit the same as
+/// [`terrain_annual_mean_insolation_factor`]'s.
+#[must_use]
+pub(crate) fn terrain_insolation_sample_stride_days() -> u16 {
+    TERRAIN_INSOLATION_SAMPLE_STRIDE_DAYS
+}
 
 /// Annual mean ratio `flux_factor / s_u` (dimensionless) the REAL
 /// terrain lets through, against the flat horizontal beam `s_u`: the

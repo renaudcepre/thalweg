@@ -121,21 +121,17 @@ fn water_cascades_through_two_lakes_to_outflow() {
 #[test]
 fn lake_cascade_conserves_mass() {
     let mut sim = build_sim();
-    let total_before: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    // `water_budget_total`: the engine's own budget, never re-assembled
+    // here (anti-pattern 2). It reads the moist upper layer on
+    // its coarse reference stock, not on the fine views (coarse upper
+    // layer, step 2).
+    let total_before = sim.water_budget_total();
 
     for _ in 0..100 {
         sim.step();
     }
 
-    let total_after: f32 = sim
-        .grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.groundwater + c.snow_level)
-        .sum();
+    let total_after = sim.water_budget_total();
 
     let drift = (total_after - total_before).abs() / total_before.max(1.0);
     assert!(

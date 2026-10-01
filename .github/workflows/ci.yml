@@ -28,6 +28,18 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # `.cargo/config.toml` builds native binaries with `target-cpu=native`.
+    # Under `rust-cache` that is a trap: the cached artifacts (proc-macros
+    # among them, which run INSIDE rustc) were compiled for the CPU of the
+    # runner that filled the cache, and the next run lands on any runner of
+    # the pool. 2026-10-01, PR #162: `clippy-driver` died in SIGILL two
+    # seconds into `Checking hexsim-core`, cache restored from a run on a
+    # different machine. An empty `RUSTFLAGS` overrides the config's
+    # target flags (cargo: env wins over `target.*.rustflags`), so CI
+    # builds portable code; `rust-cache` keys on this variable too, so the
+    # cache rotates with it. Local builds keep their native perf.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 

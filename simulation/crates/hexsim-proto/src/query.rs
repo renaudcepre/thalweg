@@ -71,8 +71,13 @@ pub fn climate(sim: &Simulation) -> Value {
 }
 
 /// Build identity (version, git hash, date) + grid constants.
+///
+/// `radius`/`cell_count` (#L6, reset-with-radius) let the front re-sync on
+/// the current world size after a reset, instead of caching the boot-time
+/// value: the front re-queries `meta` right after sending a `reset`.
 #[must_use]
 pub fn meta(sim: &Simulation, build: &BuildInfo) -> Value {
+    let grid = sim.grid();
     json!({
         "type": "meta",
         "tick": sim.tick(),
@@ -80,6 +85,8 @@ pub fn meta(sim: &Simulation, build: &BuildInfo) -> Value {
         "build_hash": build.hash,
         "build_unix": build.unix,
         "cell_spacing_m": CELL_SPACING_M,
+        "radius": grid.radius(),
+        "cell_count": grid.len(),
     })
 }
 
@@ -138,7 +145,10 @@ pub fn cell_detail(sim: &Simulation, coord: HexCoord) -> Value {
     let wind = idx
         .and_then(|i| sim.wind_field().get(i).copied())
         .unwrap_or_default();
-    let precip = idx.and_then(|i| sim.last_precipitation().get(i));
+    // This hour-tick's flux, not the daily accumulator: must agree with
+    // `Simulation::snapshot()` (fix/rain-regime), otherwise a cell query
+    // and the overlay disagree on whether it's raining.
+    let precip = idx.and_then(|i| sim.precip_this_tick().get(i));
     let (rain, snow) = precip.map_or((0.0, 0.0), |p| (p.rain, p.snow));
     let is_raining = rain > 1e-4 || snow > 1e-4;
 
@@ -177,8 +187,11 @@ pub fn cell_detail(sim: &Simulation, coord: HexCoord) -> Value {
         "humidity_upper": cell.humidity_upper,
         "humidity_surface": cell.humidity_surface,
         "groundwater": cell.groundwater,
+        "aquifer": cell.aquifer,
         "snow_level": cell.snow_level,
+        "ice_level": cell.ice_level,
         "permeability": cell.permeability,
+        "lithology": cell.lithology,
         "outflow_flux": outflow_flux,
         "flow_vec": {"x": flow_vec_x, "y": flow_vec_y},
         "is_raining": is_raining,
@@ -201,7 +214,9 @@ pub fn region_detail(sim: &Simulation, center: HexCoord, radius: i32) -> Value {
     let grid = sim.grid();
     let discharge_map = sim.discharge_map();
     let wind_field = sim.wind_field();
-    let precip_map = sim.last_precipitation();
+    // This hour-tick's flux, not the daily accumulator: must agree with
+    // `Simulation::snapshot()` (fix/rain-regime).
+    let precip_map = sim.precip_this_tick();
 
     let mut cells: Vec<Value> = grid
         .iter()
@@ -222,7 +237,9 @@ pub fn region_detail(sim: &Simulation, center: HexCoord, radius: i32) -> Value {
                 "cloud_water": props.cloud_water,
                 "humidity_upper": props.humidity_upper,
                 "groundwater": props.groundwater,
+                "aquifer": props.aquifer,
                 "snow_level": props.snow_level,
+                "ice_level": props.ice_level,
                 "discharge": discharge,
                 "is_raining": is_raining,
                 "wind_x": wind.x,
@@ -293,6 +310,21 @@ mod tests {
             .expect("champ wind.humidity_advection_rate");
         assert!((rate - 1.25).abs() < 1e-6);
         assert_eq!(val["fire"]["enabled"], Value::Bool(true));
+    }
+
+    /// #L6: `meta` must report the current `radius`/`cell_count`, not a
+    /// boot-time constant, so the front can re-sync after a `reset` with a
+    /// different radius. `tiny_sim` is radius 2 (`3*2*3+1 = 19` cells).
+    #[test]
+    fn meta_reports_the_current_radius_and_cell_count() {
+        let build = BuildInfo {
+            version: "0.0.0-test",
+            hash: "testhash",
+            unix: 0,
+        };
+        let val = meta(&tiny_sim(), &build);
+        assert_eq!(val["radius"], 2);
+        assert_eq!(val["cell_count"], 19);
     }
 
     /// A coordinate outside the grid responds `found: false` instead of

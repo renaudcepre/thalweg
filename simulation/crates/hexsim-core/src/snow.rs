@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::climate::DayRecord;
 use crate::grid::HexGrid;
 use crate::groundwater::DEFAULT_MAX_CAPACITY_MM;
+use crate::par::for_each_chunk_mut;
 use crate::temperature::{
     ATMO_IR_BACK_CLEAR, ATMO_IR_BACK_CLOUDY_BOOST, SECONDS_PER_HOUR, STEFAN_BOLTZMANN,
     cloud_cover_fraction,
@@ -179,7 +180,15 @@ impl Default for SnowParams {
 //
 // Freeze (transition to SI, finalized by Phase 3 of #60): when the
 // temperature drops below the threshold, a fraction of water_level
-// freezes into snow_level, at a rate proportional to the gap to 0 °C.
+// freezes, at the rate the surface can release latent heat. Destination:
+// the free surplus of a water body (above `water_capacity`) becomes
+// `ice_level` (lake ice), the rest (soil water) becomes `snow_level`. The
+// lake keeps its identity through the winter
+// (`CellProperties::water_body_surplus`); before the split (2026-09-05)
+// a frozen lake read as land and vegetation colonized it within weeks.
+// Melt and sublimation draw from both stocks, snowpack first
+// (`CellProperties::take_frozen`); lake ice melts under the snow albedo,
+// an approximation (bare ice 0.3-0.5) left for a later pass.
 //
 // Melt (#60 Phase 1): SI energy balance on the surface of the snowpack.
 //
@@ -211,14 +220,7 @@ pub fn step_snow(
     params: &SnowParams,
     forcing: &SnowForcing,
 ) {
-    let n = current.len();
     let cur_cells = current.cells_slice();
-
-    // Copy current → next via indexed slice (1 memcpy instead of N HashMap
-    // lookups). Freeze/melt is purely local: read from `current`, write to
-    // the local cell in `next`, so a pure index loop (#62/#65, mirrors
-    // `step_groundwater`).
-    next.cells_slice_mut().clone_from_slice(cur_cells);
 
     // Balance terms independent of the cell, precomputed.
     let q_ir_emitted = params.snow_emissivity * STEFAN_BOLTZMANN * SNOW_MELT_SURFACE_KELVIN.powi(4);
@@ -227,115 +229,161 @@ pub fn step_snow(
         AIR_DENSITY_KG_PER_M3 * AIR_SPECIFIC_HEAT_J_PER_KG_K * params.sensible_exchange_coef;
     let beam_to_incident = forcing.beam_w_m2 / (1.0 - forcing.ground_albedo).max(1e-6);
 
-    let next_cells = next.cells_slice_mut();
-    for i in 0..n {
-        let cell = &cur_cells[i];
-        let nc = &mut next_cells[i];
+    // Freeze/melt reads only `cur_cells[i]` and forcing slices at the same
+    // index `i`, writes only `next_cells[i]`: a pure per-cell map,
+    // parallelizable (`par::for_each_chunk_mut`). Folds the historical
+    // `current → next` full-grid copy into this same sweep (r250 perf
+    // effort, chunk B2): this is the phase's first (and only) per-cell
+    // pass, so starting each cell from `*cell` before applying the
+    // freeze/melt deltas is bit-identical to the separate copy, one
+    // fewer 88-byte full-grid stream per tick.
+    for_each_chunk_mut(next.cells_slice_mut(), |start, chunk| {
+        for (local, nc) in chunk.iter_mut().enumerate() {
+            let i = start + local;
+            let cell = &cur_cells[i];
+            *nc = cell.clone();
 
-        if cell.temperature < params.freeze_threshold && cell.water_level > 0.0 {
-            // Freeze under the energy balance (#60 Phase 3): freezing only
-            // advances if the surface (water/ice interface at 0 °C)
-            // RELEASES energy; the latent heat freed must leave toward the
-            // atmosphere.
-            //   freeze [mm/tick] = min(−Q_net, Q_Stefan)⁺ × Δt / Lf
-            // Q_Stefan = k_ice·(0 − T_air)/h_ice: once a layer of ice has
-            // formed, conduction through it limits freezing; a deep lake
-            // freezes at the surface then SLOWER AND SLOWER (Stefan's law,
-            // growth in √t). Replaces the old arbitrary cap
-            // `max_freeze_per_tick` with self-limiting physics.
-            let t_air = cell.temperature;
-            let ff = forcing.flux_factor.get(i).copied().unwrap_or(0.0);
-            let q_solar = beam_to_incident * ff * (1.0 - WATER_ALBEDO);
-            let cover = cloud_cover_fraction(cell.cloud_water);
-            let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
-            let wind_ms = wind_magnitude_to_meters_per_second(
-                forcing.wind_mag.get(i).copied().unwrap_or(0.0),
-            )
-            .0 + params.free_convection_wind_ms;
-            let q_sensible = sensible_coef * wind_ms * t_air; // T_air < 0 → refroidit
-            let q_net = q_solar + q_ir_down - q_ir_emitted_water + q_sensible;
+            if cell.temperature < params.freeze_threshold && cell.water_level > 0.0 {
+                // Freeze under the energy balance (#60 Phase 3): freezing only
+                // advances if the surface (water/ice interface at 0 °C)
+                // RELEASES energy; the latent heat freed must leave toward the
+                // atmosphere.
+                //   freeze [mm/tick] = min(−Q_net, Q_Stefan)⁺ × Δt / Lf
+                // Q_Stefan = k_ice·(0 − T_air)/h_ice: once a layer of ice has
+                // formed, conduction through it limits freezing; a deep lake
+                // freezes at the surface then SLOWER AND SLOWER (Stefan's law,
+                // growth in √t). Replaces the old arbitrary cap
+                // `max_freeze_per_tick` with self-limiting physics.
+                let t_air = cell.temperature;
+                let ff = forcing.flux_factor.get(i).copied().unwrap_or(0.0);
+                let q_solar = beam_to_incident * ff * (1.0 - WATER_ALBEDO);
+                let cover = cloud_cover_fraction(cell.cloud_water);
+                let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
+                let wind_ms = wind_magnitude_to_meters_per_second(
+                    forcing.wind_mag.get(i).copied().unwrap_or(0.0),
+                )
+                .0 + params.free_convection_wind_ms;
+                let q_sensible = sensible_coef * wind_ms * t_air; // T_air < 0 → refroidit
+                let q_net = q_solar + q_ir_down - q_ir_emitted_water + q_sensible;
 
-            // The local frozen stock proxies the ice layer thickness
-            // (mm of water equivalent → m of ice via ρ_ice). Below 1 mm,
-            // the film doesn't yet conduct measurable resistance.
-            let h_ice_m = (cell.snow_level / 1000.0) * (1000.0 / ICE_DENSITY_KG_PER_M3);
-            let q_stefan = if h_ice_m > 1e-3 {
-                ICE_THERMAL_CONDUCTIVITY_W_PER_M_K * (params.freeze_threshold - t_air) / h_ice_m
-            } else {
-                f32::INFINITY
-            };
+                // The local frozen stock proxies the ice layer thickness
+                // (mm of water equivalent → m of ice via ρ_ice). Below 1 mm,
+                // the film doesn't yet conduct measurable resistance.
+                let h_ice_m = (cell.frozen_surface() / 1000.0) * (1000.0 / ICE_DENSITY_KG_PER_M3);
+                let q_stefan = if h_ice_m > 1e-3 {
+                    ICE_THERMAL_CONDUCTIVITY_W_PER_M_K * (params.freeze_threshold - t_air) / h_ice_m
+                } else {
+                    f32::INFINITY
+                };
 
-            let evacuation = (-q_net).max(0.0).min(q_stefan);
-            let amount =
-                (evacuation * SECONDS_PER_HOUR / LATENT_HEAT_FUSION_J_PER_KG).min(cell.water_level);
-            // Transfer bounded to what the snow stock can REPRESENT in
-            // f32: a freeze amount smaller than the stock's ULP
-            // (`snow + amount == snow`) would debit the water without
-            // ever crediting the snow, a biased destruction measured at
-            // −0.35 over 10 years (7x the historical noise of the strict
-            // conservation test) before this guard.
-            // We credit first, then debit EXACTLY what landed.
-            let landed = (nc.snow_level + amount) - nc.snow_level;
-            if landed > 0.0 {
-                nc.snow_level += landed;
-                nc.water_level = (nc.water_level - landed).max(0.0);
+                let evacuation = (-q_net).max(0.0).min(q_stefan);
+                let mut amount = (evacuation * SECONDS_PER_HOUR / LATENT_HEAT_FUSION_J_PER_KG)
+                    .min(cell.water_level);
+                // A water body freezes from its free surface: the soil water
+                // under a lake stays liquid (insulated by the ice and the
+                // water column), so the freeze is capped at the liquid
+                // surplus. Land keeps freezing its soil water into the
+                // snowpack. Without the cap, a pond shallower than the
+                // soil's capacity froze its soil too, `water_level` hit 0,
+                // the retention bucket read as empty, the ice slab as
+                // "within capacity", and the pond turned into land under
+                // its own ice (193 of 43 561 cells, r120 seed 42, January).
+                let surplus = (cell.water_level - cell.water_capacity).max(0.0);
+                if cell.is_open_water() {
+                    amount = amount.min(surplus);
+                }
+                // Transfer bounded to what the snow stock can REPRESENT in
+                // f32: a freeze amount smaller than the stock's ULP
+                // (`snow + amount == snow`) would debit the water without
+                // ever crediting the snow, a biased destruction measured at
+                // −0.35 over 10 years (7x the historical noise of the strict
+                // conservation test) before this guard.
+                // We credit first, then debit EXACTLY what landed.
+                // Destination: the free surface freezes first, so the part
+                // of `amount` drawn from the surplus above capacity is lake
+                // ice, the remainder (soil water, land only) is snowpack.
+                // Each credit is measured in its own stock's ULP (guard
+                // above).
+                let ice_part = amount.min(surplus);
+                let landed_ice = (nc.ice_level + ice_part) - nc.ice_level;
+                let landed_snow = (nc.snow_level + (amount - ice_part)) - nc.snow_level;
+                let landed = landed_ice + landed_snow;
+                if landed > 0.0 {
+                    nc.ice_level += landed_ice;
+                    nc.snow_level += landed_snow;
+                    nc.water_level = (nc.water_level - landed).max(0.0);
+                }
+            } else if cell.temperature > params.freeze_threshold && cell.frozen_surface() > 0.0 {
+                let t_air = cell.temperature;
+
+                // SI energy balance of melt (cf. module doc), for ANY stock;
+                // Phase 4 #60: no more threshold-based glacial regime, a
+                // glacier is just a place where the annual balance
+                // accumulates. A melting pack is WET, so melt albedo (0.60,
+                // USACE), strictly more absorbing than the dry snow of the
+                // temperature balance: it's this drop that bounds the
+                // ice-albedo instability (measured: without it, drift
+                // +26/+41%/year).
+                let ff = forcing.flux_factor.get(i).copied().unwrap_or(0.0);
+                let q_solar = beam_to_incident * ff * (1.0 - params.snow_albedo_melt);
+                let cover = cloud_cover_fraction(cell.cloud_water);
+                let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
+                let wind_ms = wind_magnitude_to_meters_per_second(
+                    forcing.wind_mag.get(i).copied().unwrap_or(0.0),
+                )
+                .0 + params.free_convection_wind_ms;
+                let q_sensible = sensible_coef * wind_ms * t_air;
+                let rain_mm = forcing.rain_last_tick.get(i).map_or(0.0, |r| r.rain);
+                let q_rain = WATER_SPECIFIC_HEAT_J_PER_KG_K * rain_mm * t_air / SECONDS_PER_HOUR;
+
+                let q_net = q_solar + q_ir_down - q_ir_emitted + q_sensible + q_rain;
+                let amount = (q_net.max(0.0) * SECONDS_PER_HOUR / LATENT_HEAT_FUSION_J_PER_KG)
+                    .min(cell.frozen_surface());
+                // Exact transfer (mirrors the guard in the freeze branch): we
+                // distribute what ACTUALLY left the frozen stocks; on a
+                // glacier several metres thick the f32 ULP is coarse (~0.5 mm
+                // at 4 m), debiting `amount` but crediting the computed
+                // `amount` created a measurable bias on the strict
+                // conservation test. Snowpack first (it lies on the ice),
+                // then lake ice (`CellProperties::take_frozen`).
+                let departed = nc.take_frozen(amount);
+                // Melt split: a fraction percolates directly into the water
+                // table (soil under the snowpack), the rest runs off at the
+                // surface. Bounded by the local water table capacity
+                // (perm × max_capacity); the surplus stays on the surface.
+                // Melt happens at `temperature > 0` so the soil isn't frozen:
+                // percolation is legitimate. Conservative.
+                // (The old "glacier" exclusion followed the binary threshold
+                // removed in Phase 4; the capacity bound is enough: mountain
+                // water tables, being small, saturate fast and the rest runs
+                // off.)
+                let gw_capacity = cell.permeability * forcing.gw_max_capacity;
+                let gw_headroom = (gw_capacity - cell.groundwater).max(0.0);
+                let to_gw = (params.melt_recharge_frac * departed).min(gw_headroom);
+                nc.groundwater += to_gw;
+                nc.water_level += departed - to_gw;
             }
-        } else if cell.temperature > params.freeze_threshold && cell.snow_level > 0.0 {
-            let t_air = cell.temperature;
-
-            // SI energy balance of melt (cf. module doc), for ANY stock;
-            // Phase 4 #60: no more threshold-based glacial regime, a
-            // glacier is just a place where the annual balance
-            // accumulates. A melting pack is WET, so melt albedo (0.60,
-            // USACE), strictly more absorbing than the dry snow of the
-            // temperature balance: it's this drop that bounds the
-            // ice-albedo instability (measured: without it, drift
-            // +26/+41%/year).
-            let ff = forcing.flux_factor.get(i).copied().unwrap_or(0.0);
-            let q_solar = beam_to_incident * ff * (1.0 - params.snow_albedo_melt);
-            let cover = cloud_cover_fraction(cell.cloud_water);
-            let q_ir_down = ATMO_IR_BACK_CLEAR + cover * ATMO_IR_BACK_CLOUDY_BOOST;
-            let wind_ms = wind_magnitude_to_meters_per_second(
-                forcing.wind_mag.get(i).copied().unwrap_or(0.0),
-            )
-            .0 + params.free_convection_wind_ms;
-            let q_sensible = sensible_coef * wind_ms * t_air;
-            let rain_mm = forcing.rain_last_tick.get(i).map_or(0.0, |r| r.rain);
-            let q_rain = WATER_SPECIFIC_HEAT_J_PER_KG_K * rain_mm * t_air / SECONDS_PER_HOUR;
-
-            let q_net = q_solar + q_ir_down - q_ir_emitted + q_sensible + q_rain;
-            let amount = (q_net.max(0.0) * SECONDS_PER_HOUR / LATENT_HEAT_FUSION_J_PER_KG)
-                .min(cell.snow_level);
-            // Exact transfer (mirrors the guard in the freeze branch): we
-            // distribute what ACTUALLY left the snow stock; on a glacier
-            // several metres thick the f32 ULP is coarse (~0.5 mm at
-            // 4 m), debiting `amount` but crediting the computed `amount`
-            // created a measurable bias on the strict conservation test.
-            let new_snow = nc.snow_level - amount;
-            let departed = nc.snow_level - new_snow;
-            nc.snow_level = new_snow;
-            // Melt split: a fraction percolates directly into the water
-            // table (soil under the snowpack), the rest runs off at the
-            // surface. Bounded by the local water table capacity
-            // (perm × max_capacity); the surplus stays on the surface.
-            // Melt happens at `temperature > 0` so the soil isn't frozen:
-            // percolation is legitimate. Conservative.
-            // (The old "glacier" exclusion followed the binary threshold
-            // removed in Phase 4; the capacity bound is enough: mountain
-            // water tables, being small, saturate fast and the rest runs
-            // off.)
-            let gw_capacity = cell.permeability * forcing.gw_max_capacity;
-            let gw_headroom = (gw_capacity - cell.groundwater).max(0.0);
-            let to_gw = (params.melt_recharge_frac * departed).min(gw_headroom);
-            nc.groundwater += to_gw;
-            nc.water_level += departed - to_gw;
         }
-    }
+    });
 }
 
 #[must_use]
 pub fn total_snow(grid: &HexGrid) -> f32 {
     grid.iter().map(|(_, cell)| cell.snow_level).sum()
+}
+
+/// Lake / river ice over the whole grid (mm w.e. summed over cells).
+#[must_use]
+pub fn total_ice(grid: &HexGrid) -> f32 {
+    grid.iter().map(|(_, cell)| cell.ice_level).sum()
+}
+
+/// Snowpack + lake ice: every frozen stock on the surface. The quantity
+/// the glacier drift contract (#56) tracks, and the one that joins the
+/// liquid stocks in a water budget.
+#[must_use]
+pub fn total_frozen(grid: &HexGrid) -> f32 {
+    grid.iter().map(|(_, cell)| cell.frozen_surface()).sum()
 }
 
 #[cfg(test)]
@@ -345,7 +393,7 @@ mod tests {
     use crate::hydro::total_water;
 
     fn total_water_and_snow(grid: &HexGrid) -> f32 {
-        total_water(grid) + total_snow(grid)
+        total_water(grid) + total_frozen(grid)
     }
 
     /// "Sunny noon" forcing: full sun (beam equivalent to summer noon,
@@ -363,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn freezing_moves_water_to_snow() {
+    fn freezing_moves_water_to_the_frozen_surface() {
         let mut grid = HexGrid::from_radius(1);
         for coord in grid.coords().copied().collect::<Vec<_>>() {
             if let Some(cell) = grid.get_mut(coord) {
@@ -382,7 +430,195 @@ mod tests {
 
         let center = next.get(HexCoord::new(0, 0)).unwrap();
         assert!(center.water_level < 5.0, "Water should decrease");
-        assert!(center.snow_level > 0.0, "Snow should appear");
+        assert!(
+            center.frozen_surface() > 0.0,
+            "A frozen stock should appear"
+        );
+    }
+
+    /// The surplus above capacity is a water body: it freezes into lake ice,
+    /// not into the snowpack (5 mm on a 1 mm capacity, one calm night at
+    /// −5 °C takes well under the 4 mm of surplus).
+    #[test]
+    fn lake_surplus_freezes_into_ice_not_snow() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
+        cell.water_capacity = 1.0;
+        cell.water_level = 5.0;
+        cell.temperature = -5.0;
+
+        let mut next = grid.clone();
+        step_snow(
+            &grid,
+            &mut next,
+            &SnowParams::default(),
+            &SnowForcing::night_calm(),
+        );
+
+        let c = next.get(HexCoord::new(0, 0)).unwrap();
+        assert!(
+            c.ice_level > 0.0,
+            "lake surplus must become ice, ice={}",
+            c.ice_level
+        );
+        assert!(
+            c.snow_level.abs() < 1e-6,
+            "no snowpack from a lake surplus, snow={}",
+            c.snow_level
+        );
+        assert!(
+            ((5.0 - c.water_level) - c.ice_level).abs() < 1e-5,
+            "exact transfer"
+        );
+    }
+
+    /// Water held under capacity is soil moisture: it freezes into the
+    /// snowpack, never into lake ice.
+    #[test]
+    fn soil_water_freezes_into_snow_not_ice() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
+        cell.water_capacity = 5.0;
+        cell.water_level = 2.0;
+        cell.temperature = -5.0;
+
+        let mut next = grid.clone();
+        step_snow(
+            &grid,
+            &mut next,
+            &SnowParams::default(),
+            &SnowForcing::night_calm(),
+        );
+
+        let c = next.get(HexCoord::new(0, 0)).unwrap();
+        assert!(
+            c.snow_level > 0.0,
+            "soil water must become snowpack, snow={}",
+            c.snow_level
+        );
+        assert!(
+            c.ice_level.abs() < 1e-6,
+            "no lake ice without a surplus, ice={}",
+            c.ice_level
+        );
+    }
+
+    /// A lake freezes from its surface only: once the free surplus is ice,
+    /// the soil water under it stays liquid, however cold the night. Without
+    /// this, a pond shallower than the soil capacity turned into land under
+    /// its own ice (see `step_snow`).
+    #[test]
+    fn lake_stops_freezing_at_its_free_surplus() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
+        cell.water_capacity = 50.0;
+        cell.water_level = 60.0; // 10 mm pond over 50 mm of soil retention
+        cell.temperature = -20.0;
+        let mut next = grid.clone();
+        for _ in 0..(30 * 24) {
+            step_snow(
+                &grid,
+                &mut next,
+                &SnowParams::default(),
+                &SnowForcing::night_calm(),
+            );
+            std::mem::swap(&mut grid, &mut next);
+        }
+        let c = grid.get(HexCoord::new(0, 0)).unwrap();
+        assert!(
+            (c.ice_level - 10.0).abs() < 1e-3,
+            "the whole pond is ice: {}",
+            c.ice_level
+        );
+        assert!(
+            (c.water_level - 50.0).abs() < 1e-3,
+            "soil water stays liquid: {}",
+            c.water_level
+        );
+        assert!(
+            c.snow_level.abs() < 1e-6,
+            "no soil frost under a lake: {}",
+            c.snow_level
+        );
+        assert!(c.is_open_water(), "and the pond is still a water body");
+    }
+
+    /// Land with a puddle under the open-water threshold: the puddle
+    /// freezes into ice, then the soil water into snow, the water debit
+    /// equals both credits.
+    #[test]
+    fn freeze_across_capacity_splits_ice_then_snow() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
+        cell.water_capacity = 1.0;
+        cell.water_level = 1.2; // 0.2 mm of surplus, far below one night of freeze
+        cell.temperature = -10.0;
+
+        let mut next = grid.clone();
+        step_snow(
+            &grid,
+            &mut next,
+            &SnowParams::default(),
+            &SnowForcing::night_calm(),
+        );
+
+        let c = next.get(HexCoord::new(0, 0)).unwrap();
+        assert!(
+            (c.ice_level - 0.2).abs() < 1e-5,
+            "ice = the whole surplus, got {}",
+            c.ice_level
+        );
+        assert!(
+            c.snow_level > 0.0,
+            "the rest comes from soil water, snow={}",
+            c.snow_level
+        );
+        let debit = 1.2 - c.water_level;
+        assert!(
+            (debit - (c.ice_level + c.snow_level)).abs() < 1e-5,
+            "conservation"
+        );
+    }
+
+    /// Melt draws from the snowpack first (it lies on the ice), then from
+    /// the lake ice, and the melted ice returns to the liquid stocks.
+    #[test]
+    fn melt_takes_the_snowpack_before_the_lake_ice() {
+        let mut grid = HexGrid::from_radius(0);
+        let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
+        cell.water_capacity = 1.0;
+        cell.water_level = 1.0;
+        cell.snow_level = 0.05; // a dusting, less than one sunny hour of melt
+        cell.ice_level = 20.0;
+        cell.temperature = 15.0;
+        cell.permeability = 0.0;
+        let before = cell.water_level + cell.frozen_surface() + cell.groundwater;
+
+        let ff = vec![1.0; grid.len()];
+        let mut next = grid.clone();
+        step_snow(&grid, &mut next, &SnowParams::default(), &sunny_noon(&ff));
+
+        let c = next.get(HexCoord::new(0, 0)).unwrap();
+        assert!(
+            c.snow_level.abs() < 1e-6,
+            "dusting gone first, snow={}",
+            c.snow_level
+        );
+        assert!(
+            c.ice_level < 20.0,
+            "then the ice melts, ice={}",
+            c.ice_level
+        );
+        assert!(
+            c.water_level > 1.0,
+            "melted ice is liquid again, water={}",
+            c.water_level
+        );
+        let after = c.water_level + c.frozen_surface() + c.groundwater;
+        assert!(
+            (before - after).abs() < 1e-4,
+            "conservation {before} → {after}"
+        );
     }
 
     #[test]
@@ -720,7 +956,7 @@ mod tests {
         let mut grid = HexGrid::from_radius(0);
         let cell = grid.get_mut(HexCoord::new(0, 0)).unwrap();
         cell.water_level = 100.0;
-        cell.snow_level = ice_mm;
+        cell.ice_level = ice_mm;
         cell.temperature = temperature;
         cell.cloud_water = 0.0;
         grid

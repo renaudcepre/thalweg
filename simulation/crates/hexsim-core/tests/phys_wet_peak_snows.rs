@@ -49,7 +49,17 @@ fn build_scene() -> Simulation {
     Simulation::new(
         grid,
         HydroParams::default(),
-        AtmosphereParams::default(),
+        // #63/#146: this isolates ONE link (condensation -> solid precip)
+        // with the sky pre-saturated as a controlled boundary condition,
+        // "independent of transport / evaporation / uplift concerns" per
+        // the module doc above. The imposed weather regime is exactly
+        // such a concern: its dry episodes export the pre-filled
+        // `humidity_upper` to the sky reservoir mid-run, so the shipped
+        // default (on since 2026-09-06) must be pinned off here.
+        AtmosphereParams {
+            regime_enabled: 0.0,
+            ..AtmosphereParams::default()
+        },
         GroundwaterParams::default(),
         SnowParams::default(),
         TemperatureParams::default(),

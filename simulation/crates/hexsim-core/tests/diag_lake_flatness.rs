@@ -36,7 +36,7 @@ fn build(seed: u32, radius: i32) -> Simulation {
         &TerrainParams {
             seed,
             initial_water: d.initial_water * 40.0,
-            initial_groundwater: d.initial_groundwater * 40.0,
+            initial_groundwater_frac: (d.initial_groundwater_frac * 40.0).min(1.0),
             ..d
         },
     );

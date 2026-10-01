@@ -67,7 +67,7 @@ fn build_river_sim(accel_years_per_day: f32) -> Simulation {
         HydroParams::default(),
         atmo,
         GroundwaterParams {
-            infiltration_rate: 0.0,
+            saturated_conductivity_mm_per_day: 0.0,
             ..GroundwaterParams::default()
         },
         SnowParams::default(),

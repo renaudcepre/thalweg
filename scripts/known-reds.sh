@@ -22,7 +22,10 @@ EXPECTED="${2:?expected red count}"
 cd "$(dirname "$0")/../simulation" || exit 1
 
 echo "▸ tracked reds: $EXPECTED test(s) must fail"
-OUT=$(cargo nextest run --profile heavy --no-fail-fast -E "$FILTER" 2>&1)
+# `--color never`: nextest emits ANSI escapes even off a TTY here, and
+# they land inside the summary line, where the counter regexes below
+# then match nothing (#159).
+OUT=$(cargo nextest run --color never --profile heavy --no-fail-fast -E "$FILTER" 2>&1)
 
 SUMMARY=$(printf '%s\n' "$OUT" | grep -E "[0-9]+ tests? run:" | tail -1)
 if [ -z "$SUMMARY" ]; then
@@ -58,4 +61,4 @@ if [ "$FAILED" != "$EXPECTED" ]; then
     exit 1
 fi
 
-echo "✓ the $EXPECTED tracked reds still fail (#111, #146), debt unchanged"
+echo "✓ the $EXPECTED tracked reds still fail (#64), debt unchanged"

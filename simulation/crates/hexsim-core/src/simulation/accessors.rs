@@ -4,7 +4,9 @@
 //! orchestration (`new`/`step`/`step_hour`) so it doesn't drown it.
 
 use super::{FireStats, Simulation};
-use crate::atmosphere::{AtmosphereParams, PrecipitationMap};
+use crate::atmosphere::{
+    AtmosphereParams, MoistCoarseMode, MoistCoarseState, PrecipitationMap, moist_coarse_radius,
+};
 use crate::climate::ClimateHistory;
 use crate::climate_normals::CellClimateNormals;
 use crate::diagnostics::{Diagnostics, compute_diagnostics};
@@ -18,6 +20,7 @@ use crate::lake::LakeParams;
 use crate::phase_timing::PhaseTimings;
 use crate::snapshot::GridState;
 use crate::snow::SnowParams;
+use crate::synoptic_mesh::SynopticMesh;
 use crate::temperature::TemperatureParams;
 use crate::time;
 use crate::vegetation::VegetationParams;
@@ -31,6 +34,14 @@ impl Simulation {
         // rearranging on every rainy day (#106 point 2). `flow_vec` stays
         // the instantaneous slice, no EMA exists for this field, out of
         // scope for #106 (it drives neither river nor lake in the render).
+        // Precipitation is `scratch_precip_tick` (this hour's flux, zeroed
+        // and refilled by `step_atmosphere_into` every tick), NOT
+        // `last_precipitation` (the midnight-to-now daily accumulator):
+        // the wire's `rain_amount`/`snow_amount`/`is_raining` are read by
+        // the front as an hourly intensity (fix/rain-regime, stock/flux
+        // confusion, anti-pattern #3). `last_precipitation` stays
+        // the source for `diagnostics()`, bench metrics, climate normals and
+        // `record_tick`, which do want the daily total.
         let mut state = self.current.snapshot(
             time::ticks_to_days(self.hour_tick),
             self.hour_tick,
@@ -40,7 +51,7 @@ impl Simulation {
                 edge_flux: &self.edge_flux_ema,
             },
             &self.wind_field,
-            &self.last_precipitation,
+            &self.scratch_precip_tick,
         );
         // Synoptic fields (Phase 2): filled here, not in `grid.snapshot`, the
         // synoptic state lives in the sim, the grid doesn't know about the
@@ -64,6 +75,12 @@ impl Simulation {
         for (cell, &illum) in state.cells.iter_mut().zip(self.scratch_illumination.iter()) {
             cell.illumination = illum;
         }
+        // Imposed weather regime (#63), header only: one scalar and one
+        // flag for the whole map, filled here for the same reason as the
+        // synoptic fields (the state lives in the sim). The front reads
+        // them as-is; it must not try to derive the phase from the rain.
+        state.total_sky_water = self.atmo_state.regime.sky_water_mm;
+        state.weather_regime_wet = self.atmo_state.regime.wet;
         state
     }
 
@@ -81,6 +98,12 @@ impl Simulation {
         // `Simulation` (same pattern as `updraft_field`/`scratch_atmo.convergence`).
         // No recomputation here (anti-pattern #2).
         diag.evap_observer = self.scratch_atmo.evap;
+        // Sky reservoir of the imposed weather regime (#63): lives in the
+        // simulation, not in the grid, so `compute_diagnostics` cannot see
+        // it. Folded into the total here rather than left beside it — a
+        // budget that omits it reads as a leak the moment the regime runs.
+        diag.water_budget.sky = self.atmo_state.regime.sky_water_mm;
+        diag.water_budget.total += diag.water_budget.sky;
         diag.synoptic = Some(
             self.synoptic_state
                 .stats(&self.synoptic_params, self.synoptic_enabled),
@@ -133,9 +156,36 @@ impl Simulation {
         self.climate_normals.has_normals()
     }
 
+    /// Daily precipitation accumulator: sum of rain/snow since the last
+    /// midnight (`hour_of_day == 0`), reset there. Consumed by bench
+    /// metrics, climate normals and `record_tick`. For "this hour's flux"
+    /// (what `snapshot()` puts on the wire), use
+    /// [`precip_this_tick`](Self::precip_this_tick) instead.
     #[must_use]
     pub fn last_precipitation(&self) -> &PrecipitationMap {
         &self.last_precipitation
+    }
+
+    /// Vapour emitted by each cell since the last midnight, by source
+    /// (open water, transpiration, sublimation; mm), indexed like
+    /// `grid().cells_slice()`. Read right after [`step`](Self::step) it
+    /// holds the full day, the evaporation side of
+    /// [`last_precipitation`](Self::last_precipitation). The exact masses
+    /// `step_evaporation` moved, never recomputed.
+    #[must_use]
+    pub fn vapor_sources_today(&self) -> &[crate::atmosphere::VaporSources] {
+        &self.vapor_today
+    }
+
+    /// This hour-tick's precipitation flux (mm rain/snow fallen in the
+    /// last `step_hour`), zeroed and refilled by `step_atmosphere_into`
+    /// every tick. The map `snapshot()` puts on the wire
+    /// (`CellSnapshot::rain_amount`/`snow_amount`/`is_raining`); use this
+    /// accessor wherever a query wants to agree with the overlay instead
+    /// of reading the daily accumulator (fix/rain-regime).
+    #[must_use]
+    pub fn precip_this_tick(&self) -> &PrecipitationMap {
+        &self.scratch_precip_tick
     }
 
     #[must_use]
@@ -266,6 +316,178 @@ impl Simulation {
     #[must_use]
     pub fn upper_air_mean_t(&self) -> f32 {
         self.upper_air_mean_t
+    }
+
+    /// Water currently held outside the box by the imposed weather regime
+    /// (#63), in the same millimetres as the per-cell stocks: add it to
+    /// any water budget or the terrarium looks like it is leaking. Always
+    /// 0 while the regime is disabled — no longer the shipped default
+    /// since 2026-09-06 (#63/#146: a freshly generated world defaults to
+    /// `regime_enabled = 1.0`), but still what a checkpoint or params file
+    /// predating the mechanism loads as.
+    #[must_use]
+    pub fn sky_water_total(&self) -> f32 {
+        self.atmo_state.regime.sky_water_mm
+    }
+
+    /// The moist upper layer's whole stock (mm summed over fine cells):
+    /// `Σ_c N_c·(humidity_upper_c + cloud_water_c)` on the coarse torus.
+    ///
+    /// **This, not the sum of the fine `humidity_upper`/`cloud_water`, is
+    /// the water the upper layer holds.** On both modes this is an exact
+    /// mean gather of the fine fields, so the two agree with the fine
+    /// sum — but one accessor, on every mode, is what keeps a budget from
+    /// being assembled two ways (anti-pattern 2). On `Fine` the
+    /// mesh is the identity and this is the fine sum, bit for bit.
+    #[must_use]
+    pub fn upper_water_total(&self) -> f32 {
+        self.moist_coarse.water_total(&self.moist_mesh)
+    }
+
+    /// The terrarium's whole water stock (mm summed over fine cells): the
+    /// surface stocks of every cell, plus the upper layer's reference
+    /// stock ([`Self::upper_water_total`]), plus the sky reservoir of the
+    /// imposed weather regime ([`Self::sky_water_total`]).
+    ///
+    /// The single source of truth for "is the box closed": what
+    /// `bench_metrics`'s `water_drift_pct` and the strict conservation
+    /// tests read, so a budget can never be assembled two different ways
+    /// in two places (anti-pattern 2). `humidity_surface` is a
+    /// fine stock and is counted per cell; `humidity_upper` and
+    /// `cloud_water` are counted through the coarse mirror instead — see
+    /// [`Self::upper_water_total`].
+    #[must_use]
+    pub fn water_budget_total(&self) -> f32 {
+        let surface: f32 = self
+            .current
+            .iter()
+            .map(|(_, c)| {
+                c.water_level + c.humidity_surface + c.groundwater + c.aquifer + c.frozen_surface()
+            })
+            .sum();
+        surface + self.upper_water_total() + self.sky_water_total()
+    }
+
+    /// Which moist-layer mode this world runs (`atmosphere::coarse`).
+    /// Resolved at construction from `HEXSIM_MOIST_COARSE`, or forced by
+    /// [`set_moist_coarse_mode`](Self::set_moist_coarse_mode).
+    #[must_use]
+    pub fn moist_coarse_mode(&self) -> MoistCoarseMode {
+        self.moist_coarse_mode
+    }
+
+    /// Is the moist upper layer on its coarse mode, i.e. does the ~1 km
+    /// torus own the precipitation? Shorthand for
+    /// [`moist_coarse_mode`](Self::moist_coarse_mode).
+    #[must_use]
+    pub fn moist_coarse_path(&self) -> bool {
+        self.moist_coarse_mode.precipitates_coarse()
+    }
+
+    /// Forces the moist upper layer onto one of its two modes
+    /// ([`MoistCoarseMode`]), rebuilding the mesh at the matching radius
+    /// and re-deriving the coarse mirror from the current grid (a mean).
+    /// The fine fields are never touched: on both modes they ARE the
+    /// state.
+    ///
+    /// Test and diagnostic seam, same role as
+    /// [`set_uniform_wind`](Self::set_uniform_wind):
+    /// `Ablation::effective()` is a process-wide `OnceLock`, so a test
+    /// cannot pick the mode through the environment, and both modes have
+    /// to stay exercised by the suite whatever the compiled default
+    /// (coarse since 2026-09-30, see `atmosphere::coarse`'s
+    /// `MOIST_COARSE_DEFAULT`; the fine path is the ablation value and the
+    /// bit-for-bit reference). Like the
+    /// uniform wind, the forced value is not carried by the checkpoint: a
+    /// blob saved after this call records the process's ablation config,
+    /// not the forced mode.
+    ///
+    /// Call it right after construction. Mid-run it is well defined — the
+    /// mirror is re-derived from the grid — but the hour it lands in has
+    /// half its passes on one mode and half on the other.
+    pub fn set_moist_coarse_mode(&mut self, mode: MoistCoarseMode) {
+        let rc = if mode.precipitates_coarse() {
+            moist_coarse_radius(self.current.radius())
+        } else {
+            self.current.radius()
+        };
+        self.moist_mesh = SynopticMesh::with_coarse_radius(&self.current, rc);
+        self.moist_coarse = MoistCoarseState::new(self.moist_mesh.coarse_len());
+        self.moist_coarse
+            .gather_from_fine(&self.moist_mesh, &self.current);
+        self.moist_coarse_mode = mode;
+    }
+
+    /// The moist mesh's fine-to-coarse partition (`SynopticMesh::
+    /// fine_to_coarse`): index `i` is the coarse-cell index of
+    /// `self.grid().coords_slice()[i]`. Identity-shaped (every fine cell
+    /// its own coarse cell) on the `Fine` mode's identity mesh.
+    ///
+    /// Test/diagnostic seam, same role as
+    /// [`set_moist_coarse_mode`](Self::set_moist_coarse_mode): a black-box
+    /// test that wants to predict the coarse precipitation footprint has
+    /// to derive it from this partition on its own, independently of
+    /// `atmosphere::coarse`'s internal decision — reading the decision
+    /// back instead would make the test unable to catch a bug in that
+    /// decision itself, which is exactly what shipped in
+    /// `CoarseFootprint::of` until the fix documented on its doc
+    /// (2026-09-07, `phys_rain_footprint_is_a_disc`).
+    #[must_use]
+    pub fn moist_mesh_fine_to_coarse(&self) -> &[usize] {
+        self.moist_mesh.fine_to_coarse()
+    }
+
+    /// The moist mesh's own coarse radius (`Rc`,
+    /// `SynopticMesh::grid().radius()`). Same test seam as
+    /// [`moist_mesh_fine_to_coarse`](Self::moist_mesh_fine_to_coarse).
+    #[must_use]
+    pub fn moist_mesh_coarse_radius(&self) -> i32 {
+        self.moist_mesh.grid().radius()
+    }
+
+    /// Records every fine column's signed vapour ↔ droplet transfer, so
+    /// [`cloud_transfer`](Self::cloud_transfer) can be read back after
+    /// each `step_hour`. Diagnostic seam, same role as
+    /// [`set_uniform_wind`](Self::set_uniform_wind): the recording costs
+    /// one f32 store per cell per hour and ships off, so an instrument
+    /// asks for it explicitly rather than every world paying for it.
+    pub fn set_cloud_transfer_probe(&mut self, on: bool) {
+        self.cloud_transfer_probe = on;
+    }
+
+    /// The signed vapour ↔ droplet transfer (mm) of each fine column
+    /// during the last `step_hour`: `> 0` condensation, `< 0` the
+    /// saturation adjustment giving droplets back to vapour. Indexed like
+    /// the grid.
+    ///
+    /// Empty, or stale, unless
+    /// [`set_cloud_transfer_probe`](Self::set_cloud_transfer_probe) is on
+    /// — see `AtmoScratch::cloud_transfer`.
+    #[must_use]
+    pub fn cloud_transfer(&self) -> &[f32] {
+        &self.scratch_atmo.cloud_transfer
+    }
+
+    /// `true` while the imposed weather regime (#63) is in its wet phase
+    /// (the sky is giving its water back). Always `false` while the
+    /// regime is disabled.
+    #[must_use]
+    pub fn weather_regime_is_wet(&self) -> bool {
+        self.atmo_state.regime.wet
+    }
+
+    /// Forces the weather regime's state: the phase, and how much water
+    /// the sky already holds (mm, map total).
+    ///
+    /// Test and diagnostic seam, same role as
+    /// [`set_uniform_wind`](Self::set_uniform_wind): a phenomenon driven
+    /// by a seeded chain cannot be observed on 72 hours unless the phase
+    /// can be pinned. The daily draw still runs and will move the phase
+    /// on the next midnight, so a test either stays inside a day or
+    /// re-forces it; the value is not a lock.
+    pub fn set_weather_regime(&mut self, wet: bool, sky_water_mm: f32) {
+        self.atmo_state.regime.wet = wet;
+        self.atmo_state.regime.sky_water_mm = sky_water_mm;
     }
 
     #[must_use]
@@ -415,6 +637,15 @@ mod tests {
     #[test]
     fn snapshot_flux_uses_ema_not_daily_tranche() {
         let mut sim = sim_with_terrain(6, 42);
+        // #63/#146: this checks that the snapshot follows the discharge
+        // EMA rather than the instantaneous map, not the weather regime.
+        // With the regime on (the shipped default since 2026-09-06) a dry
+        // spell can land inside these 3 days and starve `discharge_map` to
+        // ~0 while the 60-day EMA still carries the warm-up flow, which
+        // flips the "EMA damped vs raw" assertion below for the wrong
+        // reason. A stationary atmosphere is the controlled background
+        // this accessor test needs.
+        sim.update_param("atmosphere.regime_enabled", 0.0);
         for _ in 0..(3 * 24) {
             sim.step_hour();
         }
@@ -450,9 +681,12 @@ mod tests {
 
     #[test]
     fn water_budget_equals_sum_of_components() {
-        // `water_budget.total` must be exactly the sum of the 4 stocks.
+        // `water_budget.total` must be exactly the sum of its stocks.
         // If this test fails, a new reservoir was added without updating
-        // `compute_diagnostics`.
+        // `compute_diagnostics`. `sky` (#63/#146) belongs in the sum on
+        // purpose: the regime is on by default now, so leaving it out
+        // would make this pass trivially instead of exercising the
+        // reservoir that was the very reason the field was added.
         let mut sim = sim_with_terrain(3, 42);
         for _ in 0..10 {
             sim.step();
@@ -461,10 +695,13 @@ mod tests {
         let sum = diag.water_budget.surface
             + diag.water_budget.humidity
             + diag.water_budget.groundwater
-            + diag.water_budget.snow;
+            + diag.water_budget.aquifer
+            + diag.water_budget.snow
+            + diag.water_budget.ice
+            + diag.water_budget.sky;
         assert!(
             (diag.water_budget.total - sum).abs() < 1e-3,
-            "total={} != surface+humidity+gw+snow={}",
+            "total={} != surface+humidity+gw+snow+ice={}",
             diag.water_budget.total,
             sum
         );

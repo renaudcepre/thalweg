@@ -12,6 +12,19 @@ pub const DIRECTIONS: [HexCoord; 6] = [
     HexCoord { q: 0, r: 1 },
 ];
 
+/// Index of the direction opposite `dir` in [`DIRECTIONS`]. The six
+/// directions are ordered by successive 60° rotation, so the opposite of
+/// `dir` is three steps further round (180°). Load-bearing identity for
+/// the atmosphere's scatter → gather split (r250 perf effort): on the
+/// toric lattice, if `j` is the neighbor of `i` in direction `dir`
+/// (`HexGrid::neighbor_indices_toric(i)[dir] == j`), then `i` is the
+/// neighbor of `j` in direction `opposite_direction(dir)` — pinned by
+/// `grid::tests::gather_identity_matches_scatter_direction`.
+#[must_use]
+pub const fn opposite_direction(dir: usize) -> usize {
+    (dir + 3) % 6
+}
+
 /// Unit vector in world coordinates for the hex direction at the given index.
 /// Indices correspond to `DIRECTIONS[0..6]`.
 #[must_use]
@@ -113,6 +126,23 @@ mod tests {
         let origin = HexCoord::new(0, 0);
         let expected: Vec<HexCoord> = DIRECTIONS.to_vec();
         assert_eq!(origin.neighbors().to_vec(), expected);
+    }
+
+    #[test]
+    fn opposite_direction_is_an_involution_three_steps_round() {
+        for dir in 0..6 {
+            let opp = opposite_direction(dir);
+            assert_eq!(
+                opp,
+                (dir + 3) % 6,
+                "dir {dir}: opposite must be 3 steps round"
+            );
+            assert_eq!(
+                opposite_direction(opp),
+                dir,
+                "opposite must be its own inverse"
+            );
+        }
     }
 
     #[test]

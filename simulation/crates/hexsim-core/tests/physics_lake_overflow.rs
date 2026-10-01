@@ -137,11 +137,16 @@ fn lake_system_conserves_mass() {
     );
 }
 
+/// The terrarium's whole water stock: `Simulation::water_budget_total`,
+/// read and never re-assembled here (anti-pattern 2). It counts
+/// the surface stocks per cell, the moist upper layer through its coarse
+/// REFERENCE stock (coarse upper layer, step 2: the fine `humidity_upper`/
+/// `cloud_water` are views rewritten by a non-conservative interpolation
+/// every hour, so summing them is not the mass) and the sky reservoir of
+/// the imposed weather regime (#63), which left the cells but not the
+/// world.
 fn grid_water_budget(sim: &Simulation) -> f32 {
-    sim.grid()
-        .iter()
-        .map(|(_, c)| c.water_level + c.humidity_total() + c.snow_level + c.groundwater)
-        .sum()
+    sim.water_budget_total()
 }
 
 #[test]
