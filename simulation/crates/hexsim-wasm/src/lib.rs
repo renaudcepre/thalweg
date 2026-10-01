@@ -113,9 +113,18 @@ pub struct HexSim {
     world: World,
 }
 
+/// Day of year a browser world is born on: 79 = March 21st, the spring
+/// equinox (day 0 = January 1st, 365-day year).
+const WASM_START_DAY: u16 = 79;
+
 #[wasm_bindgen]
 impl HexSim {
     /// Generates a fresh world. `radius` 45 ≈ 6200 cells, 120 ≈ 43000.
+    ///
+    /// Born on [`WASM_START_DAY`], the spring equinox, not January 1st: a
+    /// page opens on greening slopes and thawing heights rather than on
+    /// mid-winter. The initial state is computed for that day
+    /// (`TerrainParams::start_day`), and a `reset` keeps it.
     ///
     /// Installs the panic hook along the way: without it, a panic in the
     /// wasm shows up in JS as a `RuntimeError: unreachable` with no stack.
@@ -125,6 +134,7 @@ impl HexSim {
         console_error_panic_hook::set_once();
         let terrain = TerrainParams {
             seed,
+            start_day: WASM_START_DAY,
             ..TerrainParams::default()
         };
         Self {

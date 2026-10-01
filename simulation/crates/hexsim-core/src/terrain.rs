@@ -29,6 +29,13 @@ use crate::vegetation::VegetationParams;
 #[derive(Clone)]
 pub struct TerrainParams {
     pub seed: u32,
+    /// Day of the year (0 = January 1st, < 365) the world is born on.
+    /// Drives the climatological t0 (`climatology::terrain_climate`): the
+    /// temperature field of that day's sampled balance and the frost run
+    /// the snowpack accumulated through before it. The simulation clock
+    /// starts there too (`Simulation::set_start_day`, called by the world
+    /// owner right after `Simulation::new`). 0 is the historical start.
+    pub start_day: u16,
     pub elevation_scale: f32,
     /// The climate the world is generated for (#152): the climatological
     /// initial state (January temperature field, snow above the frost
@@ -172,6 +179,7 @@ impl Default for TerrainParams {
     fn default() -> Self {
         Self {
             seed: 42,
+            start_day: 0,
             // Recalibrated 2000 → 2400 with the move to toroidal (4D)
             // terrain. The embedding samples the continent's fundamental
             // octave on a small circle (diameter 2ρf ≈ 0.23 noise cell at
@@ -566,7 +574,7 @@ fn smoothstep(x: f32) -> f32 {
 
 /// Generates a world: the relief and its static properties
 /// (`sample_relief`), then the climatological state the relief carries
-/// on the morning of January 1st ([`seed_initial_state`]).
+/// on its start day, January 1st by default ([`seed_initial_state`]).
 pub fn generate_terrain(grid: &mut HexGrid, params: &TerrainParams) {
     sample_relief(grid, params);
     seed_initial_state(grid, params);
@@ -615,7 +623,8 @@ fn sample_relief(grid: &mut HexGrid, params: &TerrainParams) {
 /// again on a changed relief (a DEM override) rebuilds a consistent t0.
 /// Order matters: the water table and the lakes first, since the climate
 /// sweep reads the stocks (open-water cooling, root water), then snow and
-/// vegetation from that climate, then the January temperature field.
+/// vegetation from that climate, then the temperature field of the start
+/// day (`params.start_day`, January 1st by default).
 ///
 /// `Simulation::new` reruns the same climate sweep on the grid it
 /// receives to prime its climate normals, and gets the same normals: same
@@ -634,7 +643,7 @@ pub fn seed_initial_state(grid: &mut HexGrid, params: &TerrainParams) {
         cell.cloud_water = 0.0;
         cell.sediment_load = 0.0;
     }
-    let climate = climatology::terrain_climate(grid, params.temperature.clone());
+    let climate = climatology::terrain_climate(grid, params.temperature.clone(), params.start_day);
     climatology::seed_snowpack(grid, &climate, params.snowfall_mm_per_day);
     climatology::seed_vegetation(
         grid,
@@ -646,7 +655,7 @@ pub fn seed_initial_state(grid: &mut HexGrid, params: &TerrainParams) {
     for (cell, &t) in grid
         .cells_slice_mut()
         .iter_mut()
-        .zip(climate.temperature_day0.iter())
+        .zip(climate.temperature_t0.iter())
     {
         cell.temperature = t;
     }

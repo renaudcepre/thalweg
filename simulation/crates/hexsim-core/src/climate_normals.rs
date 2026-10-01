@@ -219,6 +219,23 @@ impl ClimateNormalsAccumulator {
         self.finalized_once = true;
     }
 
+    /// Number of ticks the current year's accumulators hold (the first
+    /// cell's count, all cells record together; 0 without cells).
+    #[must_use]
+    pub fn recorded_ticks(&self) -> u32 {
+        self.acc.first().map_or(0, |a| a.count)
+    }
+
+    /// Drops the partial year being accumulated and keeps the current
+    /// normals: a world born mid-year reaches its first rollover with less
+    /// than a year recorded, a warm- or cold-biased mean that must not
+    /// replace the analytic normals it was primed with.
+    pub fn discard_year(&mut self) {
+        for a in &mut self.acc {
+            *a = CellAccum::new();
+        }
+    }
+
     /// Normals for the last complete year (indexed like `cells_slice`).
     /// Default values until at least one year has completed.
     #[must_use]
@@ -365,5 +382,40 @@ mod tests {
         acc.finalize_year();
 
         assert!((acc.normals()[0].t_mean - 0.0).abs() < 1e-4, "year 2 cold");
+    }
+
+    #[test]
+    fn recorded_ticks_counts_the_year_in_progress() {
+        assert_eq!(ClimateNormalsAccumulator::new(0).recorded_ticks(), 0);
+        let mut acc = ClimateNormalsAccumulator::new(1);
+        assert_eq!(acc.recorded_ticks(), 0);
+        for _ in 0..7 {
+            acc.record_tick(&one_cell(5.0, 0.0, 0.0, 0.0), &[1.0_f32], 0.0);
+        }
+        assert_eq!(acc.recorded_ticks(), 7);
+        acc.finalize_year();
+        assert_eq!(acc.recorded_ticks(), 0);
+    }
+
+    #[test]
+    fn discard_year_resets_the_accumulators_and_keeps_the_normals() {
+        let primed = CellClimateNormals {
+            t_mean: 9.0,
+            ..CellClimateNormals::default()
+        };
+        let mut acc = ClimateNormalsAccumulator::primed(vec![primed]);
+        for _ in 0..10 {
+            acc.record_tick(&one_cell(30.0, 0.0, 0.0, 0.0), &[1.0_f32], 0.0);
+        }
+        acc.discard_year();
+        assert_eq!(acc.recorded_ticks(), 0);
+        assert!(acc.has_normals());
+        assert_eq!(acc.normals()[0], primed);
+        // The next year starts clean: only its own ticks count.
+        for _ in 0..10 {
+            acc.record_tick(&one_cell(0.0, 0.0, 0.0, 0.0), &[1.0_f32], 0.0);
+        }
+        acc.finalize_year();
+        assert!(acc.normals()[0].t_mean.abs() < 1e-4);
     }
 }

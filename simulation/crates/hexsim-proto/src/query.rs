@@ -75,6 +75,7 @@ pub fn climate(sim: &Simulation) -> Value {
 /// `radius`/`cell_count` (#L6, reset-with-radius) let the front re-sync on
 /// the current world size after a reset, instead of caching the boot-time
 /// value: the front re-queries `meta` right after sending a `reset`.
+/// `seed` likewise, so an embed host can show the world it is looking at.
 #[must_use]
 pub fn meta(sim: &Simulation, build: &BuildInfo) -> Value {
     let grid = sim.grid();
@@ -87,6 +88,7 @@ pub fn meta(sim: &Simulation, build: &BuildInfo) -> Value {
         "cell_spacing_m": CELL_SPACING_M,
         "radius": grid.radius(),
         "cell_count": grid.len(),
+        "seed": sim.seed(),
     })
 }
 
@@ -325,6 +327,7 @@ mod tests {
         let val = meta(&tiny_sim(), &build);
         assert_eq!(val["radius"], 2);
         assert_eq!(val["cell_count"], 19);
+        assert!(val["seed"].is_u64(), "meta carries the world seed");
     }
 
     /// A coordinate outside the grid responds `found: false` instead of

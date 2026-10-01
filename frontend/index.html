@@ -123,6 +123,12 @@
         export: function () { return call("export"); },
         load: function (data) { return call("load", data); },
 
+        // Regenerates a fresh world. `opts.radius` (5-300) and `opts.seed`
+        // (u32) are optional: absent keeps the current one. Resolves once
+        // the engine has rebuilt it, rejects on an out-of-range value
+        // without touching the current world.
+        reset: function (opts) { return call("reset", opts || {}); },
+
         // Returns an unsubscribe function.
         on: function (event, cb) {
           var l = listeners[event];

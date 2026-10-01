@@ -68,10 +68,29 @@ therefore never stale.
 - `view`: the background actually displayed
 - `layers`: the ids of the overlays turned on, `["clouds"]` at start
 - `inspect`: whether the cell inspector is active (`false` at start in embed)
+- `radius`, `seed`: the world currently simulated, as the engine reports
+  it (since v0.15.0). `null` until the engine has answered once.
 
 The last five fields state **what is applied**, never what was requested.
 A button bar painted from `tick` stays correct even when a command is
 refused (and it will be: an unknown id changes nothing).
+
+### `reset({ radius, seed })`
+
+Since v0.15.0. Regenerates a fresh world, both fields optional (absent
+keeps the current value): `radius` an integer in **5-300**, `seed` a u32.
+Resolves once the engine has rebuilt the world and the next `tick`
+carries the new `radius` and `seed`. An out-of-range value **rejects**
+with a `RangeError` and leaves the current world untouched.
+
+The cost grows with the cell count, `3r² + 3r + 1`: radius 5 is 91 cells,
+45 is 6 211 (~3 ms per simulated hour in wasm), 70 is 14 911 and already
+lags on a recent laptop. A host offering a size slider should cap it
+accordingly. Like the boot world, a reset world is born on the spring
+equinox and advanced to noon before it plays.
+
+A reset world replaces the current one entirely: a host that stores the
+world should consider the stored one obsolete.
 
 ### `speed(hoursPerSecond)`
 
@@ -274,12 +293,15 @@ where a `play()` passed through the queue was lost (#143).
 
 ### The starting world
 
-**Since v0.14.0, an embed starts on a fresh world, radius 70** (~14 900
-cells, seed 42, or a random seed under `chrome=minimal`). A fresh world is
-no longer a bare board: it opens on its climatological state, lakes in the
-hollows, snow on the heights, forests seeded at equilibrium with trees of
-every age. Nothing is downloaded besides the engine, and the first `tick`
-is the world's real state.
+**An embed starts on a fresh world, radius 5** (91 cells, seed 42, or a
+random seed under `chrome=minimal`), born on **March 21st**, the spring
+equinox, at noon. Radius 5 since v0.15.0: v0.14.0 opened at 70 and lagged
+even on a recent laptop, the host now lets the visitor choose the size
+with `reset()`. A fresh world is no longer a bare board: it opens on the
+climatological state of its start day, lakes in the hollows, snow above
+the frost line, forests seeded at equilibrium with trees of every age.
+Nothing is downloaded besides the engine, and the first `tick` is the
+world's real state.
 
 Up to v0.13.0 the embed loaded `worlds/aged.ckptz`, a 42-year world at
 radius 45 written by engine v0.10.0. The file is still in the archive and
@@ -321,8 +343,8 @@ already had.
 ### Scope
 
 `play`, `pause`, `speed`, `view`, `layer`, `views`, `layers`, `export`, `load`,
-`ready`, `tick`, and nothing else. `step()` and `reset()` will come if
-they're needed. A contract between two repos holds over time.
+`reset`, `ready`, `tick`, and nothing else. `step()` will come if it's
+needed. A contract between two repos holds over time.
 
 What HexSim won't do for you: decide when to export, under what key to
 store it, when to discard it. The host knows when its page closes, HexSim

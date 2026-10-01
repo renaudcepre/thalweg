@@ -572,6 +572,12 @@ impl Simulation {
         self.seed = seed;
     }
 
+    /// The world seed set by [`Self::set_seed`].
+    #[must_use]
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
     /// Replaces the fire parameters (preserved on reset, like the others).
     pub fn set_fire_params(&mut self, params: FireParams) {
         self.fire_params = params;

@@ -248,6 +248,39 @@ api.foreignBufferRejected = rejection.message;
 api.tickAfterReject = rejection.tickAfter;
 api.worldIntactAfterReject = rejection.tickAfter >= rejection.tickBefore;
 
+// --- reset({ radius, seed }) (v0.15.0) ----------------------------------------
+// WASM only: in WS mode a reset would regenerate the dev server's world under
+// whoever is watching it. A reset world is born on the spring equinox, so its
+// date reads March.
+if (WASM_MODE) {
+  Object.assign(api, await page.evaluate(async () => {
+    const sim = window.__hexsim;
+    const last = () => {
+      let seen = null;
+      sim.on("tick", (d) => { seen = d; })();
+      return seen;
+    };
+    const bootRadius = last().radius;
+    await sim.reset({ radius: 6, seed: 7 });
+    await new Promise((r) => setTimeout(r, 1500));
+    const after = last();
+    let resetRejected = null;
+    try {
+      await sim.reset({ radius: 4 });
+    } catch (e) {
+      resetRejected = String(e?.message ?? e);
+    }
+    return {
+      bootRadius,
+      resetRadius: after.radius,
+      resetSeed: after.seed,
+      resetDate: after.date,
+      resetRejected,
+      radiusAfterRejected: last().radius,
+    };
+  }));
+}
+
 // --- The API seen from a REAL host page --------------------------------------
 //
 // Everything above tests the embed page by calling it from itself. That is
@@ -367,6 +400,15 @@ if (!api.exportBytes) failures.push("`export` returns an empty buffer");
 if (!api.bufferSurvivesLoad) failures.push("`load` detached the caller's buffer");
 if (!api.foreignBufferRejected) failures.push("a foreign buffer was accepted by `load`");
 if (!api.worldIntactAfterReject) failures.push("the world did not survive a rejected `load`");
+if (WASM_MODE) {
+  if (!EXPECT_AGED && api.bootRadius !== 5) failures.push(`boot world radius ${api.bootRadius}, expected 5`);
+  if (api.resetRadius !== 6 || api.resetSeed !== 7) {
+    failures.push(`reset({radius: 6, seed: 7}) gave radius ${api.resetRadius}, seed ${api.resetSeed}`);
+  }
+  if (!/Mar/.test(api.resetDate ?? "")) failures.push(`a reset world reads "${api.resetDate}", not March`);
+  if (!api.resetRejected) failures.push("reset({radius: 4}) was accepted");
+  if (api.radiusAfterRejected !== 6) failures.push("a rejected reset changed the world");
+}
 const insp = api.inspector;
 if (insp.hoverOff) failures.push("the tooltip shows in embed while the inspector is off");
 if (insp.clipWritesOff) failures.push(`${insp.clipWritesOff} write(s) to the host clipboard, inspector off`);

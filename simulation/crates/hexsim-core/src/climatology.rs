@@ -9,7 +9,8 @@
 //! shipped a 42-year checkpoint to get out of it.
 //!
 //! This module poses, once, at generation, the state a world of this relief
-//! would have on the morning of January 1st under the engine's own climate.
+//! would have on its start day (January 1st by default) under the
+//! engine's own climate.
 //! Nothing here is a new stock and nothing is painted by the tick: it is an
 //! initial condition, deterministic by seed, that the phenomena then take
 //! over. Every rule is the engine's own physics evaluated at its
@@ -33,7 +34,7 @@
 //!   `1/(LIN + SENS)` of the balance to three digits, and the sustained
 //!   extremes sit 14-17 K from the mean, where the clear-sky balance puts
 //!   them;
-//! - **snowpack**: the snowfall of the frost weeks before January 1st;
+//! - **snowpack**: the snowfall of the frost weeks before the start day;
 //! - **vegetation**: each stratum seeded at the logistic equilibrium cover
 //!   its best species reaches under those normals, shared in proportion to
 //!   suitability, the light coupling evaluated top-down; canopy ages drawn
@@ -422,12 +423,18 @@ pub fn fill_basins_with_runoff(grid: &mut HexGrid, basins: &ReliefBasins, sheet_
 // Climate: the sampled-year balance on the real relief
 // ====================================================================
 
-/// Number of sampled days kept per cell for the frost count: the second
-/// half of the year, from day 182 to the last sample before January 1st.
+/// Longest frost run counted, in samples: half a year, from day 182 to the
+/// last sample before January 1st (what the frost run of a January 1st
+/// start walks back through).
 fn autumn_sample_count() -> usize {
     let stride = usize::from(terrain_insolation_sample_stride_days());
     let first_kept = 182_usize.div_ceil(stride) * stride;
     (365 - first_kept).div_ceil(stride)
+}
+
+/// Number of sampled days of a year (`0, stride, 2·stride, …` below 365).
+fn samples_per_year() -> usize {
+    365_usize.div_ceil(usize::from(terrain_insolation_sample_stride_days()))
 }
 
 /// What the climate sweep hands back: the calibrated temperature
@@ -443,12 +450,14 @@ pub struct TerrainClimate {
     pub cache: IllumCache,
     /// Analytic climate normals, indexed like `cells_slice()`.
     pub normals: Vec<CellClimateNormals>,
-    /// Expected daily-mean temperature (°C) on January 1st, the t0 field.
-    pub temperature_day0: Vec<f32>,
-    /// Number of consecutive sampled days before January 1st whose
-    /// expected temperature sits below 0 °C: the frost run the snowpack
-    /// accumulated through.
-    pub frost_samples_before_day0: Vec<u16>,
+    /// Expected daily-mean temperature (°C) on the start day, the t0
+    /// field (the last sampled day at or before it).
+    pub temperature_t0: Vec<f32>,
+    /// Number of consecutive sampled days before the start day whose
+    /// expected temperature sits below 0 °C (walking back cyclically,
+    /// capped at half a year): the frost run the snowpack accumulated
+    /// through.
+    pub frost_samples_before_t0: Vec<u16>,
 }
 
 /// Per-cell running statistics of the sampled year.
@@ -529,7 +538,7 @@ impl DayBalance {
 
 /// The sampled-year sweep: one illumination pass per daylight hour of
 /// every sampled day, reduced per cell into [`SeasonAccum`], the autumn
-/// temperatures (frost run) and the January 1st field, plus the sums the
+/// temperatures of every sample (frost run) and the start-day field, plus the sums the
 /// terrain insolation factor is the ratio of.
 struct ClimateSweep<'a> {
     grid: &'a HexGrid,
@@ -537,9 +546,12 @@ struct ClimateSweep<'a> {
     params: &'a TemperatureParams,
     balance: DayBalance,
     accum: Vec<SeasonAccum>,
-    autumn_t: Vec<f32>,
-    autumn_slot: usize,
-    temperature_day0: Vec<f32>,
+    /// Cloudy-sky temperature of every sample, `slot * n + cell`.
+    sample_t: Vec<f32>,
+    slot: usize,
+    /// Day of the sample the t0 field is read from.
+    t0_day: u16,
+    temperature_t0: Vec<f32>,
     daily: Vec<f32>,
     flux_factor: Vec<f32>,
     illumination: Vec<f32>,
@@ -549,7 +561,13 @@ struct ClimateSweep<'a> {
 }
 
 impl<'a> ClimateSweep<'a> {
-    fn new(grid: &'a HexGrid, cache: &'a IllumCache, params: &'a TemperatureParams) -> Self {
+    fn new(
+        grid: &'a HexGrid,
+        cache: &'a IllumCache,
+        params: &'a TemperatureParams,
+        start_day: u16,
+    ) -> Self {
+        let stride = terrain_insolation_sample_stride_days();
         let cells = grid.cells_slice();
         let n = cells.len();
         Self {
@@ -565,9 +583,10 @@ impl<'a> ClimateSweep<'a> {
                     insolation_sum: 0.0,
                 })
                 .collect(),
-            autumn_t: vec![0.0; n * autumn_sample_count()],
-            autumn_slot: 0,
-            temperature_day0: vec![0.0; n],
+            sample_t: vec![0.0; n * samples_per_year()],
+            slot: 0,
+            t0_day: (start_day / stride) * stride,
+            temperature_t0: vec![0.0; n],
             daily: vec![0.0; n],
             flux_factor: Vec::with_capacity(n),
             illumination: Vec::with_capacity(n),
@@ -627,7 +646,6 @@ impl<'a> ClimateSweep<'a> {
         let b = &self.balance;
         let t_bar_cloud = b.map_mean(mean_flux * b.solar_cloud_factor, b.longwave_cloud);
         let t_bar_clear = b.map_mean(mean_flux, b.longwave_clear);
-        let autumn = day >= 182;
         for (i, acc) in self.accum.iter_mut().enumerate() {
             let z = cells[i].elevation;
             let shortwave_cloud = self.daily[i] * b.solar_cloud_factor;
@@ -637,21 +655,17 @@ impl<'a> ClimateSweep<'a> {
             acc.t_clear_min = acc.t_clear_min.min(t_clear);
             acc.t_clear_max = acc.t_clear_max.max(t_clear);
             acc.insolation_sum += f64::from(shortwave_cloud);
-            if day == 0 {
-                self.temperature_day0[i] = t_cloud;
+            if day == self.t0_day {
+                self.temperature_t0[i] = t_cloud;
             }
-            if autumn {
-                self.autumn_t[self.autumn_slot * n + i] = t_cloud;
-            }
+            self.sample_t[self.slot * n + i] = t_cloud;
         }
-        if autumn {
-            self.autumn_slot += 1;
-        }
+        self.slot += 1;
     }
 
     /// Reduces the sweep: the terrain factor, the offset, the normals.
     fn finish(self, mut params: TemperatureParams, cache: IllumCache) -> TerrainClimate {
-        debug_assert_eq!(self.autumn_slot, autumn_sample_count());
+        debug_assert_eq!(self.slot, samples_per_year());
         let cells = self.grid.cells_slice();
         let n = cells.len();
         #[expect(clippy::cast_possible_truncation)] // a ratio of bounded sums, see the factor's doc
@@ -685,13 +699,16 @@ impl<'a> ClimateSweep<'a> {
                 }
             })
             .collect();
-        let temperature_day0 = self.temperature_day0.iter().map(|t| t + offset).collect();
-        let autumn_len = autumn_sample_count();
-        let frost_samples_before_day0 = (0..n)
+        let temperature_t0 = self.temperature_t0.iter().map(|t| t + offset).collect();
+        let samples = samples_per_year();
+        let t0_slot = usize::from(self.t0_day / terrain_insolation_sample_stride_days());
+        let max_run = autumn_sample_count();
+        let frost_samples_before_t0 = (0..n)
             .map(|i| {
                 let mut frost = 0_u16;
-                for slot in (0..autumn_len).rev() {
-                    if self.autumn_t[slot * n + i] + offset < 0.0 {
+                for back in 1..=max_run {
+                    let slot = (t0_slot + samples - back % samples) % samples;
+                    if self.sample_t[slot * n + i] + offset < 0.0 {
                         frost += 1;
                     } else {
                         break;
@@ -704,8 +721,8 @@ impl<'a> ClimateSweep<'a> {
             params,
             cache,
             normals,
-            temperature_day0,
-            frost_samples_before_day0,
+            temperature_t0,
+            frost_samples_before_t0,
         }
     }
 }
@@ -747,14 +764,22 @@ impl<'a> ClimateSweep<'a> {
 /// evapotranspiration empties an unfed reservoir (measured 2026-10-01, r30
 /// × 3 seeds: the year's minimum is 2-8 % of the mean in every band, below
 /// every positive drought threshold of the species table).
-pub fn terrain_climate(grid: &mut HexGrid, params: TemperatureParams) -> TerrainClimate {
+///
+/// `start_day` (0 = January 1st, < 365) picks the t0 sample (the last
+/// sampled day at or before it) and the end of the frost run; the normals,
+/// factor and cache do not depend on it.
+pub fn terrain_climate(
+    grid: &mut HexGrid,
+    params: TemperatureParams,
+    start_day: u16,
+) -> TerrainClimate {
     compute_surface_normals(grid);
     let mut params = params;
     params.aspect_correction = aspect_insolation_correction(grid, &params);
     let mut cache = IllumCache::new();
     cache.ensure(grid);
     let stride = terrain_insolation_sample_stride_days();
-    let mut sweep = ClimateSweep::new(grid, &cache, &params);
+    let mut sweep = ClimateSweep::new(grid, &cache, &params, start_day);
     let mut day = 0_u16;
     while day < 365 {
         sweep.sample_day(day);
@@ -770,7 +795,7 @@ pub fn terrain_climate(grid: &mut HexGrid, params: TemperatureParams) -> Terrain
 // Seeding: snow, vegetation, temperature
 // ====================================================================
 
-/// Snowpack on January 1st: the snowfall of the consecutive frost samples
+/// Snowpack on the start day: the snowfall of the consecutive frost samples
 /// before it, `frost_samples × stride_days × snowfall_mm_per_day`. Nothing
 /// melts while the expected temperature stays below zero, and nothing
 /// falls as snow before the first frost sample. A cell whose January is
@@ -780,7 +805,7 @@ pub fn seed_snowpack(grid: &mut HexGrid, climate: &TerrainClimate, snowfall_mm_p
     for (cell, &frost) in grid
         .cells_slice_mut()
         .iter_mut()
-        .zip(climate.frost_samples_before_day0.iter())
+        .zip(climate.frost_samples_before_t0.iter())
     {
         cell.snow_level = f32::from(frost) * stride * snowfall_mm_per_day.max(0.0);
         cell.ice_level = 0.0;
@@ -791,7 +816,7 @@ pub fn seed_snowpack(grid: &mut HexGrid, climate: &TerrainClimate, snowfall_mm_p
 /// the regime's.
 const STAND_AGE_SALT: u64 = 0x5EED_A6E5;
 
-/// Vegetation on January 1st: each stratum, canopy first, is seeded at the
+/// Vegetation on the start day: each stratum, canopy first, is seeded at the
 /// cover the shared logistic equilibrium gives its best species under the
 /// cell's normals and the light the strata above let through,
 ///
@@ -1058,7 +1083,7 @@ mod tests {
             },
         );
         let base = TemperatureParams::default();
-        let climate = terrain_climate(&mut grid, base.clone());
+        let climate = terrain_climate(&mut grid, base.clone(), 0);
         let mut reference = base.clone();
         reference.aspect_correction = aspect_insolation_correction(&grid, &reference);
         let mut cache = IllumCache::new();
@@ -1085,7 +1110,7 @@ mod tests {
     fn analytic_normals_sit_on_the_calibrated_mean_and_bracket_it() {
         let mut grid = HexGrid::from_radius(2);
         let params = TemperatureParams::default();
-        let climate = terrain_climate(&mut grid, params.clone());
+        let climate = terrain_climate(&mut grid, params.clone(), 0);
         let plain = climate.normals[0];
         for n in &climate.normals {
             assert_eq!(n.t_mean.to_bits(), plain.t_mean.to_bits());
@@ -1115,10 +1140,50 @@ mod tests {
             mean_flat * (1.0 - params.cloud_albedo_coef * cloud)
         );
         assert!(
-            climate.temperature_day0[0] < plain.t_mean - 5.0,
+            climate.temperature_t0[0] < plain.t_mean - 5.0,
             "January is colder than the year"
         );
-        assert_eq!(climate.frost_samples_before_day0.len(), grid.len());
+        assert_eq!(climate.frost_samples_before_t0.len(), grid.len());
+    }
+
+    /// The start day moves the t0: a summer-born world is warmer on day
+    /// ~172 than a January one and its frost run is no longer, day 0 is
+    /// deterministic, and the normals do not depend on the start day.
+    #[test]
+    fn start_day_moves_the_t0_field_and_the_frost_run() {
+        let mut jan_grid = HexGrid::from_radius(3);
+        generate_terrain(
+            &mut jan_grid,
+            &TerrainParams {
+                seed: 42,
+                ..TerrainParams::default()
+            },
+        );
+        let mut summer_grid = jan_grid.clone();
+        let mut again_grid = jan_grid.clone();
+        let params = TemperatureParams::default();
+        let jan = terrain_climate(&mut jan_grid, params.clone(), 0);
+        let again = terrain_climate(&mut again_grid, params.clone(), 0);
+        let summer = terrain_climate(&mut summer_grid, params, 172);
+        assert_eq!(jan.temperature_t0, again.temperature_t0);
+        assert_eq!(jan.frost_samples_before_t0, again.frost_samples_before_t0);
+        for (j, s) in jan.temperature_t0.iter().zip(summer.temperature_t0.iter()) {
+            assert!(s > j, "summer t0 {s} not warmer than january {j}");
+        }
+        for (j, s) in jan
+            .frost_samples_before_t0
+            .iter()
+            .zip(summer.frost_samples_before_t0.iter())
+        {
+            assert!(s <= j, "summer frost run {s} longer than january's {j}");
+        }
+        assert!(
+            jan.frost_samples_before_t0.iter().any(|&f| f > 0),
+            "some cell freezes in the weeks before January 1st"
+        );
+        for (j, s) in jan.normals.iter().zip(summer.normals.iter()) {
+            assert_eq!(j.t_mean.to_bits(), s.t_mean.to_bits());
+        }
     }
 
     /// Lapse rate: a flat world raised by 1000 m as a whole runs the lapse
@@ -1132,15 +1197,15 @@ mod tests {
         for c in high.cells_slice_mut() {
             c.elevation = 1000.0;
         }
-        let low_climate = terrain_climate(&mut low, params.clone());
-        let high_climate = terrain_climate(&mut high, params.clone());
+        let low_climate = terrain_climate(&mut low, params.clone(), 0);
+        let high_climate = terrain_climate(&mut high, params.clone(), 0);
         for (l, h) in low_climate.normals.iter().zip(high_climate.normals.iter()) {
             for (a, b) in [(l.t_mean, h.t_mean), (l.t_min, h.t_min), (l.t_max, h.t_max)] {
                 assert!((a - b - params.lapse_rate).abs() < 1e-3, "{a} vs {b}");
             }
         }
         assert!(
-            high_climate.frost_samples_before_day0[0] >= low_climate.frost_samples_before_day0[0],
+            high_climate.frost_samples_before_t0[0] >= low_climate.frost_samples_before_t0[0],
             "the higher world freezes for at least as long"
         );
     }
@@ -1231,8 +1296,8 @@ mod tests {
             params: TemperatureParams::default(),
             cache: IllumCache::new(),
             normals: vec![CellClimateNormals::default(); n],
-            temperature_day0: vec![0.0; n],
-            frost_samples_before_day0: (0..n).map(|i| u16::try_from(i).unwrap()).collect(),
+            temperature_t0: vec![0.0; n],
+            frost_samples_before_t0: (0..n).map(|i| u16::try_from(i).unwrap()).collect(),
         };
         seed_snowpack(&mut grid, &climate, 0.1);
         let stride = f32::from(terrain_insolation_sample_stride_days());

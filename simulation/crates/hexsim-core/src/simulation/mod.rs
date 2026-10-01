@@ -543,6 +543,16 @@ fn build_moist_layer(grid: &HexGrid, mode: MoistCoarseMode) -> (SynopticMesh, Mo
 }
 
 impl Simulation {
+    /// Moves the clock of a fresh world to `day` of the year (0 = January
+    /// 1st, < 365), the day its t0 was generated for
+    /// (`TerrainParams::start_day`). Call once, right after
+    /// [`Simulation::new`], before any step.
+    pub fn set_start_day(&mut self, day: u16) {
+        debug_assert_eq!(self.hour_tick, 0, "the start day is set on a fresh world");
+        debug_assert!(u64::from(day) < time::DAYS_PER_YEAR);
+        self.hour_tick = u64::from(day) * time::TICKS_PER_DAY;
+    }
+
     #[must_use]
     pub fn new(
         mut grid: HexGrid,
@@ -574,7 +584,7 @@ impl Simulation {
             cache: illum_cache,
             normals: initial_normals,
             ..
-        } = terrain_climate(&mut grid, temperature_params);
+        } = terrain_climate(&mut grid, temperature_params, 0);
         // Moist-layer coarse mesh and mirror (coarse upper layer): see
         // `build_moist_layer`'s doc.
         let moist_coarse_mode = Ablation::effective().moist_coarse_mode();
@@ -734,8 +744,19 @@ impl Simulation {
         // Year rollover: freeze the climate normals of the elapsed year (#79).
         // `hour_tick` multiple of TICKS_PER_YEAR = N complete years accumulated.
         // Normals N-1 serve year N (assumed 1-year lag).
+        // A world born mid-year (`set_start_day`) reaches its first rollover
+        // with a partial year recorded: its mean is season-biased, so the
+        // partial year is discarded and the primed normals stay. A world
+        // born on day 0 records exactly TICKS_PER_YEAR ticks (hour_tick
+        // 0..TICKS_PER_YEAR-1, the rollover runs before this tick's
+        // `record_tick`), so it finalizes as it always did.
         if self.hour_tick > 0 && self.hour_tick.is_multiple_of(time::TICKS_PER_YEAR) {
-            self.climate_normals.finalize_year();
+            let full_year = u32::try_from(time::TICKS_PER_YEAR).unwrap_or(u32::MAX);
+            if self.climate_normals.recorded_ticks() < full_year {
+                self.climate_normals.discard_year();
+            } else {
+                self.climate_normals.finalize_year();
+            }
         }
 
         // Illumination per cell (#102): aspect x relief occlusion x cloud shadow,

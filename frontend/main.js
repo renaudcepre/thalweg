@@ -3057,6 +3057,10 @@ function emitEmbedTick() {
     // right state without keeping its own copy, and see it move if dev
     // mode or another call changed it.
     inspect: inspectorOn,
+    // Current world size and seed, from the core's `meta`: what a host's
+    // SIZE slider and SEED field show, and what `reset()` changes.
+    radius: worldRadius,
+    seed: worldSeed,
   });
 }
 
@@ -3178,6 +3182,10 @@ function dispatchMessage(msg) {
     return;
   }
   if (msg.type === "meta") {
+    if (typeof msg.radius === "number") worldRadius = msg.radius;
+    if (typeof msg.seed === "number") worldSeed = msg.seed;
+    for (const resolve of pendingResets.splice(0)) resolve();
+    emitEmbedTick();
     if (typeof msg.cell_spacing_m === "number" && msg.cell_spacing_m > 0) {
       applyCellSpacingM(msg.cell_spacing_m);
     }
@@ -3329,14 +3337,7 @@ function connect() {
       const demarre = () => {
         if (premierEmbed || hostIntent) applyPlayState(hostIntent !== "pause");
       };
-      // A fresh world starts at midnight on January 1st: a visitor would
-      // land on a dark board and wait ~8 s at 1 h/s for dawn. The shipped
-      // world avoided it by opening at noon; a fresh one is advanced to
-      // noon before the first playback (12 hourly ticks, ~0.1 s at r70).
-      // WASM only: in WS mode the world is the server's, not fresh.
-      if (premierEmbed && !BOOT_WORLD_URL && resolveMode() === "wasm") {
-        send({ cmd: "step_hour", n: EMBED_FRESH_START_HOUR });
-      }
+      if (premierEmbed && !BOOT_WORLD_URL) advanceFreshEmbedWorld();
       // The shipped world must replace the fresh world BEFORE the first playback,
       // otherwise the visitor sees tick 0 scroll by for a second before being overwritten.
       if (BOOT_WORLD_URL && !bootWorldDone) loadBootWorld().finally(demarre);
@@ -3383,6 +3384,58 @@ function updatePlayPauseButton() {
 // typically because the iframe is off-screen. Without this, autostart
 // would restart the simulation right after popping the `pause()`.
 let hostIntent = null;
+
+// A fresh world is born at midnight: a visitor would land on a dark board
+// and wait ~8 s at 1 h/s for dawn. The shipped world avoided it by opening
+// at noon; a fresh embed world is advanced to noon before it plays (12
+// hourly ticks, instant at the default radius), at boot and after a host
+// `reset()`. WASM only: in WS mode the world is the server's, not fresh.
+function advanceFreshEmbedWorld() {
+  if (EMBED && resolveMode() === "wasm") {
+    send({ cmd: "step_hour", n: EMBED_FRESH_START_HOUR });
+  }
+}
+
+// World identity as the core reports it in `meta` (anti-pattern #2: never
+// recomputed here), published in every embed `tick` so a host can draw a
+// SIZE slider and a SEED field without keeping its own copy.
+let worldRadius = null;
+let worldSeed = null;
+// `reset()` promises waiting for the post-reset `meta`. Declared up here:
+// `_attach` flushes the host's queue synchronously further down.
+const pendingResets = [];
+
+// Same bounds as the engine (`RESET_RADIUS_RANGE`, hexsim-proto): checked
+// here too so a bad value rejects the host's promise instead of vanishing
+// into an engine error the host never sees.
+const RESET_RADIUS_MIN = 5;
+const RESET_RADIUS_MAX = 300;
+
+/** `reset(opts)` from the embed contract. */
+function applyHostReset(opts) {
+  const cmd = { cmd: "reset" };
+  if (opts.radius !== undefined) {
+    const r = opts.radius;
+    if (!Number.isInteger(r) || r < RESET_RADIUS_MIN || r > RESET_RADIUS_MAX) {
+      return Promise.reject(
+        new RangeError(`reset: radius must be an integer in ${RESET_RADIUS_MIN}-${RESET_RADIUS_MAX}, got ${r}`),
+      );
+    }
+    cmd.radius = r;
+  }
+  if (opts.seed !== undefined) {
+    const s = opts.seed;
+    if (!Number.isInteger(s) || s < 0 || s > 4294967295) {
+      return Promise.reject(new RangeError(`reset: seed must be a u32, got ${s}`));
+    }
+    cmd.seed = s;
+  }
+  const done = new Promise((resolve) => pendingResets.push(resolve));
+  send(cmd);
+  advanceFreshEmbedWorld();
+  send({ cmd: "meta" });
+  return done;
+}
 
 // Brings the play/pause state to the desired value, without sending
 // anything if we're already there. Don't use at connection time: see `applyPlayState` (#143).
@@ -3786,6 +3839,8 @@ window.__hexsim?._attach((name, arg) => {
     // WASM's `export_checkpoint`): nothing to translate here, we let it through.
     case "export":
       return moteurJoignable.then(() => transport.exportCheckpoint());
+    case "reset":
+      return moteurJoignable.then(() => applyHostReset(arg));
     case "load":
       // A host restoring its state has no use for the shipped world: we
       // cancel the one that hasn't gone out yet, and queue behind the one

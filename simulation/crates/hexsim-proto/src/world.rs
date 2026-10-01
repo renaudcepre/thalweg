@@ -122,6 +122,7 @@ impl World {
             hexsim_core::temperature::TemperatureParams::default(),
             wind,
         );
+        sim.set_start_day(terrain.start_day);
         // Live world: emergent fire active, randomness tied to the world seed (#wildfire).
         sim.set_seed(terrain.seed);
         sim.update_param("fire.enabled", 1.0);
@@ -246,6 +247,7 @@ impl World {
             temperature,
             wind,
         );
+        sim.set_start_day(self.terrain.start_day);
         sim.set_seed(self.terrain.seed);
         sim.set_fire_params(fire);
         sim.set_erosion_params(erosion);
